@@ -1,18 +1,21 @@
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 from jax import vmap
 
 from functools import partial
 from sing.sde import SparseGP
 
+from sing.utils.params import *
 from sing.utils.general_helpers import discretize_sde_on_grid
-from sing.sde import SDE
+from sing.utils.sing_helpers import InitParams, dynamics_to_natural_params 
+from sing.sde import SparseGP, SDE, GPPost
 
-from typing import Optional, Any
+from typing import Any, Dict, Optional, Tuple
 
-def initialize_zs(D: int, zs_lim: float, num_per_dim: int):
+def initialize_zs(D: int, zs_lim: float, num_per_dim: int) -> jnp.array:
     """
-    Initializes inducing points on a num_per_dim^K grid between -zs_lim and zs_lim.
+    Initializes inducing points on a (num_per_dim)^D grid between -zs_lim and zs_lim
 
     Params:
     -------------
@@ -31,9 +34,9 @@ def initialize_zs(D: int, zs_lim: float, num_per_dim: int):
     zs = jnp.stack(jnp.meshgrid(*all_zs_per_dim), axis=-1).reshape(-1, D)
     return zs
 
-def initialize_params_pca(D: int, ys: jnp.array):
+def initialize_params_pca(D: int, ys: jnp.array) -> Tuple[Dict[str, jnp.array], jnp.array]:
     """
-    Initialize output parameters C, d, R with PCA for a Gaussian observation model, y ~ N(Cx+d, R).
+    Initialize output parameters C, d, R with PCA for a Gaussian observation model, y ~ N(Cx+d, R)
 
     Params:
     -------------
@@ -43,8 +46,8 @@ def initialize_params_pca(D: int, ys: jnp.array):
     Returns:
     -------------
     C_init: a shape (N, D) array, the initialized C (affine mapping)
-    d_init: a shape (N,) array, the initialized d (offset)
-    R_init: a shape (N,) array, the initialized R (diagonal covariance)
+    d_init: a shape (N) array, the initialized d (offset)
+    R_init: a shape (N) array, the initialized R (diagonal covariance)
     x0_init_params: a shape (n_trials, D) array, estimated initial latent states 
     """
     ys_stacked = jnp.vstack(ys) # (total_n_samps, N)
@@ -53,73 +56,68 @@ def initialize_params_pca(D: int, ys: jnp.array):
     U, S, Vt = jnp.linalg.svd(ys_centered, full_matrices=False)
     C_init = Vt[:D].T # (N, D)
 
-    # initialize output covariance R
+    # Initialize output covariance R
     xs_pca = ys_centered @ C_init # (total_n_samps, D)
     ys_recon = xs_pca @ C_init.T + d_init 
     residual = ys_stacked - ys_recon 
-    R_init = (residual**2).sum(0) / len(residual) # (N,)
+    R_init = (residual**2).sum(0) / len(residual) # (N)
 
     output_params_init = {'C': C_init, 'd': d_init, 'R': R_init}
 
-    # intialize x0_init_params
+    # Intialize x0_init_params
     x0_init_params = ((ys - d_init) @ C_init)[:,0] # (n_trials, D) 
 
     return output_params_init, x0_init_params
 
-def linearize_prior(fn: SDE, gp_post: dict[str, jnp.array], drift_params: dict[str, Any], t_grid: jnp.array, ms: jnp.array, Ss: jnp.array):
+def linearize_prior(key: jr.PRNGKey, fn: SDE, gp_post: GPPost, drift_params: Dict[str, Any], t_grid: jnp.array, mean_params: MeanParams) -> Tuple[jnp.array, jnp.array]:
     """
     Function for linearizing a nonlinear SDE according to statistical linearization
     i.e. computing
     argmin_{A(t), b(t)} E_{q(x(t))}[||A(\tau_i) x_i + b(\tau_i) - f(x_i, \tau_i)||], i = 0, ..., T
     where f(x, t) is the drift of the nonlinear SDE and q(x_i) is a multivariate Gaussian distribution
-    See Verma et al., 2024.
+    See Verma et al., 2024
     
     Params:
     -------------
     fn: the SDE to be linearized
-    gp_post: for SING-GP, a dictionary containing the parameters of the variational posterior over inducing points, including 
-        - q_u_mu: (D, n_inducing)
-        - q_u_sigma: (D, n_inducing, n_inducing)
-        None if drift is modeled as deterministic
+    gp_post: the variational posterior over the drift function f; None if f is modelled as deterministic 
     drift_params: a dictionary containing the parameters of the SDE
     t_grid: a shape (T) array, the grid on which the SDE is discretized
     ms: a shape (T, D) array, the marginal means E[x_i]
     Ss: a shape (T, D, D) array, the marginal covariances Var(x_i)
     
-    Return:
+    Returns:
     -------------
     a linear SDE of the form dx(t) = A(t)x(t) + b(t) + L dW(t)
     As: a shape (T, D, D) array, the linear transition matrices of the linear SDE  
     bs: a shape (T, D) array, the offset vectors of the linear SDE
     """
-    As = vmap(partial(fn.dfdx, drift_params, gp_post=gp_post))(t_grid, ms, Ss)
-    bs = vmap(partial(fn.f, drift_params, gp_post=gp_post))(t_grid, ms, Ss) - vmap(lambda x1, x2: x1 @ x2)(As, ms)
+    ms, Ss = mean_params['m'], mean_params['S']
+    T = t_grid.shape[0]
+    A_key, b_key = jr.split(key, 2)
+    As = vmap(partial(fn.dfdx, drift_params, gp_post=gp_post))(jr.split(A_key, T), t_grid, ms, Ss)
+    bs = vmap(partial(fn.f, drift_params, gp_post=gp_post))(jr.split(b_key, T), t_grid, ms, Ss) - vmap(lambda x1, x2: x1 @ x2)(As, ms)
     return As, bs
 
-def initialize_params(fn: SDE, drift_params: dict[str, Any], init_params: dict[str, jnp.array], t_grid: jnp.array, sigma: float = 1.):
+def initialize_params(fn: SDE, drift_params: Dict[str, Any], key: jr.PRNGKey, init_params: InitParams, trial_mask: jnp.array, t_grid: jnp.array, sigma: float = 1.) -> Tuple[NaturalParams, MarginalParams, GPPost]:
     """
-    Initializes parameters to perform inference.
+    Initializes parameters to perform inference
 
     Params:
     -------------
     fn: the prior SDE
     drift_params: dictionary containing the parameters of the prior SDE drift
-    init_params: a dictionary containing
-        - mu0: a shape (D) array, the initial mean of the prior
-        - V0: a shape (D, D) array, the initial covariance of the prior
+    key: a random key for sampling
+    init_params: the initial parameters of the prior
+    trial_mask: a shape (T) array, a binary mask indicating whether a trial is active
     t_grid: a shape (T) array, the time grid \tau on which to discretize process
     sigma: the noise scale  of the prior SDE
     
-    Return:
+    Returns:
     -------------
-    natural_params: a dictionary containing the parameters of the variational posterior over the latents
-        - J: a shape (T, D, D) array
-        - L: a shape (T-1, D, D) array
-        - h: a shape (T, D) array
-    gp_post: a dictionary containing the parameters of the variational posterior over the sparse inducing points
-        - q_u_mu: a shape (n_inducing) array, the posterior mean over inducing points
-        - q_u_sigma: a shape (n_inducing, n_inducing) array, the posterior variance over inducing points
-    None if fn is not a SparseGP
+    natural_params: natural parameters of the variational posterior
+    marginal_params: marginal parameters of the variational posterior
+    gp_post: variational posterior over the drift function f
     """
 
     D = fn.latent_dim
@@ -136,52 +134,19 @@ def initialize_params(fn: SDE, drift_params: dict[str, Any], init_params: dict[s
     else:
         gp_post = None
     
-    # Initialize variational posterior by performing statistical linearization wrt N(0, I)
-    # TODO: it is probably better to linearize about the initial state of the prior i.e. x0
+    # Initialize variational posterior by performing statistical linearization
     ms = jnp.zeros((T, D))
     Ss = (jnp.eye(D)[None, :, :]).repeat(T, axis=0)
-    SSs = jnp.zeros((T-1, D, D))
-    As, bs = linearize_prior(fn, gp_post, drift_params, t_grid[:-1], ms[:-1], Ss[:-1])
+    As, bs = linearize_prior(key, fn, gp_post, drift_params, t_grid[:-1], {'m': ms[:-1], 'S': Ss[:-1]})
     
-    # set posterior covariance = sigma^2 * identity (same as prior covariance)
+    # Set posterior covariance = sigma^2 * identity (same as prior covariance)
     L = sigma * jnp.eye(D)
     As_SSM, bs_SSM, Qs_SSM = discretize_sde_on_grid(t_grid, As, bs, L)
     bs_SSM = jnp.concat([init_params['mu0'][None, :], bs_SSM], axis=0)
     Qs_SSM = jnp.concat([init_params['V0'][None, :], Qs_SSM], axis=0)
-    J, L, h = get_natural_params(As_SSM, bs_SSM, Qs_SSM)
-    natural_params = {
-      'J': J, # (T, D, D)
-      'L': L, # (T-1, D, D)
-      'h': h # (T, K)
-    }
+    natural_params = dynamics_to_natural_params(As_SSM, bs_SSM, Qs_SSM, trial_mask)
 
-    # initialize marginal_params as a tuple of empty arrays
-    marginal_params = (jnp.zeros((T, D)), jnp.zeros((T, D, D)), jnp.zeros((T-1, D, D)))
-    
+    # Initialize marginal_params as a tuple of empty arrays
+    marginal_params = {'m': jnp.zeros((T, D)), 'S': jnp.zeros((T, D, D)), 'SS': jnp.zeros((T-1, D, D))}
+
     return natural_params, marginal_params, gp_post
-
-def get_natural_params(A, b, Q):
-    """
-    Function for computing the natural parameters from SSM parameters
-    
-    Params:
-    -------------
-    A: a shape (T - 1, D, D) array of transition matrices
-    b: a shape (T, D) array of offsets, with b[0] being the initial mean
-    Q: a shape (T, D, D) array of noise covariance matrices, with Q[0] being the initial covariance
-    """
-
-    # Diagonal blocks of precision matrix
-    invQ = jnp.linalg.inv(Q)
-    cross = vmap(lambda A_t, invQ_tp1: A_t.T @ invQ_tp1 @ A_t)(A, invQ[1:])                                
-    J_diag = invQ.at[:-1].add(cross)
-
-    # Lower diagonal blocks of precision matrix
-    J_lower_diag = -vmap(lambda invQ_tp1, A_t: invQ_tp1 @ A_t)(invQ[1:], A)
-
-    # Linear potential
-    h_base = vmap(lambda invQ_t, b_t: invQ_t @ b_t)(invQ, b)
-    h_corr = -vmap(lambda A_t, invQ_tp1, b_tp1: A_t.T @ (invQ_tp1 @ b_tp1))(A, invQ[1:], b[1:]) # shape (d−1, n)
-    h = h_base.at[:-1].add(h_corr)
-
-    return (-1/2)*J_diag, (-1)*J_lower_diag, h

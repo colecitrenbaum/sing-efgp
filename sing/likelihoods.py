@@ -1,21 +1,23 @@
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 from jax import vmap
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 from functools import partial
 
-from sing.quadrature import GaussHermiteQuadrature
+from sing.expectation import GaussHermiteQuadrature
+from sing.utils.params import *
 from sing.utils.general_helpers import sgd
 
 from abc import ABC, abstractmethod
-from typing import Dict, Tuple, Callable, Optional
+from typing import Callable, Dict, Optional, Tuple
 
 class Likelihood(ABC):
     """
-    Abstract base class representing a likelihood
+    Represents the likelihood model
     """
-    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array):
+    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array) -> None:
         """
         Params:
         ------------
@@ -26,7 +28,7 @@ class Likelihood(ABC):
         self.t_mask = t_mask
 
     @abstractmethod
-    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params: dict[str, jnp.array]):
+    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params: Dict[str, jnp.array]) -> float:
         """
         Computes the expected log likelihood
         E_{q(x_i)}[log p(y_i | x_i)]
@@ -37,10 +39,7 @@ class Likelihood(ABC):
         y: a shape (N) array, an observation
         mean: a shape (D) array, the Gaussian mean
         var: a shape (D, D) array, the Gaussian mean
-        output_params: a dictionary representing the parameters of the likelihood, containing
-            - C: a shape (N, D) array
-            - d: a shape (N) array
-            where E[y(tau_i)|x_i] = inverse_link(Cx_i + d)
+        output_params: a dictionary representing the parameters of the likelihood
 
         Returns:
         ------------
@@ -48,7 +47,7 @@ class Likelihood(ABC):
         """
         raise NotImplementedError
 
-    def grad_ell(self, mean_params: dict[str, jnp.array], y: jnp.array, output_params: dict[str, jnp.array]):
+    def grad_ell(self, mean_params: MeanParams, y: jnp.array, output_params: Dict[str, jnp.array]) -> Tuple[jnp.array, jnp.array]:
         """
         Compute gradient of expected log-likelihood **along a single output dimension** wrt mean parameters 
         of the Gaussian distribution q(x_i)
@@ -58,9 +57,7 @@ class Likelihood(ABC):
 
         Params:
         ---------
-        mean_params: a dictionary containing the mean parameters of q(x_i)
-            - mu1: a shape (D) array, E_{q(x_i)}[x_i]
-            - mu2: a shape (D, D) array, E_{q(x_i)}[x_i x_i^T]
+        mean_params: mean parameters of the variational posterior over x
         y: a shape (1) array, the observation y(tau_i) at a single dimension
         output_params: a dictionary representing the parameters of the likelihood, containing
             - C: a shape (D) array, a single row of the emissions matrix C
@@ -73,38 +70,38 @@ class Likelihood(ABC):
         grad_mu2: (D, D) gradient wrt mu2
         """
         c, d = output_params['C'], output_params['d']
-        mu1, mu2 = mean_params['mu1'], mean_params['mu2']
-        mean = jnp.dot(c, mu1) + d
-        var = jnp.dot(c, (mu2 - jnp.outer(mu1, mu1)) @ c)
+        Ex, ExxT = mean_params['Ex'], mean_params['ExxT']
+        mean = jnp.dot(c, Ex) + d
+        var = jnp.dot(c, (ExxT - jnp.outer(Ex, Ex)) @ c)
 
         alpha, beta = jax.grad(self.ell, argnums=(1, 2))(y, mean, var, output_params) # both scalars
-        grad_mu1 = (alpha - 2 * beta * jnp.dot(c, mu1)) * c # (D,)
+        grad_mu1 = (alpha - 2 * beta * jnp.dot(c, Ex)) * c # (D)
         grad_mu2 = beta * jnp.outer(c, c) # (D, D)
         return grad_mu1, grad_mu2
     
-    def ell_over_obs_dims(self, y: jnp.array, m: jnp.array, S: jnp.array, output_params: dict[str, jnp.array]):
+    def ell_over_obs_dims(self, y: jnp.array, marginal_params: MarginalParams, output_params: Dict[str, jnp.array]) -> float:
         """
         Compute the expected log-likelihood across all output dimensions
         """
         C, d = output_params['C'], output_params['d']
-        means = C @ m + d # (N,)
-        vars = vmap(lambda c: jnp.dot(c, S @ c))(C) # (N,)
+        m, S = marginal_params['m'], marginal_params['S']
+        means = C @ m + d # (N)
+        vars = vmap(lambda c: jnp.dot(c, S @ c))(C) # (N)
         return vmap(self.ell)(y, means, vars, output_params).sum()
 
-    def ell_over_time(self, ys: jnp.array, ms: jnp.array, Ss: jnp.array, t_mask: jnp.array, output_params: dict[str, jnp.array]):
+    def ell_over_time(self, ys: jnp.array, marginal_params: MarginalParams, t_mask: jnp.array, output_params: Dict[str, jnp.array]) -> float:
         """
-        Compute the expected log-likelihood across all output dimensions and across the time grid tau,
-        taking into account masking observations
+        Compute the expected log-likelihood across all output dimensions and across the time grid tau, taking into account masking observations
         sum_{i=0}^T E_{q(x_i)}[log p(y(tau_i) | x_i)] delta(tau_i)
         where delta(tau_i) =1 if there is an observation at time i and =0 if not
         """
-        ell_on_grid = vmap(partial(self.ell_over_obs_dims, output_params=output_params))(ys, ms, Ss)
+        ell_on_grid = vmap(partial(self.ell_over_obs_dims, output_params=output_params))(ys, marginal_params)
         return (ell_on_grid * t_mask).sum()
 
-    def update_output_params(self, marginal_params: Tuple[jnp.array], output_params: dict[str, jnp.array], loss_fn, n_iters_m: int = 200, learning_rate: int = .08, **kwargs):
+    def update_output_params(self, marginal_params: MarginalParams, key: jr.PRNGKey, output_params: Dict[str, jnp.array], loss_fn: Callable[[jr.PRNGKey, jnp.array], float], n_iters_m: int = 200, learning_rate: int = .08, **kwargs) -> Dict[str, jnp.array]:
         """
-        Updates for the output parameters during the M-step of the variational expectation-maximization (vEM) algorithm
-        By default, learn output parameters with SGD (except for Gaussian case, where there are closed-form updates, see below)
+        Updates the output parameters during the M-step of the variational expectation-maximization (vEM) algorithm
+        By default, learn output parameters with SGD
         
         Params:
         ---------
@@ -119,32 +116,32 @@ class Likelihood(ABC):
         ---------
         output_params_new: the output parameters that approximately maximize the ELBO at the current set of variational parameters
         """
-        output_params, _ = sgd(loss_fn, output_params, n_iters=n_iters_m, learning_rate=learning_rate)
-        return output_params
+        output_params_new, _ = sgd(key, loss_fn, output_params, n_iters=n_iters_m, learning_rate=learning_rate)
+        return output_params_new
 
 class Gaussian(Likelihood):
     """
     A Gaussian likelihood with diagonal covariance, y ~ N(Cx + d, R)
     """
-    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array):
+    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array) -> None:
         super().__init__(ys_obs, t_mask)
 
-    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params: dict[str, jnp.array]):
+    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params: Dict[str, jnp.array]) -> float:
         r = output_params['R']
         ll = tfd.Normal(mean, jnp.sqrt(r)).log_prob(y)
         correction = -0.5 * var / r
         return ll + correction
     
-    def update_output_params(self, marginal_params: Tuple[jnp.array], ys: jnp.array, t_mask: jnp.array, **kwargs):
+    def update_output_params(self, marginal_params: MarginalParams, ys: jnp.array, t_mask: jnp.array, **kwargs) -> Dict[str, jnp.array]:
         """
         Perform closed-form updates for output mapping parameters for Gaussian likelihood model according to Hu et al., 2025
 
-        NOTE: closed-form updates do not require the previous C, d
+        NOTE: Closed-form updates do not require the previous C, d
         """
-        ms, Ss, _ = marginal_params
-        D = ms.shape[-1] # Latent dimension
-        N = ys.shape[-1] # Output dimension
-        n_total_obs = t_mask.sum() # Number of total observations
+        ms, Ss = marginal_params['m'], marginal_params['S']
+        D = ms.shape[-1] # latent dimension
+        N = ys.shape[-1] # output dimension
+        n_total_obs = t_mask.sum() # number of total observations
 
         # Stack ys across trials
         ys_obs_stacked = ys.reshape(-1, N)
@@ -152,29 +149,29 @@ class Gaussian(Likelihood):
         ms_stacked, Ss_stacked = ms.reshape(-1, D), Ss.reshape(-1, D, D)
     
         # Compute closed-form update for C
-        ybar, mbar = jnp.mean(ys_obs_stacked, axis=0), jnp.mean(ms_stacked, axis=0) # (N), (D)
+        ybar, mbar = jnp.sum(t_mask_stacked[:, None] * ys_obs_stacked, axis=0) / n_total_obs, jnp.sum(t_mask_stacked[:, None] * ms_stacked, axis=0) / n_total_obs # (N), (D)
 
         C_term1_on_grid = vmap(jnp.outer)(ys_obs_stacked - ybar[None,:], ms_stacked - mbar[None,:]) # (-1, N, D)
-        C_term1 = (t_mask_stacked[:,None,None] * C_term1_on_grid).sum(0)
+        C_term1 = (t_mask_stacked[:,None,None] * C_term1_on_grid).sum(axis=0)
         C_term2_on_grid = Ss_stacked + vmap(jnp.outer)(ms_stacked - mbar[None,:], ms_stacked - mbar[None,:]) # (-1, D, D)
-        C_term2 = (t_mask_stacked[:,None,None] * C_term2_on_grid).sum(0)
+        C_term2 = (t_mask_stacked[:,None,None] * C_term2_on_grid).sum(axis=0)
         C = jnp.linalg.solve(C_term2, C_term1.T).T # (N, D)
     
         # Update for d
-        d_term1_on_grid = ys_obs_stacked - (C @ ms_stacked[...,None]).squeeze(-1) # (-1, D)
-        d_term1 = (t_mask_stacked[:,None] * d_term1_on_grid).sum(0) # (D, )
-        d = 1. / n_total_obs * d_term1 # (D, )
+        d_term1_on_grid = ys_obs_stacked - (C @ ms_stacked.T).T # (-1, N)
+        d_term1 = (t_mask_stacked[:,None] * d_term1_on_grid).sum(axis=0) # (N, )
+        d = (1. / n_total_obs) * d_term1 # (N, )
     
         # Update for R
         all_mus = (C @ ms_stacked[...,None]).squeeze(-1) + d # (-1, N)
         all_vars = vmap(jnp.diag)(C @ Ss_stacked @ C.T) # (-1, N)
-        R_term1 = (t_mask_stacked[:,None] * ys_obs_stacked**2).sum(0) # (N)
-        R_term2 = -2 * (t_mask_stacked[:,None] * ys_obs_stacked * all_mus).sum(0) # (N)
-        R_term3 = (t_mask_stacked[:,None] * (all_vars + all_mus**2)).sum(0) # (N)
-        R = 1. / n_total_obs * (R_term1 + R_term2 + R_term3)
+        R_term1 = (t_mask_stacked[:,None] * ys_obs_stacked**2).sum(axis=0) # (N)
+        R_term2 = -2 * (t_mask_stacked[:,None] * ys_obs_stacked * all_mus).sum(axis=0) # (N)
+        R_term3 = (t_mask_stacked[:,None] * (all_vars + all_mus**2)).sum(axis=0) # (N)
+        R = (1. / n_total_obs) * (R_term1 + R_term2 + R_term3)
 
-        output_params = {'C': C, 'd': d, 'R': R}
-        return output_params
+        output_params_new = {'C': C, 'd': d, 'R': R}
+        return output_params_new
 
 class NonlinearGaussian(Likelihood):
     """
@@ -183,7 +180,7 @@ class NonlinearGaussian(Likelihood):
     where inv_link is applied element-wise
     """
 
-    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array, link, n_quad: int = 100):
+    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array, link: Callable[[float], float], n_quad: int = 100) -> None:
         """
         Params:
         --------------
@@ -197,16 +194,16 @@ class NonlinearGaussian(Likelihood):
         self.link = link
         self.quadrature = GaussHermiteQuadrature(1, n_quad=n_quad)
 
-    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params: dict[str, jnp.array]):
+    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params: Dict[str, jnp.array]) -> float:
         r = output_params['R']
         fn = lambda u: tfd.Normal(self.link(u), jnp.sqrt(r)).log_prob(y)
         return self.quadrature.gaussian_int(fn, mean.reshape(1), var.reshape((1, 1))).squeeze(-1)
 
 class Poisson(Likelihood):
     """
-    Poisson likelihood class, y ~ Pois(g(Cx + d)*dt), where g is a pre-specified inverse link function.
+    Poisson likelihood class, y ~ Pois(g(Cx + d)*dt), where g is a pre-specified inverse link function
     """
-    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array, dt: float, link: Optional[Callable] = None, include_dt: bool = False, n_quad: int = 20):
+    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array, dt: float, link: Optional[Callable[[float], float]] = None, include_dt: bool = False, n_quad: int = 20) -> None:
         """
         Params:
         --------------
@@ -224,10 +221,10 @@ class Poisson(Likelihood):
         self.include_dt = include_dt
         self.quadrature = GaussHermiteQuadrature(1, n_quad=n_quad)
     
-    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params = None):
+    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params = None) -> float:
         """
         Compute expectation E[log Pois(y|inv_link(u))] wrt q(u) = N(u|mean, var).
-        Here, we can view u = c^Tx + d, so mean = c^Tm + d and var = c^TSc.
+        Here, we can view u = c^Tx + d, so mean = c^Tm + d and var = c^TSc
         """
         if self.link is None: # Denotes 'exp' link
             cov_term = 0.5 * var
@@ -251,13 +248,13 @@ class PoissonProcess(Likelihood):
     """
     Poisson process likelihood class, t_i|x ~ PP(g(Cx+d))
     """
-    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array, dt: float, link: Optional[Callable] = None, n_quad: int = 20):
+    def __init__(self, ys_obs: jnp.array, t_mask: jnp.array, dt: float, link: Optional[Callable[[float], float]] = None, n_quad: int = 20) -> None:
         super().__init__(ys_obs, t_mask)
         self.dt = dt
         self.link = link
         self.quadrature = GaussHermiteQuadrature(1, n_quad=n_quad)
 
-    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params = None):
+    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params = None) -> float:
         # for Poisson Process likelihood, each time step gets a "continuous" part (from discretized integral) and "jump" part (if there is an observation at that time step)
         if self.link is None: # Denotes 'exp' link
             ell_cont = -self.dt * jnp.exp(mean + 0.5 * var)
@@ -272,12 +269,12 @@ class PoissonProcess(Likelihood):
 
 class GeneralizedPoisson(Likelihood):
     """
-    In this model, y_n ~ Pois(f_n(x)), n = 1, ..., N.
-    NOTE: This differs from above because each observation dimension has a different rate function f_n.
+    In this model, y_n ~ Pois(f_n(x)), n = 1, ..., N
+    NOTE: this differs from above because each observation dimension has a different rate function f_n
 
-    This is used for the synthetic place cell model in the demo notebooks and in the paper (Hu, Smith, Linderman 2025).
+    This is used for the synthetic place cell model in the demo notebooks and in the paper Hu et al., 2025
     """
-    def __init__(self, latent_dim: int, ys_obs: jnp.array, t_mask: jnp.array, link, n_quad: int = 5):
+    def __init__(self, latent_dim: int, ys_obs: jnp.array, t_mask: jnp.array, link: Callable[[float, int], float], n_quad: int = 5) -> None:
         """
         Params:
         --------------
@@ -290,19 +287,19 @@ class GeneralizedPoisson(Likelihood):
         # NOTE: Expectations approximated over D dimensions due to different rate function per obs dimension
         self.quadrature = GaussHermiteQuadrature(latent_dim, n_quad=n_quad) 
         
-    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params: dict[str, jnp.array]):
+    def ell(self, y: jnp.array, mean: jnp.array, var: jnp.array, output_params: Dict[str, jnp.array]) -> float:
         idx = output_params['obs_idx'].astype(int)
         fn = lambda u: tfd.Poisson(rate=self.link(u, idx)).log_prob(y)
         return self.quadrature.gaussian_int(fn, mean, var)
         
-    def grad_ell(self, mean_params: dict[str, jnp.array], y: jnp.array, output_params: dict[str, jnp.array]):
-        mu1, mu2 = mean_params['mu1'], mean_params['mu2']
+    def grad_ell(self, mean_params: MeanParams, y: jnp.array, output_params: Dict[str, jnp.array]) -> Tuple[jnp.array, jnp.array]:
+        Ex, ExxT = mean_params['Ex'], mean_params['ExxT']
 
         # Compute gradients directly i.e. without the chain rule
         ell_wrapped = lambda mu1, mu2: self.ell(y, mu1, mu2 - jnp.outer(mu1, mu1), output_params)
-        grad_mu1, grad_mu2 = jax.grad(ell_wrapped, argnums=(0, 1))(mu1, mu2)
+        grad_mu1, grad_mu2 = jax.grad(ell_wrapped, argnums=(0, 1))(Ex, ExxT)
 
         return grad_mu1, grad_mu2
     
-    def ell_over_obs_dims(self, y: jnp.array, m: jnp.array, S: jnp.array, output_params: dict[str, jnp.array]):
-        return vmap(lambda y, output_params: self.ell(y, m, S, output_params))(y, output_params).sum()
+    def ell_over_obs_dims(self, y: jnp.array, marginal_params: MarginalParams, output_params: Dict[str, jnp.array]) -> float:
+        return vmap(lambda y, output_params: self.ell(y, marginal_params['m'], marginal_params['S'], output_params))(y, output_params).sum()

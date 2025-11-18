@@ -1,26 +1,27 @@
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 from jax import grad
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
 tfb = tfp.bijectors
 from functools import partial
 
-from sing.quadrature import GaussHermiteQuadrature
+from sing.expectation import Expectation
 
 from abc import ABC, abstractmethod 
-from typing import Dict, Any, Union, Callable
+from typing import Any, Callable, Dict, Union
 
 class Kernel(ABC):
     """
     Abstract base class representing the positive semi-definite kernel of a Gaussian process (GP)
     """
 
-    def __init__(self, latent_dim: int = 1, n_quad: int = 5):
-        self.quadrature = GaussHermiteQuadrature(latent_dim, n_quad)
+    def __init__(self, latent_dim: int = 1) -> None:
+        self.latent_dim = latent_dim
 
     @abstractmethod
-    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: dict[Any, jnp.array]):
+    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: Dict[str, Any]) -> float:
         """
         Evaluates the kernel at inputs x1, x2
         NOTE: K(x1, x2) = K(x2, x1) so the ordering of x1 and x2 doesn't matter
@@ -32,35 +33,35 @@ class Kernel(ABC):
         """
         return NotImplementedError
 
-    # --------- Expectations computed with quadrature ----------
-    def E_Kxx(self, m: jnp.array, S: jnp.array, kernel_params: dict[str, Any]):
-        """Computes E[k(x,x)] wrt q(x) = N(x|m,S)."""
+    # --------- Expectations computed with quadrature or Monte Carlo ----------
+    def E_Kxx(self, expectation: Expectation, key: jr.PRNGKey, m: jnp.array, S: jnp.array, kernel_params: Dict[str, Any]) -> float:
+        """Computes E[k(x,x)] wrt q(x) = N(x|m,S)"""
         fn = lambda x: self.K(x, x, kernel_params)
-        return self.quadrature.gaussian_int(fn, m, S) # scalar
+        return expectation.gaussian_int(key=key, fn=fn, m=m, S=S) # scalar
 
-    def E_Kxz(self, z: jnp.array, m: jnp.array, S: jnp.array, kernel_params: dict[str, Any]):
-        """Computes E[k(x,z)] wrt q(x) = N(x|m,S)."""
+    def E_Kxz(self, expectation: Expectation, key: jr.PRNGKey, z: jnp.array, m: jnp.array, S: jnp.array, kernel_params: Dict[str, Any]) -> float:
+        """Computes E[k(x,z)] wrt q(x) = N(x|m,S)"""
         fn = lambda x: self.K(x, z, kernel_params)
-        return self.quadrature.gaussian_int(fn, m, S) # scalar
+        return expectation.gaussian_int(key=key, fn=fn, m=m, S=S) # scalar
 
-    def E_KzxKxz(self, z1: jnp.array, z2: jnp.array, m: jnp.array, S: jnp.array, kernel_params: dict[str, Any]):
-        """Computes E[k(z1,x)k(x,z2)] wrt q(x) = N(x|m,S)."""
+    def E_KzxKxz(self, expectation: Expectation, key: jr.PRNGKey, z1: jnp.array, z2: jnp.array, m: jnp.array, S: jnp.array, kernel_params: Dict[str, Any]) -> float:
+        """Computes E[k(z1,x)k(x,z2)] wrt q(x) = N(x|m,S)"""
         fn = lambda x: self.K(z1, x, kernel_params) * self.K(x, z2, kernel_params)
-        return self.quadrature.gaussian_int(fn, m, S) # scalar
+        return expectation.gaussian_int(key=key, fn=fn, m=m, S=S) # scalar
 
-    def E_dKzxdx(self, z: jnp.array, m: jnp.array, S: jnp.array, kernel_params: dict[str, Any]):
+    def E_dKzxdx(self, expectation: Expectation, key: jr.PRNGKey, z: jnp.array, m: jnp.array, S: jnp.array, kernel_params: Dict[str, Any]) -> jnp.array:
         """Computes E[dk(z,x)/dx] wrt q(x) = N(x|m,S)."""
         fn = grad(partial(self.K, z, kernel_params=kernel_params))
-        return self.quadrature.gaussian_int(fn, m, S) # (D)
+        return expectation.gaussian_int(key=key, fn=fn, m=m, S=S) # (D)
 
 class RBF(Kernel):
     """
     The RBF kernel
     """
-    def __init__(self, latent_dim: int = 1):
+    def __init__(self, latent_dim: int = 1) -> None:
         super().__init__(latent_dim)
 
-    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: dict[str, jnp.array]):
+    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: Dict[str, jnp.array]) -> float:
         """
         Params:
         -------------
@@ -73,16 +74,16 @@ class RBF(Kernel):
         return kernel_params["output_scale"]**2 * jnp.exp(-0.5 * sq_diffs) # scalar
 
     # --------- Closed-form expectations ----------
-    def E_Kxx(self, m: jnp.array, S: jnp.array, kernel_params: dict[str, jnp.array]):
+    def E_Kxx(self, expectation: Expectation, key: jr.PRNGKey, m: jnp.array, S: jnp.array, kernel_params: Dict[str, jnp.array]) -> float:
         return kernel_params["output_scale"]**2 # scalar
 
-    def E_Kxz(self, z: jnp.array, m: jnp.array, S: jnp.array, kernel_params: dict[str, jnp.array]):
+    def E_Kxz(self, expectation: Expectation, key: jr.PRNGKey, z: jnp.array, m: jnp.array, S: jnp.array, kernel_params: Dict[str, jnp.array], **kwargs) -> float:
         K = len(m)
         integral = tfd.MultivariateNormalFullCovariance(m, S + jnp.diag(kernel_params["length_scales"]**2)).prob(z)
         const = kernel_params["output_scale"]**2 * jnp.sqrt((2 * jnp.pi)**K) * kernel_params["length_scales"].prod()
         return const * integral
 
-    def E_KzxKxz(self, z1: jnp.array, z2: jnp.array, m: jnp.array, S: jnp.array, kernel_params: dict[str, jnp.array]):
+    def E_KzxKxz(self, expectation: Expectation, key: jr.PRNGKey, z1: jnp.array, z2: jnp.array, m: jnp.array, S: jnp.array, kernel_params: Dict[str, jnp.array], **kwargs) -> float:
         K = len(m)
         squared_length_scales = kernel_params["length_scales"]**2
 
@@ -98,35 +99,37 @@ class RBF(Kernel):
 
         return const * prob1 * prob2
 
-    def E_dKzxdx(self, z: jnp.array, m: jnp.array, S: jnp.array, kernel_params: dict[str, jnp.array]):
-        Psi1 = self.E_Kxz(z, m, S, kernel_params)
+    def E_dKzxdx(self, expectation: Expectation, key: jr.PRNGKey, z: jnp.array, m: jnp.array, S: jnp.array, kernel_params: Dict[str, jnp.array], **kwargs) -> jnp.array:
+        Psi1 = self.E_Kxz(expectation, key, z, m, S, kernel_params)
         L = jnp.diag(kernel_params["length_scales"]**2)
         return Psi1 * jnp.linalg.solve(L + S, z - m) # (D, )
 
 # --------------------- see Hu et al., 2024 for discussion of linear kernels -------------------
 class SimpleLinear(Kernel):
     """
-    The linear kernel. Trajectories drawn from the GP with linear kernel will be linear functions.
+    The linear kernel
+    
+    Trajectories drawn from the GP with linear kernel will be linear functions
     """
-    def __init__(self, noise_var: float =  1., latent_dim: int = 1, n_quad: int = 5):
-        super().__init__(latent_dim, n_quad)
+    def __init__(self, noise_var: float =  1., latent_dim: int = 1) -> None:
+        super().__init__(latent_dim)
         self.noise_var = noise_var
 
-    def K(self, x1: jnp.array, x2: jnp.array, kernel_params = None):
-        """Linear kernel with M = I, c = 0."""
+    def K(self, x1: jnp.array, x2: jnp.array, kernel_params = None) -> float:
+        """Linear kernel with M = I, c = 0"""
         return (x1 * x2).sum() + self.noise_var
 
 class Linear(Kernel):
     """
-    The linear kernel with a fixed point parameter.
+    The linear kernel with a fixed point parameter
    
-    The fixed point defines the x values at which a zero of the linear function is most likely to occur.
+    The fixed point defines the x values at which a zero of the linear function is most likely to occur
     """
-    def __init__(self, noise_var: float = 1., latent_dim: int = 1, n_quad: int = 5):
-        super().__init__(latent_dim, n_quad)
+    def __init__(self, noise_var: float = 1., latent_dim: int = 1) -> None:
+        super().__init__(latent_dim)
         self.noise_var = noise_var
 
-    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: dict[str, jnp.array]):
+    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: Dict[str, jnp.array]) -> float:
         """
         Params:
         -------------
@@ -144,10 +147,10 @@ class FullLinear(Kernel):
    
     NOTE: assumes slope variance is diagonal
     """
-    def __init__(self, latent_dim: int = 1, n_quad: int = 5):
-        super().__init__(latent_dim, n_quad)
+    def __init__(self, latent_dim: int = 1) -> None:
+        super().__init__(latent_dim)
 
-    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: dict[str, jnp.array]):
+    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: Dict[str, jnp.array]) -> float:
         """
         Params:
         -------------
@@ -166,29 +169,29 @@ class SSL(Kernel):
     """
     The smoothly switching linear kernel introduced by Hu et al., 2024
     """
-    def __init__(self, linear_kernel: Union[SimpleLinear, Linear, FullLinear], basis_set: Callable[jnp.array, jnp.array], latent_dim: int = 1, n_quad: int = 5):
+    def __init__(self, linear_kernel: Union[SimpleLinear, Linear, FullLinear], basis_set: Callable[[jnp.array], jnp.array], latent_dim: int = 1) -> None:
         """
         Params:
         -------------
-        quadrature
         linear_kernel: the linear kernel from which the smoothly switching linear kernel is defined
         basis_set: a function with signature basis_set(x) -> R^{num_bases}, where num_bases is a set of basis functions that determines the boundary between states
+        latent_dim
         """
-        super().__init__(latent_dim, n_quad)
+        super().__init__(latent_dim)
         self.linear_kernel = linear_kernel
         self.basis_set = basis_set
 
-    def construct_partition(self, x, W, log_tau):
+    def construct_partition(self, x: jnp.array, W: jnp.array, log_tau: float) -> jnp.array:
         """
-        Construct partition function pi at a given latent space location x.
+        Construct partition function pi at a given latent space location x
         """
         activations = W.T @ self.basis_set(x)
         pi = tfb.SoftmaxCentered().forward(activations / jnp.exp(log_tau))
         return pi
 
-    def K(self, x1, x2, kernel_params):
+    def K(self, x1: jnp.array, x2: jnp.array, kernel_params: Dict[str, jnp.array]) -> float:
         """
-        Compute smoothly switching linear (SSL) kernel.
+        Compute smoothly switching linear (SSL) kernel
 
         Params:
         --------------
@@ -203,5 +206,5 @@ class SSL(Kernel):
         log_tau = kernel_params["log_tau"]
         pi_x1 = self.construct_partition(x1, W, log_tau)
         pi_x2 = self.construct_partition(x2, W, log_tau)
-        linear_kernels = jnp.array([self.linear_kernel.K(x1, x2, param) for param in linear_params]) # (num_states,)
+        linear_kernels = jnp.array([self.linear_kernel.K(x1, x2, param) for param in linear_params]) # (num_states)
         return (pi_x1 * pi_x2 * linear_kernels).sum()

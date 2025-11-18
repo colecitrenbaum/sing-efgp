@@ -5,13 +5,16 @@ e.g., for data cleaning, analyzing results from SING
 
 import jax
 import jax.numpy as jnp
+import jax.random as jr
 import tensorflow_probability.substrates.jax as tfp
 tfd = tfp.distributions
-
 from jax import vmap, lax
+
 from functools import partial
 
-from typing import Any, Optional
+import flax.linen as nn # import flax for the MLP
+
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 from sing.kernels import Kernel
 
@@ -19,7 +22,7 @@ import optax
 import numpy as np
 
 # --------------------- Helpers for sampling and binning data -------------------
-def discretize_sde_on_grid(t_grid: jnp.array, As: jnp.array, bs: jnp.array, L: jnp.array):
+def discretize_sde_on_grid(t_grid: jnp.array, As: jnp.array, bs: jnp.array, L: jnp.array) -> Tuple[jnp.array, jnp.array, jnp.array]:
     """
     Discretizes a linear SDE from evaluations of the drift term on the specified grid
     using the Euler-Maruyama scheme
@@ -29,7 +32,7 @@ def discretize_sde_on_grid(t_grid: jnp.array, As: jnp.array, bs: jnp.array, L: j
     t_grid: a shape (T) array
     As: a shape (T - 1, D, D) array, the matrix part of the drift evaluated on the grid \tau
     bs: a shape (T - 1, D) array, the vector part of the drift evaluated on the grid \tau
-    L: a shape (latent_dim, latent_dim) array, the diffusion coefficient L dW(t) 
+    L: a shape (D, D) array, the diffusion coefficient L dW(t) 
     """
     d = As.shape[-1]
 
@@ -41,7 +44,7 @@ def discretize_sde_on_grid(t_grid: jnp.array, As: jnp.array, bs: jnp.array, L: j
 
     return As_discretized, bs_discretized, Q_discretized
 
-def bin_regularly_sampled_data(dt: float, ys: jnp.array, bin_size: float):
+def bin_regularly_sampled_data(dt: float, ys: jnp.array, bin_size: float) -> Tuple[jnp.array, jnp.array]:
     """
     Bin regularly-sampled observations into **smaller** time bins.
 
@@ -63,18 +66,18 @@ def bin_regularly_sampled_data(dt: float, ys: jnp.array, bin_size: float):
     
     return jnp.array(ys_binned), jnp.array(t_mask)
     
-def bin_sparse_data(ys: jnp.array, t_obs: jnp.array, t_max: float, dt: float):
+def bin_sparse_data(ys: jnp.array, t_obs: jnp.array, t_max: float, dt: float) -> Tuple[jnp.array, jnp.array]:
     """
-    Bin sparsely sampled data into discrete time bindings.
+    Bin sparsely sampled data (at potentially irregular times) into discrete time bins
 
-    Params
+    Params:
     -------------
     ys: a shape (n_trials, n_samps, N) array, the sparse observations
     t_obs: a shape (n_trials, n_samps) array, the timestamps of observations
     t_max: scalar, duration of trials
     dt: scalar, bin size
 
-    Returns
+    Returns:
     -------------
     ys_binned: a shape (n_trials, T, N) array, binned observations
     t_mask: a shape (n_trials, T) array, mask for observed timestamps
@@ -86,7 +89,7 @@ def bin_sparse_data(ys: jnp.array, t_obs: jnp.array, t_max: float, dt: float):
     all_ys_binned = []
 
     for i in range(n_trials):
-        hist, bins = np.histogram(t_obs[i], T, (0, t_max)) # (T, ) containing counts of obs in each time bin
+        hist, bins = np.histogram(t_obs[i], T, (0, t_max)) # (T) containing counts of obs in each time bin
         t_idx = np.nonzero(hist)[0] # containing time bin indices with >= 1 obs
         ys_binned = np.zeros((T, D))
         for j, idx in enumerate(t_idx):
@@ -105,11 +108,11 @@ def bin_sparse_data(ys: jnp.array, t_obs: jnp.array, t_max: float, dt: float):
     return jnp.array(all_ys_binned), jnp.array(all_t_mask)
 
 # --------------------- Helpers for analyzing SING inferred latents -------------------
-def get_transformation_for_latents(C: jnp.array, d: jnp.array, C_hat: jnp.array, d_hat: jnp.array):
+def get_transformation_for_latents(C: jnp.array, d: jnp.array, C_hat: jnp.array, d_hat: jnp.array) -> Tuple[jnp.array, jnp.array]:
     """
     Computes a linear transformation matrix 
     Px + offset
-    that maps learned latents to true latents (or another latent space).
+    that maps learned latents to true latents (or another latent space)
 
     Params:
     ------------
@@ -120,9 +123,9 @@ def get_transformation_for_latents(C: jnp.array, d: jnp.array, C_hat: jnp.array,
 
     Returns:
     ------------
-    A mapping Px + offset from learned latents -> true latents
-    P: (D, D) the linear part of the map
-    offset: (N) the additive part of the map
+    A mapping Px + offset from learned -> true latents
+    P: a shape (D, D) array, the linear part of the map
+    offset: a shale (D) array, the additive part of the map
     """    
     U, S, Vt = jnp.linalg.svd(C, full_matrices=False)
     MP_inv = Vt.T @ jnp.diag(1./S) @ U.T
@@ -130,9 +133,9 @@ def get_transformation_for_latents(C: jnp.array, d: jnp.array, C_hat: jnp.array,
     offset = MP_inv @ (d_hat - d)
     return P, offset
 
-def get_learned_partition(partition_fn, kernel_params: dict[str, jnp.array], Xs: jnp.array):
+def get_learned_partition(partition_fn, kernel_params: Dict[str, jnp.array], Xs: jnp.array) -> jnp.array:
     """
-    For the SSL (smoothly switching linear) kernel, compute value of pi(x) at each point in Xs.
+    For the SSL (smoothly switching linear) kernel, compute value of pi(x) at each point in Xs
 
     Params:
     ------------
@@ -147,17 +150,17 @@ def get_learned_partition(partition_fn, kernel_params: dict[str, jnp.array], Xs:
     learned_pis = vmap(partition_fn, (0, None, None))(Xs, kernel_params['W'], kernel_params['log_tau'])
     return learned_pis
     
-def get_most_likely_state(partition_fn, kernel_params: dict[str, jnp.array], Xs: jnp.array):
+def get_most_likely_state(partition_fn, kernel_params: Dict[str, jnp.array], Xs: jnp.array) -> jnp.array:
     """For SSL kernel, compute most likely state at each point in Xs."""
     learned_pis = get_learned_partition(partition_fn, kernel_params, Xs)
     most_likely_states = jnp.argmax(learned_pis, 1)
     return most_likely_states
 
-def compute_latents_mse(xs: jnp.array, latents_mean: jnp.array, latents_cov: Optional[jnp.array] = None):
+def compute_latents_mse(xs: jnp.array, ms: jnp.array, Ss: Optional[jnp.array] = None) -> float:
     """
     Computes the MSE between the latents under the variational posterior and the true latents
 
-    Params
+    Params:
     ------------
     xs: a shape (T, D) array, the true latents
     latents_mean: a shape (T, D) array, the (univariate) marginal means of the latents under the variational posterior q
@@ -173,14 +176,14 @@ def compute_latents_mse(xs: jnp.array, latents_mean: jnp.array, latents_cov: Opt
         return jnp.trace(S) + ((m - true)**2).sum()
 
     n_timesteps, latent_dim = xs.shape
-    if latents_cov is None:
-        latents_cov = jnp.zeros(n_timesteps, latent_dim, latent_dim)
+    if Ss is None:
+        Ss = jnp.zeros(n_timesteps, latent_dim, latent_dim)
 
     # vmap over timesteps
-    return vmap(_compute_mse_single)(xs, latents_mean, latents_cov).mean()
+    return vmap(_compute_mse_single)(xs, ms, Ss).mean()
 
 # --------------------- Other helpers -------------------
-def make_gram(kernel_fn: Kernel, kernel_params: dict[str, Any], Xs: jnp.array, Xps: jnp.array, jitter=1e-8):
+def make_gram(kernel_fn: Kernel, kernel_params: Dict[str, Any], Xs: jnp.array, Xps: jnp.array, jitter=1e-8) -> jnp.array:
     """
     Compute gram matrix between inputs Xs and Xps.
 
@@ -201,12 +204,13 @@ def make_gram(kernel_fn: Kernel, kernel_params: dict[str, Any], Xs: jnp.array, X
         K += jitter * jnp.eye(len(Xs))
     return K
 
-def sgd(loss_fn: Any, params: dict[str, Any], n_iters: int, learning_rate: float):
+def sgd(key: jr.PRNGKey, loss_fn: Callable[[jr.PRNGKey, Dict[str, Any]], float], params: Dict[str, Any], n_iters: int, learning_rate: float) -> Tuple[Dict[str, Any], float]:
     """
     Performs SGD with Adam on a specified loss function with respect to params
     
     Params:
     ------------
+    key: random key for sampling; the loss function can depend on this random key i.e. L(key, x) -> R_+
     loss_fn: loss function to be optimizing, a function of params
     params: dictionary containing the parameters with respect to which the loss function is optimized
     n_iters: the number of SGD iterations
@@ -215,20 +219,39 @@ def sgd(loss_fn: Any, params: dict[str, Any], n_iters: int, learning_rate: float
     Returns:
     ------------
     final_params: the parameters from the final step of SGD
-    fina_val: final value of the loss function
+    final_val: final value of the loss function
     """
     optimizer = optax.adam(learning_rate)
     opt_state = optimizer.init(params)
 
     def _step(carry, arg):
         params_prev, opt_state_prev = carry
-        loss, grads = jax.value_and_grad(loss_fn)(params_prev)
+        key = arg
+
+        loss, grads = jax.value_and_grad(loss_fn, argnums=1)(key, params_prev)
         updates, opt_state = optimizer.update(grads, opt_state_prev, params_prev)
         params = optax.apply_updates(params_prev, updates)
         return (params, opt_state), -loss # returning elbo
 
     initial_carry = (params, opt_state)
-    (final_params, _), all_elbos = lax.scan(_step, initial_carry, jnp.arange(n_iters))
-    fina_val = all_elbos[-1]
+    args = jr.split(key, n_iters)
+    (final_params, _), all_elbos = lax.scan(_step, initial_carry, args, length=n_iters)
+    final_val = all_elbos[-1]
 
-    return final_params, fina_val
+    return final_params, final_val
+
+# --------------------- Helpers for neural-SDEs -------------------
+class MLP(nn.Module):
+    """
+    A simple flax implementation of a multilayer perceptron (MLP) with ReLU activations
+    """
+    features: Sequence[int]  # list of hidden‐layer sizes
+    latent_dim: int # size of the output layer
+
+    @nn.compact
+    def __call__(self, x: jnp.array, t: float) -> jnp.array:
+        xt = x # for now, neural network drift is time homogeneous
+        h = xt
+        for feat in self.features:
+            h = nn.relu(nn.Dense(feat)(h))
+        return nn.Dense(self.latent_dim)(h)
