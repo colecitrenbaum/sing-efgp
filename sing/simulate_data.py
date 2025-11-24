@@ -44,13 +44,13 @@ def simulate_sde(key: jr.PRNGKey,
         key, t, input = arg
         drift = f(x, t).reshape(D)
         diffusion = sigma(x, t).reshape(D, D)
-        next_x = tfd.MultivariateNormalFullCovariance(loc = x + drift * dt + B @ input * dt, covariance_matrix = diffusion @ diffusion.T *
+        next_x = tfd.MultivariateNormalFullCovariance(loc = x + drift * dt + input_effect @ input * dt, covariance_matrix = diffusion @ diffusion.T *
                                                       dt).sample(seed=key).astype(jnp.float64)
         return next_x, x
     
     if inputs is None:
         inputs = jnp.zeros((n_timesteps, 1))
-        B = jnp.zeros((len(x0), 1))
+        input_effect = jnp.zeros((len(x0), 1))
     
     # Default is unit variance
     if sigma is None:
