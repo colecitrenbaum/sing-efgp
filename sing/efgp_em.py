@@ -316,25 +316,36 @@ def fit_efgp_sing(
 # JAX-native EM loop (lax.scan'd inner E-step, no torch round-trip)
 # ============================================================================
 def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
-                                ls, var, eps_grid, S_marginal, n_estep_iters,
-                                X_template_for_grid):
+                                S_marginal, n_estep_iters):
     """Compile a function that runs ``n_estep_iters`` inner E-step iterations
     via ``lax.scan``, all JAX, no torch.
 
-    The spectral grid is determined at trace time from the kernel hypers and
-    a representative cloud (so `mtot_per_dim` is a static int tuple) — when
-    the kernel hypers change in the M-step we must rebuild this function.
+    The spectral grid is passed AS AN INPUT (not closure-captured) so the
+    same compiled artifact is reused for any grid with the same
+    ``mtot_per_dim``.  ``mtot_per_dim`` is a ``static_argnames``: JAX
+    automatically caches one compiled artifact per ``mtot_per_dim`` value.
+
+    For an EM run that explores ℓ across only a handful of grid sizes,
+    this reduces compilation cost from "every M-step" to "first time we
+    see each grid size".
     """
-    grid = jp.spectral_grid_se(ls, var, X_template_for_grid, eps=eps_grid)
     inputs = jnp.zeros((T, 1))
     input_effect = jnp.zeros((D, 1))
     del_t = (t_grid[1:] - t_grid[:-1])
 
     nat_to_marg_b = jax.jit(vmap(natural_to_marginal_params))
 
-    @jax.jit
+    @partial(jax.jit, static_argnames=('mtot_per_dim',))
     def scan_estep(natural_params, init_params, ys_obs, t_mask,
-                    output_params, key, rho):
+                    output_params, key, rho,
+                    xis_flat, ws, h_per_dim, xcen, mtot_per_dim):
+        # Reconstruct the JaxGridState pytree inside the trace.  M and d
+        # are derived from xis_flat shape, so they are static at trace time.
+        grid = jp.JaxGridState(
+            xis_flat=xis_flat, ws=ws, h_per_dim=h_per_dim,
+            mtot_per_dim=mtot_per_dim, xcen=xcen,
+            M=int(xis_flat.shape[0]), d=int(xis_flat.shape[1]),
+        )
         trial_mask = jnp.ones((1, T), dtype=bool)
 
         def one_iter(carry, key_iter):
@@ -373,7 +384,7 @@ def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
         final_nat_p, _ = jax.lax.scan(one_iter, natural_params, keys)
         return final_nat_p
 
-    return scan_estep, nat_to_marg_b, grid
+    return scan_estep, nat_to_marg_b
 
 
 def fit_efgp_sing_jax(
@@ -399,6 +410,9 @@ def fit_efgp_sing_jax(
     mstep_lr: float = 0.05,
     n_hutchinson_mstep: int = 4,
     kernel_warmup_iters: int = 2,
+    pin_grid: bool = False,                # if True, build grid once and never rebuild
+    pin_grid_eps: Optional[float] = None,  # if pin_grid, eps_grid override (defaults to eps_grid)
+    pin_grid_lengthscale: Optional[float] = None,  # if pin_grid, ls override
     X_template: Optional[jnp.ndarray] = None,
     seed: int = 0,
     true_xs: Optional[np.ndarray] = None,
@@ -453,17 +467,32 @@ def fit_efgp_sing_jax(
 
     init_key, key = jr.split(jr.PRNGKey(seed), 2)
 
-    def _build():
-        return _build_jit_estep_scan_jax(
-            D=D, T=T, t_grid=t_grid, lik=likelihood, sigma=sigma,
-            sigma_drift_sq=sigma_drift_sq, ls=ls, var=var, eps_grid=eps_grid,
-            S_marginal=S_marginal, n_estep_iters=n_estep_iters,
-            X_template_for_grid=X_template,
-        )
+    # Build the jit'd E-step ONCE.  The grid (xis, ws, h, xcen) is now a
+    # JIT INPUT, and ``mtot_per_dim`` is a static_argnames — JAX
+    # automatically caches one compiled artifact per ``mtot_per_dim``
+    # value.
+    scan_estep, _ = _build_jit_estep_scan_jax(
+        D=D, T=T, t_grid=t_grid, lik=likelihood, sigma=sigma,
+        sigma_drift_sq=sigma_drift_sq,
+        S_marginal=S_marginal, n_estep_iters=n_estep_iters,
+    )
 
-    scan_estep, _, grid = _build()
+    def _make_grid(ls_, var_, eps_):
+        return jp.spectral_grid_se(ls_, var_, X_template, eps=eps_)
+
+    if pin_grid:
+        # Conservative grid that stays valid across the M-step's ℓ range.
+        # Use the (optionally larger) ``pin_grid_lengthscale`` as the
+        # grid-determining ls, with optionally tighter eps for safety.
+        pin_ls = pin_grid_lengthscale if pin_grid_lengthscale is not None else ls
+        pin_eps = pin_grid_eps if pin_grid_eps is not None else eps_grid
+        grid = _make_grid(pin_ls, var, pin_eps)
+    else:
+        grid = _make_grid(ls, var, eps_grid)
+
     if verbose:
-        print(f"  [jax] M={grid.M}, mtot_per_dim={grid.mtot_per_dim}")
+        print(f"  [jax] M={grid.M}, mtot_per_dim={grid.mtot_per_dim}, "
+              f"pin_grid={pin_grid}")
 
     history = EFGPEMHistory()
     log_ls = float(np.log(ls))
@@ -474,7 +503,10 @@ def fit_efgp_sing_jax(
         em_key, key = jr.split(key, 2)
         natural_params = scan_estep(natural_params, init_params,
                                      ys_obs, t_mask, output_params,
-                                     em_key, rho_jax)
+                                     em_key, rho_jax,
+                                     grid.xis_flat, grid.ws,
+                                     grid.h_per_dim, grid.xcen,
+                                     mtot_per_dim=grid.mtot_per_dim)
 
         # ---- M-step ----
         mp_b, _ = nat_to_marg_b(natural_params, trial_mask)
@@ -528,8 +560,14 @@ def fit_efgp_sing_jax(
                 var = new_var
                 log_ls = float(log_ls_new)
                 log_var = float(log_var_new)
-                # Rebuild the jit'd scan_estep with the new spectral grid.
-                scan_estep, _, grid = _build()
+                # Rebuild only the GRID (a cheap numpy bisection + JAX
+                # array build), not the jit'd scan_estep.  JAX caches one
+                # compiled artifact per ``mtot_per_dim`` value, so as long
+                # as the kernel range visits only a few discrete grid
+                # sizes during the M-step, recompilation is rare.  With
+                # ``pin_grid=True`` the grid is fixed and we never rebuild.
+                if not pin_grid:
+                    grid = _make_grid(ls, var, eps_grid)
 
         if true_xs is not None:
             rmse_lat = float(np.sqrt(np.mean(
