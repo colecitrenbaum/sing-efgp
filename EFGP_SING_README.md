@@ -161,13 +161,33 @@ hyperparameters held fixed at the init):
 
 | Method | Inducing/feature dim | Predictive observation RMSE | Wall time |
 | --- | --- | --- | --- |
-| **EFGP-SING** (this branch) | M = 49 (Fourier features) | **0.228** | ~250 s |
-| SING-SparseGP | 64 inducing pts | 0.251 | ~22 s |
+| **EFGP-SING** (this branch) | M = 49 (Fourier features) | **0.228** | ~140 s |
+| SING-SparseGP | 64 inducing pts | 0.251 | ~40 s |
 | Trivial (predict mean obs) | – | 0.280 | – |
 
-EFGP wins by ~10% on observation prediction.  EFGP wall time is dominated by
-JAX compilation in the first iteration (~60 s overhead), then ~5–10 s per
-inner E-step iter.  Subsequent runs (with JAX cache warm) are faster.
+EFGP wins by ~10% on observation prediction.
+
+### Why isn't EFGP faster than SparseGP here?
+
+The EFGP block itself is fast (~50 ms/iter at this M).  The wall-time gap
+is almost entirely JAX↔Torch bridge overhead in the EM loop:
+
+* SING-SparseGP runs the entire E-step inside `jax.jit` + `lax.scan`, so
+  the per-iter cost is just the actual numerics on the device.
+* Our EFGP block runs in PyTorch.  Each E-step iteration we
+  `jnp.asarray(numpy(torch))` the drift moments back into JAX so SING's
+  natural-grad routine can use them.  After v0's jit fix (the rho-as-JAX-
+  scalar trick in `efgp_em.py:_build_jit_estep`) the JAX side compiles
+  once and reuses the artifact, but the round-trip itself is still ~50 ms
+  per iter.  At small `M` the round-trip dominates.
+
+For larger problems where SparseGP's `O(N M_ind²)` grows but EFGP's
+`O(N + M log M)` does not, the gap reverses.  The bridge overhead becomes
+negligible relative to the numerics.
+
+When a JAX-native EFGP backend lands (`# TODO(efgp-jax)` markers in the
+code), the bridge disappears entirely and EFGP-SING approaches parity
+with SING's compiled SparseGP path even at small M.
 
 Both methods beat the trivial baseline; EFGP comes out ~10% better on
 predictive observation RMSE in this setting.  EFGP wall time is dominated

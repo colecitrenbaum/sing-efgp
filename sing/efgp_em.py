@@ -42,6 +42,56 @@ from sing.initialization import initialize_params
 from sing.efgp_drift import EFGPDrift, _FrozenEFGPDrift
 from sing.efgp_emissions import update_emissions_gaussian
 
+from functools import partial
+
+
+def _build_jit_estep(D, T, t_grid, lik, output_params_static_keys, sigma):
+    """Compile a single inner-E-step iteration.
+
+    The compiled function takes natural_params, init_params, frozen-drift
+    arrays (Ef, Eff, Edfdx) and observation tensors as JAX inputs; building a
+    fresh _FrozenEFGPDrift inside the jit body is cheap because it only
+    closes over the input arrays, not over any python state that changes
+    between iters.
+
+    Caching the compiled artifact across iters is what makes the EM loop
+    competitive with SING's native ``fit_variational_em`` after a single
+    warm-up iter.
+
+    # TODO(efgp-jax): when EFGPBackend is JAX-native, the whole
+    # outer EM loop can be jit'd and lax.scan'd.
+    """
+    inputs = jnp.zeros((T, 1))
+    input_effect = jnp.zeros((D, 1))
+
+    @jax.jit
+    def _step(natural_params, init_params, Ef, Eff, Edfdx,
+              ys_obs, t_mask, output_params, key, rho):
+        trial_mask = jnp.ones((1, T), dtype=bool)
+        # mean params from natural
+        mean_params_b, _ = vmap(natural_to_mean_params)(natural_params,
+                                                        trial_mask)
+        frozen = _FrozenEFGPDrift(latent_dim=D, t_grid=t_grid,
+                                  Ef_per_t=Ef, Eff_per_t=Eff,
+                                  Edfdx_per_t=Edfdx)
+        # likelihood nat-grads
+        lik_g = vmap(lambda mp_, tm_, ys_: nat_grad_likelihood(
+            mp_, tm_, ys_, lik, output_params))(mean_params_b, t_mask, ys_obs)
+        # transition nat-grads
+        tr_g = vmap(lambda k, mp_, tm_, ip_: nat_grad_transition(
+            k, frozen, None, {}, tm_, ip_, t_grid, mp_,
+            inputs, input_effect, sigma))(jr.split(key, 1),
+                                          mean_params_b, trial_mask, init_params)
+        return {
+            'J': (1 - rho) * natural_params['J']
+                 + rho * (lik_g['J'] + tr_g['J']),
+            'L': (1 - rho) * natural_params['L'] + rho * tr_g['L'],
+            'h': (1 - rho) * natural_params['h']
+                 + rho * (lik_g['h'] + tr_g['h']),
+        }
+
+    return _step
+
 
 @dataclass
 class EFGPEMHistory:
@@ -142,16 +192,29 @@ def fit_efgp_sing(
 
     history = EFGPEMHistory()
 
+    # Pre-build jit'd E-step iteration; caches the compiled artifact across
+    # iterations so per-iter dispatch matches SING's native fit_variational_em.
+    # Sanity: SING's outer sigma must match the drift's σ_r (tied case).
+    sigma_d_sq = float(drift.sigma_drift_sq[0].cpu())
+    if not np.isclose(sigma_d_sq, sigma ** 2, rtol=1e-6):
+        raise ValueError(
+            f"EFGPDrift's sigma_drift_sq={sigma_d_sq} disagrees with "
+            f"EM-loop sigma²={sigma ** 2}. Pass them consistently.")
+    estep_step_fn = _build_jit_estep(D=D, T=T, t_grid=t_grid,
+                                     lik=likelihood,
+                                     output_params_static_keys=tuple(output_params),
+                                     sigma=sigma)
+
     # ---------------- main EM loop --------------------------------------
     for it in range(n_em_iters):
         rho = float(rho_sched[it])
 
         # ----- E-step ------------------------------------------------------
         for e in range(n_estep_iters):
-            # Get current marginals
+            # Get current marginals (jit-cached after first call)
             mp_b, _ = vmap(natural_to_marginal_params)(natural_params, trial_mask)
 
-            # Refresh q(f) on schedule
+            # Refresh q(f) on schedule (Torch side; not JAX-traced)
             if e % refresh_qf_every == 0:
                 qf_key, key = jr.split(key, 2)
                 drift.update_dynamics_params(qf_key, t_grid, mp_b, trial_mask,
@@ -159,49 +222,20 @@ def fit_efgp_sing(
                                              inputs=inputs, input_effect=input_effect,
                                              sigma=sigma)
 
-            # Batched drift moments at each (m_t, S_t)
+            # Batched drift moments at each (m_t, S_t) — single torch round-trip
             Ef, Eff, Edfdx = drift.drift_moments_at_marginals(
                 mp_b['m'][0], mp_b['S'][0]
             )
-            frozen = _FrozenEFGPDrift(latent_dim=D, t_grid=t_grid,
-                                      Ef_per_t=Ef, Eff_per_t=Eff,
-                                      Edfdx_per_t=Edfdx)
-            # Sanity: SING's outer `sigma` must match the drift's σ_r (tied case)
-            # because the q(f) update built A_r with W = Δ/(S σ_r²).
-            # We assert this once per E-step iter for safety.
-            sigma_d_sq = float(drift.sigma_drift_sq[0].cpu())
-            if not np.isclose(sigma_d_sq, sigma ** 2, rtol=1e-6):
-                raise ValueError(
-                    f"EFGPDrift's sigma_drift_sq={sigma_d_sq} disagrees "
-                    f"with EM-loop sigma²={sigma ** 2}. Pass them consistently."
-                )
 
-            mean_params_b, _ = vmap(natural_to_mean_params)(natural_params, trial_mask)
-
-            # Likelihood nat-grads (per-trial)
-            lik_g = vmap(
-                lambda mp_, tm_, ys_: nat_grad_likelihood(
-                    mp_, tm_, ys_, likelihood, output_params)
-            )(mean_params_b, t_mask, ys_obs)
-
-            # Transition nat-grads (per-trial). frozen passes through gp_post=None.
             tr_key, key = jr.split(key, 2)
-            tr_g = vmap(
-                lambda k, mp_, tm_, ip_: nat_grad_transition(
-                    k, frozen, None, {}, tm_, ip_, t_grid, mp_,
-                    inputs, input_effect, sigma)
-            )(jr.split(tr_key, n_trials), mean_params_b, trial_mask, init_params)
-
-            grads = {
-                'J': lik_g['J'] + tr_g['J'],
-                'h': lik_g['h'] + tr_g['h'],
-                'L': tr_g['L'],
-            }
-            natural_params = {
-                'J': (1 - rho) * natural_params['J'] + rho * grads['J'],
-                'L': (1 - rho) * natural_params['L'] + rho * grads['L'],
-                'h': (1 - rho) * natural_params['h'] + rho * grads['h'],
-            }
+            # Pass rho as a JAX scalar so changing rho doesn't retrigger jit
+            # tracing each iter.
+            natural_params = estep_step_fn(
+                natural_params, init_params,
+                Ef, Eff, Edfdx,
+                ys_obs, t_mask, output_params,
+                tr_key, jnp.asarray(rho, dtype=jnp.float32),
+            )
 
         # ----- M-step ------------------------------------------------------
         mp_b, _ = vmap(natural_to_marginal_params)(natural_params, trial_mask)
