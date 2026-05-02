@@ -161,9 +161,26 @@ hyperparameters held fixed at the init):
 
 | Method | Inducing/feature dim | Predictive observation RMSE | Wall time |
 | --- | --- | --- | --- |
-| **EFGP-SING** (this branch) | M = 49 (Fourier features) | **0.228** | ~41 s |
+| **EFGP-SING (JAX)** ¹ | M = 49 (Fourier features) | **0.219** | **~12 s** |
+| EFGP-SING (torch) ² | M = 49 | 0.228 | ~41 s |
 | SING-SparseGP | 64 inducing pts | 0.251 | ~28 s |
 | Trivial (predict mean obs) | – | 0.280 | – |
+
+¹ `fit_efgp_sing_jax`: inner E-step is `lax.scan`'d inside `jit`; q(f) update + drift moments + SING natural-grad in one compiled graph; no torch round-trip.
+² `fit_efgp_sing`: torch-backed q(f) and drift moments with a JIT'd SING natural-grad shell.
+
+With kernel learning enabled (`learn_kernel=True`, `kernel_warmup_iters=2`),
+EFGP-SING (JAX) wall time becomes ~75 s because the spectral grid (and
+hence the JIT'd graph) gets rebuilt every iter when ℓ moves enough to
+shift `mtot_per_dim`.  Lifting the grid to a JIT-input is a v1 task.
+
+JAX primitives benchmark against torch (raw NUFFT + Toeplitz + CG step):
+
+| M | torch | jax (jit) | ratio |
+| --- | --- | --- | --- |
+| 49 | 6.8 ms | 2.0 ms | **0.30x** |
+| 169 | 10.5 ms | 3.6 ms | **0.34x** |
+| 729 | 13.8 ms | 11.6 ms | 0.84x |
 
 EFGP wins by ~10% on observation prediction.
 
