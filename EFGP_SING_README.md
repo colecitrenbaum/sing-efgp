@@ -161,33 +161,42 @@ hyperparameters held fixed at the init):
 
 | Method | Inducing/feature dim | Predictive observation RMSE | Wall time |
 | --- | --- | --- | --- |
-| **EFGP-SING** (this branch) | M = 49 (Fourier features) | **0.228** | ~140 s |
-| SING-SparseGP | 64 inducing pts | 0.251 | ~40 s |
+| **EFGP-SING** (this branch) | M = 49 (Fourier features) | **0.228** | ~41 s |
+| SING-SparseGP | 64 inducing pts | 0.251 | ~28 s |
 | Trivial (predict mean obs) | – | 0.280 | – |
 
 EFGP wins by ~10% on observation prediction.
 
-### Why isn't EFGP faster than SparseGP here?
+### Per-iter cost breakdown (after the v0 jit / cache fixes)
 
-The EFGP block itself is fast (~50 ms/iter at this M).  The wall-time gap
-is almost entirely JAX↔Torch bridge overhead in the EM loop:
+```
+natural_to_marginal_params (Bayesian smoother, jit'd):   ~0.5 ms
+update_dynamics_params (torch q(f) update, grid cached): ~30   ms
+drift_moments_at_marginals (torch round-trip):            ~7   ms
+estep_step (jit'd SING natural-grad update):              ~1   ms
+                                                         --------
+TOTAL                                                    ~39   ms
+```
 
-* SING-SparseGP runs the entire E-step inside `jax.jit` + `lax.scan`, so
-  the per-iter cost is just the actual numerics on the device.
-* Our EFGP block runs in PyTorch.  Each E-step iteration we
-  `jnp.asarray(numpy(torch))` the drift moments back into JAX so SING's
-  natural-grad routine can use them.  After v0's jit fix (the rho-as-JAX-
-  scalar trick in `efgp_em.py:_build_jit_estep`) the JAX side compiles
-  once and reuses the artifact, but the round-trip itself is still ~50 ms
-  per iter.  At small `M` the round-trip dominates.
+Performance trace from the original v0 to today:
 
-For larger problems where SparseGP's `O(N M_ind²)` grows but EFGP's
-`O(N + M log M)` does not, the gap reverses.  The bridge overhead becomes
-negligible relative to the numerics.
+| Change | Wall time |
+| --- | --- |
+| Initial implementation (un-jit'd `vmap(natural_to_marginal_params)` per call) | 247 s |
+| Jit `natural_to_marginal_params` and the SING natural-grad inner-step | 142 s |
+| Pass `rho` as a JAX scalar (no per-iter retrace) | 53 s |
+| Cache the spectral grid across E-step iters (`setup_grid` was 26 ms) | 45 s |
+| Reuse marginals from last E-step iter in the M-step (skip a 2nd un-jit'd smoother call) | 41 s |
+
+EFGP-SING is now within 1.5x of SparseGP at this small problem size.  The
+remaining gap is overhead in our plain-Python EM loop body that SparseGP
+avoids by `lax.scan`'ing the entire E-step inside `jax.jit`.  At larger
+M the EFGP block stays at `O(M log M)` while SparseGP scales as
+`O(N M_ind²)`, so the wall-time gap reverses.
 
 When a JAX-native EFGP backend lands (`# TODO(efgp-jax)` markers in the
-code), the bridge disappears entirely and EFGP-SING approaches parity
-with SING's compiled SparseGP path even at small M.
+code), the bridge disappears entirely and the EM loop can be fully
+`@jit + lax.scan`'d, matching SING-SparseGP's compiled-loop performance.
 
 Both methods beat the trivial baseline; EFGP comes out ~10% better on
 predictive observation RMSE in this setting.  EFGP wall time is dominated

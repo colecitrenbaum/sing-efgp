@@ -287,6 +287,12 @@ class EFGPDrift(SDE):
         self.sigma_drift_sq = sd                    # (D_out,)
 
         self.cache: Optional[EFGPCache] = None
+        # Grid cache: ``setup_grid`` does a kernel-truncation bisection that
+        # accounts for ~40% of update_dynamics_params at small M.  We reuse
+        # the grid across E-step iters whenever the kernel hypers haven't
+        # changed and the X-cloud extent is similar.
+        self._grid_cache_key = None
+        self._grid_cache = None
 
     # ----------------------------------------------------------------
     # Required SDE abstract method
@@ -425,7 +431,21 @@ class EFGPDrift(SDE):
         # 3) Build the spectral grid once (depends only on kernel hypers + cloud)
         X_torch = torch.tensor(X_flat, dtype=self.backend.rdtype,
                                device=self.backend.device)
-        grid = self.backend.setup_grid(self.kernel, X_torch, self.eps_grid)
+        # Cheap cache key: (kernel hypers, cloud per-dim extent rounded).
+        # Across E-step iters within an EM iter, kernel hypers are unchanged
+        # and the X-cloud extent barely moves, so this cache hits ~ every
+        # iter except the very first / immediately after the M-step.
+        cur_extent = tuple(np.round(X_flat.max(axis=0) - X_flat.min(axis=0),
+                                    decimals=1).tolist())
+        key_grid = (round(float(self.kernel.lengthscale), 6),
+                    round(float(self.kernel.variance), 6),
+                    cur_extent, self.eps_grid)
+        if self._grid_cache_key == key_grid and self._grid_cache is not None:
+            grid = self._grid_cache
+        else:
+            grid = self.backend.setup_grid(self.kernel, X_torch, self.eps_grid)
+            self._grid_cache_key = key_grid
+            self._grid_cache = grid
         M = grid.M
 
         sigma_r = self.sigma_drift_sq.cpu().numpy()           # (D_out,)

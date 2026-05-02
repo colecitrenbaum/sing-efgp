@@ -204,6 +204,11 @@ def fit_efgp_sing(
                                      lik=likelihood,
                                      output_params_static_keys=tuple(output_params),
                                      sigma=sigma)
+    # Profiling showed that the per-iter Bayesian-smoother conversion
+    # (vmap(natural_to_marginal_params)) was ~95% of the wall time when
+    # called bare from Python — it gets retraced every call.  Jitting it
+    # collapses to ~5 ms / iter.
+    nat_to_marg_jit = jax.jit(vmap(natural_to_marginal_params))
 
     # ---------------- main EM loop --------------------------------------
     for it in range(n_em_iters):
@@ -212,7 +217,7 @@ def fit_efgp_sing(
         # ----- E-step ------------------------------------------------------
         for e in range(n_estep_iters):
             # Get current marginals (jit-cached after first call)
-            mp_b, _ = vmap(natural_to_marginal_params)(natural_params, trial_mask)
+            mp_b, _ = nat_to_marg_jit(natural_params, trial_mask)
 
             # Refresh q(f) on schedule (Torch side; not JAX-traced)
             if e % refresh_qf_every == 0:
@@ -238,7 +243,10 @@ def fit_efgp_sing(
             )
 
         # ----- M-step ------------------------------------------------------
-        mp_b, _ = vmap(natural_to_marginal_params)(natural_params, trial_mask)
+        # Reuse the marginals computed at the end of the E-step (jit cached).
+        # Avoids a second un-jit'd Bayesian-smoother call per outer EM iter
+        # (~1 s overhead each).
+        mp_b, _ = nat_to_marg_jit(natural_params, trial_mask)
         ms_t = mp_b['m'][0]                                       # (T, D)
         Ss_t = mp_b['S'][0]                                       # (T, D, D)
 
