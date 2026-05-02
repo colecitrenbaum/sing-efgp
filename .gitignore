@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+demos/_efgp_demo_out/
