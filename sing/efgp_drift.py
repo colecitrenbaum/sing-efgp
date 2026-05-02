@@ -85,122 +85,13 @@ class EFGPCache:
 # approximation used by most sparse-GP VI codes when an analytic E[J_f]
 # is available.
 
-@jax.custom_vjp
-def _ef_with_jac_grad(m, ef_const, jac_const):
-    """Returns ``ef_const`` (a (D_out,) value) but with VJP
-
-           ∂L/∂m = jac_const.T @ ∂L/∂ef
-
-    so SING's autodiff sees the Jacobian as ∂E[f]/∂m.
-    """
-    return ef_const
-
-
-def _ef_fwd(m, ef_const, jac_const):
-    return ef_const, (ef_const, jac_const)
-
-
-def _ef_bwd(res, g):
-    ef_const, jac_const = res
-    # g has shape (D_out,); jac_const has shape (D_out, D_lat).
-    grad_m = jac_const.T @ g
-    return (grad_m, jnp.zeros_like(ef_const), jnp.zeros_like(jac_const))
-
-
-_ef_with_jac_grad.defvjp(_ef_fwd, _ef_bwd)
-
-
-@jax.custom_vjp
-def _eff_with_grads(m, S, eff_const, ef_const, jac_const):
-    """Returns scalar ``eff_const = E[||f||²]`` with a *local-quadratic*-
-    transition-approximation VJP through both ``m`` and ``S``.
-
-    Local quadratic expansion ``f(x) ≈ f(m) + J(x − m)`` gives
-
-       E_q[||f(x)||²] ≈ ||f(m)||² + tr(J S Jᵀ)
-
-    so
-
-       ∂/∂m  ≈ 2 Jᵀ f(m)         (already encodes S=0 limit cleanly)
-       ∂/∂S  ≈ Jᵀ J              (matrix grad; symmetric)
-
-    The σ⁻² (diffusion) factor is applied separately by SING's
-    ``compute_neg_CE_single`` via its outer ``sigma`` argument.
-
-    We keep the cached scalar value (which can be more accurate than the
-    quadratic surrogate when the Hutchinson variance is included), but use
-    the quadratic-form gradients above — those are the principled local
-    sensitivities of E[||f||²] under a Gaussian q(x).
-    """
-    del S
-    return eff_const
-
-
-def _eff_fwd(m, S, eff_const, ef_const, jac_const):
-    return eff_const, (ef_const, jac_const)
-
-
-def _eff_bwd(res, g):
-    ef_const, jac_const = res
-    grad_m = 2.0 * g * (ef_const @ jac_const)              # (D_lat,)
-    grad_S = g * (jac_const.T @ jac_const)                  # (D_lat, D_lat)
-    return (grad_m, grad_S,
-            jnp.zeros(()),
-            jnp.zeros_like(ef_const),
-            jnp.zeros_like(jac_const))
-
-
-_eff_with_grads.defvjp(_eff_fwd, _eff_bwd)
-
-
-class _FrozenEFGPDrift(SDE):
-    """SDE whose ``f/ff/dfdx`` return precomputed values **and** expose
-    delta-method gradients through ``custom_vjp``.
-
-    Built once per E-step inner iteration from ``EFGPDrift``'s cached
-    moments at the *current* marginal means.  SING's natural-gradient
-    update then auto-differentiates ``compute_neg_CE_single`` and gets:
-
-      * the explicit ``(m, S)`` gradients of the cross-entropy, AND
-      * the implicit ``∂E[f]/∂m`` and ``∂E[f^T Σ⁻¹ f]/∂m`` via the cached
-        Jacobian (``Edfdx``) and mean (``Ef``).
-
-    ``∂/∂S`` of the drift expectations is set to zero (delta-method).
-    """
-
-    def __init__(self, *, latent_dim: int, t_grid: jnp.ndarray,
-                 Ef_per_t: jnp.ndarray, Eff_per_t: jnp.ndarray,
-                 Edfdx_per_t: jnp.ndarray):
-        super().__init__(expectation=None, latent_dim=latent_dim)
-        self._t_grid = t_grid                      # (T,)
-        self._Ef = Ef_per_t                        # (T, D_out)
-        self._Eff = Eff_per_t                      # (T,)  = E[||f||²]
-        self._Edfdx = Edfdx_per_t                  # (T, D_out, D_lat)
-
-    def _idx(self, t):
-        # SING calls with t = t_grid[i] exactly, so argmin is robust under vmap.
-        return jnp.argmin(jnp.abs(self._t_grid - t))
-
-    def drift(self, drift_params, x, t):
-        return self._Ef[self._idx(t)]
-
-    def f(self, drift_params, key, t, m, S, gp_post=None, *args, **kwargs):
-        idx = self._idx(t)
-        ef = self._Ef[idx]
-        jac = self._Edfdx[idx]
-        return _ef_with_jac_grad(m, ef, jac)
-
-    def ff(self, drift_params, key, t, m, S, gp_post=None, *args, **kwargs):
-        idx = self._idx(t)
-        eff = self._Eff[idx]
-        ef = self._Ef[idx]
-        jac = self._Edfdx[idx]
-        return _eff_with_grads(m, S, eff, ef, jac)
-
-    def dfdx(self, drift_params, key, t, m, S, gp_post=None, *args, **kwargs):
-        # Delta-method: treat the Jacobian itself as constant w.r.t. (m, S).
-        # Adding a (m,S) gradient here would require third-order moments.
-        return self._Edfdx[self._idx(t)]
+# Re-exports (the JAX-pure shims now live in sing.efgp_jax_drift so they can
+# be imported without pulling in torch).
+from sing.efgp_jax_drift import (
+    ef_with_jac_grad as _ef_with_jac_grad,
+    eff_with_grads as _eff_with_grads,
+    FrozenEFGPDrift as _FrozenEFGPDrift,
+)
 
 
 # --------------------------------------------------------------------------

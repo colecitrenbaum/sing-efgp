@@ -129,6 +129,87 @@ def test_cg_solve_matches_torch(ref):
     assert rel < 1e-3, f"CG μ rel error {rel:.2e}"
 
 
+def test_qf_and_drift_moments_match_torch(ref):
+    """End-to-end parity: q(f) update + drift moments at marginals.
+
+    Both sides use the SAME pre-sampled pseudo-cloud X_flat (sampled in
+    numpy; torch / JAX both consume it) so the only sources of difference
+    are NUFFT/CG accuracy and float dtype.
+    """
+    import sing.efgp_jax_drift as jpd
+    import sing.efgp_jax_primitives as jp_
+
+    fq = ref['full_qf']
+    cfg = ref['config']
+    d = cfg['d']
+
+    # Build the JAX grid for the FULL cloud (matches torch's grid here)
+    X_flat = jnp.asarray(fq['X_flat_full'], dtype=jnp.float32)
+    grid = jp_.spectral_grid_se(cfg['ls'], cfg['var'], X_flat,
+                                 eps=cfg['eps_grid'])
+    # Sanity: same M as torch
+    assert grid.M == fq['M_full'], f"grid M mismatch: jax {grid.M} vs torch {fq['M_full']}"
+
+    # Override the JAX side's pseudo-cloud sampling: replace the
+    # _build_pseudo_cloud call by injecting X_flat directly.  We do this by
+    # calling compute_mu_r_jax with a key that produces the same samples...
+    # but JAX RNG ≠ numpy RNG, so we monkey-patch: build mu_r by hand using
+    # the deterministic X_flat that's already in fq.
+    ms = jnp.asarray(fq['ms'], dtype=jnp.float32)
+    Ss = jnp.asarray(fq['Ss'], dtype=jnp.float32)
+    SSs = jnp.asarray(fq['SSs'], dtype=jnp.float32)
+    del_t = jnp.asarray(fq['del_t'], dtype=jnp.float32)
+
+    # Reproduce mu_r by inlining (no _build_pseudo_cloud sampling)
+    cdtype = grid.ws.dtype
+    weights = (jnp.repeat(del_t, fq['S_marginal'])
+               / (fq['S_marginal'] * fq['sigma_drift_sq']))
+    v_kernel = jp_.bttb_conv_vec_weighted(
+        X_flat, weights.astype(cdtype), grid.xcen, grid.h_per_dim,
+        grid.mtot_per_dim)
+    top = jp_.make_toeplitz(v_kernel, force_pow2=True)
+    A = jp_.make_A_apply(grid.ws, top, sigmasq=1.0)
+    ws_real_c = grid.ws.real.astype(cdtype)
+
+    import math as _math
+    d_a = ms[1:] - ms[:-1]
+    C_a = SSs - Ss[:-1]
+    mu_r_jax = []
+    for r in range(d):
+        a_r = (jnp.repeat(d_a[:, r], fq['S_marginal'])
+               / (fq['S_marginal'] * fq['sigma_drift_sq']))
+        Fstar_a = jp_.nufft1(X_flat, a_r.astype(cdtype),
+                              grid.xcen, grid.h_per_dim,
+                              out_shape=grid.mtot_per_dim).reshape(-1)
+        h1 = ws_real_c * Fstar_a
+        h2 = jnp.zeros_like(h1)
+        for j in range(d):
+            c_jr = (jnp.repeat(C_a[:, j, r], fq['S_marginal'])
+                    / (fq['S_marginal'] * fq['sigma_drift_sq']))
+            Fstar_c = jp_.nufft1(X_flat, c_jr.astype(cdtype),
+                                  grid.xcen, grid.h_per_dim,
+                                  out_shape=grid.mtot_per_dim).reshape(-1)
+            xi_j = grid.xis_flat[:, j].astype(cdtype)
+            h2 = h2 + (2j * _math.pi * xi_j) * (ws_real_c * Fstar_c)
+        h_r = h1 + h2
+        mu = jp_.cg_solve(A, h_r, tol=1e-7, max_iter=4 * grid.M)
+        mu_r_jax.append(mu)
+    mu_r_jax = jnp.stack(mu_r_jax, axis=0)
+
+    rel_mu = _rel(mu_r_jax, fq['mu_r_full'])
+    assert rel_mu < 5e-3, f"mu_r rel err {rel_mu:.2e}"
+
+    # Drift moments
+    Ef, Eff, Edfdx = jpd.drift_moments_jax(
+        mu_r_jax, grid, ms, D_lat=d, D_out=d)
+    rel_Ef = _rel(Ef, fq['Ef_full'])
+    rel_Eff = _rel(Eff, fq['Eff_full'])
+    rel_Edfdx = _rel(Edfdx, fq['Edfdx_full'])
+    assert rel_Ef < 5e-3, f"Ef rel err {rel_Ef:.2e}"
+    assert rel_Eff < 1e-2, f"Eff rel err {rel_Eff:.2e}"
+    assert rel_Edfdx < 5e-3, f"Edfdx rel err {rel_Edfdx:.2e}"
+
+
 def test_hutchinson_diag_consistent(ref):
     """Hutchinson is unbiased; with enough probes the mean should agree
     with a dense reference.  We compute the dense reference here in NumPy

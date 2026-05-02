@@ -39,10 +39,21 @@ from sing.utils.sing_helpers import (
 from sing.sing import nat_grad_likelihood, nat_grad_transition
 from sing.initialization import initialize_params
 
-from sing.efgp_drift import EFGPDrift, _FrozenEFGPDrift
 from sing.efgp_emissions import update_emissions_gaussian
 
 from functools import partial
+
+# JAX-native path (must be importable WITHOUT pulling in torch).
+# Import jax_finufft FIRST via efgp_jax_primitives so it loads before any
+# pytorch_finufft (which efgpnd uses) — they share libfinufft.
+import sing.efgp_jax_primitives as jp
+import sing.efgp_jax_drift as jpd
+from sing.efgp_jax_drift import FrozenEFGPDrift as _FrozenEFGPDrift
+
+# Torch path is optional: only import when fit_efgp_sing (not _jax) is called.
+def _import_torch_drift():
+    from sing.efgp_drift import EFGPDrift, _FrozenEFGPDrift as _FED_torch
+    return EFGPDrift, _FED_torch
 
 
 def _build_jit_estep(D, T, t_grid, lik, output_params_static_keys, sigma):
@@ -298,4 +309,243 @@ def fit_efgp_sing(
             print(f"EM {it + 1:2d}/{n_em_iters}  rho={rho:.3f}  " + "  ".join(extras))
 
     marginal_params, _ = vmap(natural_to_marginal_params)(natural_params, trial_mask)
+    return marginal_params, natural_params, output_params, init_params, history
+
+
+# ============================================================================
+# JAX-native EM loop (lax.scan'd inner E-step, no torch round-trip)
+# ============================================================================
+def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
+                                ls, var, eps_grid, S_marginal, n_estep_iters,
+                                X_template_for_grid):
+    """Compile a function that runs ``n_estep_iters`` inner E-step iterations
+    via ``lax.scan``, all JAX, no torch.
+
+    The spectral grid is determined at trace time from the kernel hypers and
+    a representative cloud (so `mtot_per_dim` is a static int tuple) — when
+    the kernel hypers change in the M-step we must rebuild this function.
+    """
+    grid = jp.spectral_grid_se(ls, var, X_template_for_grid, eps=eps_grid)
+    inputs = jnp.zeros((T, 1))
+    input_effect = jnp.zeros((D, 1))
+    del_t = (t_grid[1:] - t_grid[:-1])
+
+    nat_to_marg_b = jax.jit(vmap(natural_to_marginal_params))
+
+    @jax.jit
+    def scan_estep(natural_params, init_params, ys_obs, t_mask,
+                    output_params, key, rho):
+        trial_mask = jnp.ones((1, T), dtype=bool)
+
+        def one_iter(carry, key_iter):
+            nat_p = carry
+            mp_b, _ = vmap(natural_to_marginal_params)(nat_p, trial_mask)
+            ms = mp_b['m'][0]
+            Ss = mp_b['S'][0]
+            SSs = mp_b['SS'][0]
+
+            key_qf, key_grad = jr.split(key_iter, 2)
+            mu_r, Ef, Eff, Edfdx = jpd.qf_and_moments_jax(
+                ms, Ss, SSs, del_t, grid, key_qf,
+                sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+                D_lat=D, D_out=D,
+            )
+            frozen = _FrozenEFGPDrift(
+                latent_dim=D, t_grid=t_grid,
+                Ef_per_t=Ef, Eff_per_t=Eff, Edfdx_per_t=Edfdx)
+            mean_params_b, _ = vmap(natural_to_mean_params)(nat_p, trial_mask)
+            lik_g = vmap(lambda mp_, tm_, ys_: nat_grad_likelihood(
+                mp_, tm_, ys_, lik, output_params))(mean_params_b, t_mask, ys_obs)
+            tr_g = vmap(lambda k, mp_, tm_, ip_: nat_grad_transition(
+                k, frozen, None, {}, tm_, ip_, t_grid, mp_,
+                inputs, input_effect, sigma))(jr.split(key_grad, 1),
+                                              mean_params_b, trial_mask, init_params)
+            new_nat_p = {
+                'J': (1 - rho) * nat_p['J']
+                     + rho * (lik_g['J'] + tr_g['J']),
+                'L': (1 - rho) * nat_p['L'] + rho * tr_g['L'],
+                'h': (1 - rho) * nat_p['h']
+                     + rho * (lik_g['h'] + tr_g['h']),
+            }
+            return new_nat_p, None
+
+        keys = jr.split(key, n_estep_iters)
+        final_nat_p, _ = jax.lax.scan(one_iter, natural_params, keys)
+        return final_nat_p
+
+    return scan_estep, nat_to_marg_b, grid
+
+
+def fit_efgp_sing_jax(
+    *,
+    likelihood: Likelihood,
+    t_grid: jnp.ndarray,
+    output_params: Dict[str, jnp.ndarray],
+    init_params: InitParams,
+    latent_dim: int,
+    lengthscale: float,
+    variance: float,
+    sigma: float = 1.0,
+    sigma_drift_sq: Optional[float] = None,   # defaults to sigma**2
+    eps_grid: float = 1e-2,
+    S_marginal: int = 2,
+    n_em_iters: int = 8,
+    n_estep_iters: int = 10,
+    rho_sched: Optional[jnp.ndarray] = None,
+    learn_emissions: bool = True,
+    update_R: bool = True,
+    learn_kernel: bool = False,
+    n_mstep_iters: int = 4,
+    mstep_lr: float = 0.05,
+    n_hutchinson_mstep: int = 4,
+    kernel_warmup_iters: int = 2,
+    X_template: Optional[jnp.ndarray] = None,
+    seed: int = 0,
+    true_xs: Optional[np.ndarray] = None,
+    verbose: bool = True,
+) -> Tuple[MarginalParams, NaturalParams, Dict[str, jnp.ndarray],
+           InitParams, EFGPEMHistory]:
+    """Fully JAX-native fit: inner E-step is ``lax.scan``'d inside ``jit``.
+
+    Takes raw SE-kernel hypers (lengthscale, variance) instead of a torch-
+    backed ``EFGPDrift`` instance, so this function never imports torch.
+    Avoids the ``pytorch_finufft`` / ``jax_finufft`` libfinufft load-order
+    segfault: callers must not import any torch-using SING modules in the
+    same process.
+    """
+    if rho_sched is None:
+        rho_sched = jnp.linspace(0.1, 0.9, n_em_iters)
+    rho_sched = jnp.asarray(rho_sched)
+    if sigma_drift_sq is None:
+        sigma_drift_sq = float(sigma) ** 2
+
+    ys_obs = likelihood.ys_obs
+    t_mask = likelihood.t_mask
+    assert ys_obs.shape[0] == 1, "v0 supports a single trial."
+    n_trials, T, N = ys_obs.shape
+    D = latent_dim
+    trial_mask = jnp.ones((n_trials, T), dtype=bool)
+
+    ls = float(lengthscale)
+    var = float(variance)
+
+    # Build a *representative* cloud at the prior marginals so the spectral
+    # grid (and thus the jit'd graph) is built once.  Caller can supply a
+    # custom one if the latent posterior is expected to roam beyond the
+    # prior covariance.
+    if X_template is None:
+        diag_V0 = jnp.diag(jnp.asarray(init_params['V0'][0]))
+        X_template = (jnp.sqrt(diag_V0)[None, :]
+                      * jnp.linspace(-2., 2., max(T, 16))[:, None]
+                      + jnp.asarray(init_params['mu0'][0])[None, :])
+
+    # ---- Initialise natural params with a "diffusion-only" SDE ----
+    # Avoid SING's initialize_params (which would import torch via
+    # the drift module).  Use a Brownian-like initial chain instead.
+    nat_to_marg_b = jax.jit(vmap(natural_to_marginal_params))
+    A_init = jnp.zeros((T - 1, D, D))
+    b_init = jnp.zeros((T, D)).at[0].set(jnp.asarray(init_params['mu0'][0]))
+    Q_init = jnp.tile((sigma ** 2) * jnp.eye(D), (T, 1, 1)).at[0].set(
+        jnp.asarray(init_params['V0'][0]))
+    from sing.utils.sing_helpers import dynamics_to_natural_params
+    nat_one = dynamics_to_natural_params(A_init, b_init, Q_init, trial_mask[0])
+    natural_params = jax.tree_util.tree_map(lambda x: x[None], nat_one)
+
+    init_key, key = jr.split(jr.PRNGKey(seed), 2)
+
+    def _build():
+        return _build_jit_estep_scan_jax(
+            D=D, T=T, t_grid=t_grid, lik=likelihood, sigma=sigma,
+            sigma_drift_sq=sigma_drift_sq, ls=ls, var=var, eps_grid=eps_grid,
+            S_marginal=S_marginal, n_estep_iters=n_estep_iters,
+            X_template_for_grid=X_template,
+        )
+
+    scan_estep, _, grid = _build()
+    if verbose:
+        print(f"  [jax] M={grid.M}, mtot_per_dim={grid.mtot_per_dim}")
+
+    history = EFGPEMHistory()
+    log_ls = float(np.log(ls))
+    log_var = float(np.log(var))
+
+    for it in range(n_em_iters):
+        rho_jax = jnp.asarray(float(rho_sched[it]), dtype=jnp.float32)
+        em_key, key = jr.split(key, 2)
+        natural_params = scan_estep(natural_params, init_params,
+                                     ys_obs, t_mask, output_params,
+                                     em_key, rho_jax)
+
+        # ---- M-step ----
+        mp_b, _ = nat_to_marg_b(natural_params, trial_mask)
+        ms_t = mp_b['m'][0]
+        Ss_t = mp_b['S'][0]
+        SSs_t = mp_b['SS'][0]
+
+        # 1) Closed-form (C, d, R) for Gaussian emissions
+        if learn_emissions:
+            C_new, d_new, R_new = update_emissions_gaussian(
+                ms_t, Ss_t, ys_obs[0], t_mask[0], update_R=update_R)
+            output_params = {**output_params, 'C': C_new, 'd': d_new}
+            if R_new is not None:
+                output_params['R'] = R_new
+        init_params = vmap(update_init_params)(ms_t[None, 0], Ss_t[None, 0])
+
+        # 2) Collapsed kernel M-step (after warmup so q(f) isn't trivial)
+        if learn_kernel and it >= kernel_warmup_iters:
+            mstep_key, key = jr.split(key, 2)
+            del_t = t_grid[1:] - t_grid[:-1]
+            mu_r, X_pseudo, top = jpd.compute_mu_r_jax(
+                ms_t, Ss_t, SSs_t, del_t, grid, mstep_key,
+                sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+                D_lat=D, D_out=D,
+            )
+            # z_r = h_θ,r / ws  (so M-step varies hypers via ws and recovers h_r = ws ⊙ z_r)
+            ws_real_c = grid.ws.real.astype(grid.ws.dtype)
+            ws_safe = jnp.where(jnp.abs(ws_real_c) < 1e-30,
+                                 jnp.array(1e-30, dtype=ws_real_c.dtype),
+                                 ws_real_c)
+            # h_θ_0,r = A_θ_0 μ at the E-step optimum
+            from sing.efgp_jax_primitives import make_A_apply
+            A_at_theta0 = make_A_apply(grid.ws, top, sigmasq=1.0)
+            h_r0 = jax.vmap(A_at_theta0)(mu_r)
+            z_r = h_r0 / ws_safe
+            log_ls_new, log_var_new, _ = jpd.m_step_kernel_jax(
+                log_ls, log_var,
+                mu_r_fixed=mu_r, z_r=z_r, top=top,
+                xis_flat=grid.xis_flat, h_per_dim=grid.h_per_dim,
+                D_lat=D, D_out=D,
+                n_inner=n_mstep_iters, lr=mstep_lr,
+                n_hutchinson=n_hutchinson_mstep, include_trace=True,
+                key=mstep_key,
+            )
+            new_ls = float(jnp.exp(log_ls_new))
+            new_var = float(jnp.exp(log_var_new))
+            # Avoid pathological collapse (a v0 safety belt; the cold-start
+            # collapse is documented as a known issue)
+            if 0.05 < new_ls < 50.0 and 0.01 < new_var < 100.0:
+                ls = new_ls
+                var = new_var
+                log_ls = float(log_ls_new)
+                log_var = float(log_var_new)
+                # Rebuild the jit'd scan_estep with the new spectral grid.
+                scan_estep, _, grid = _build()
+
+        if true_xs is not None:
+            rmse_lat = float(np.sqrt(np.mean(
+                (np.asarray(ms_t) - true_xs) ** 2)))
+            history.latent_rmse.append(rmse_lat)
+        history.lengthscale.append(ls)
+        history.variance.append(var)
+
+        if verbose:
+            extras = []
+            if history.latent_rmse:
+                extras.append(f"latent_rmse={history.latent_rmse[-1]:.3f}")
+            extras.append(f"ℓ={ls:.3f}")
+            extras.append(f"σ²={var:.3f}")
+            print(f"[jax] EM {it + 1:2d}/{n_em_iters}  rho={float(rho_sched[it]):.3f}  "
+                  + "  ".join(extras))
+
+    marginal_params, _ = nat_to_marg_b(natural_params, trial_mask)
     return marginal_params, natural_params, output_params, init_params, history
