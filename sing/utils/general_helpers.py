@@ -207,7 +207,7 @@ def make_gram(kernel_fn: Kernel, kernel_params: Dict[str, Any], Xs: jnp.array, X
 def sgd(key: jr.PRNGKey, loss_fn: Callable[[jr.PRNGKey, Dict[str, Any]], float], params: Dict[str, Any], n_iters: int, learning_rate: float) -> Tuple[Dict[str, Any], float]:
     """
     Performs SGD with Adam on a specified loss function with respect to params
-    
+
     Params:
     ------------
     key: random key for sampling; the loss function can depend on this random key i.e. L(key, x) -> R_+

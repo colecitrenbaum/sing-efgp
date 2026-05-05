@@ -1,0 +1,721 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true, linkcolor=blue!50!black, urlcolor=blue!50!black}
+
+% --- notation ---------------------------------------------------------------
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Eq}[1][q]{\mathbb{E}_{#1}}
+\newcommand{\Eqx}{\mathbb{E}_{q(x_i)}}
+\newcommand{\Eqxx}{\mathbb{E}_{q(x_i,\,x_{i+1})}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\GP}{\operatorname{GP}}
+\newcommand{\given}{\,|\,}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{The EFGP-SING E-step\\
+\large GP regression on uncertain latent velocities,
+solved by Fourier features}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note derives the E-step of SING with a GP drift prior, accelerated by
+EFGP. The derivation is laid out in four strict layers, introduced once each:
+\textbf{(1)} the conceptual update is GP regression on latent velocities;
+\textbf{(2)} when the latent path is uncertain, fixed sufficient statistics
+are replaced by expectations under $q(x)$, with the linear term resolved by
+Stein's lemma; \textbf{(3)} EFGP is the kernel approximation
+$K(x,x')\!\approx\!\phi(x)^*\phi(x')$, which turns the same regression problem
+into a matrix-free system $A_r\mu_r=h_r$; \textbf{(4)} the expectations are
+computed by Monte Carlo over $q(x)$ using NUFFT and BTTB-Toeplitz primitives.
+\end{abstract}
+
+\tableofcontents
+
+% ============================================================================
+\section{Setup}
+% ============================================================================
+
+\subsection*{Latent SDE and observations}
+
+We assume an Euler-discretised latent SDE
+\begin{equation}
+x_{i+1} \;=\; x_i \;+\; \Delta_i\, f(x_i) \;+\; \varepsilon_i,
+\qquad \varepsilon_i \sim \mathcal{N}(0,\,\Delta_i\Sigma),
+\label{eq:sde}
+\end{equation}
+with Gaussian observations $p(y_i\given x_i)$. Throughout, we abbreviate
+\begin{equation}
+\delta_i \;:=\; x_{i+1} - x_i.
+\end{equation}
+The diffusion is taken diagonal,
+$\Sigma=\diag(\sigma_1^2,\ldots,\sigma_{D_x}^2)$. The drift coordinates carry
+independent GP priors,
+\begin{equation}
+f_r \sim \GP(0, k_\theta), \qquad r = 1,\ldots,D_x.
+\label{eq:gp-prior}
+\end{equation}
+
+\subsection*{Joint and ELBO}
+
+The joint density factorises as
+\begin{equation}
+p(f, x_{0:T}, y_{0:T})
+\;=\;
+p(f)\,p(x_0)
+\prod_i p(x_{i+1}\given x_i, f)
+\prod_i p(y_i\given x_i),
+\end{equation}
+and SING uses a structured variational posterior $q(x_{0:T})\,q(f)$. The ELBO
+splits into
+\begin{equation}
+\mathcal{L}(q)
+\;=\;
+\underbrace{\Eq[\log p(y\given x)]}_{\text{depends only on }q(x)}
+\;+\;
+\underbrace{\Eq[\log p(x\given f)]}_{\text{couples }q(x),\,q(f)}
+\;+\;
+\underbrace{\Eq[\log p(f)] - \Eq[\log q(f)]}_{\text{prior + entropy of }q(f)}
+\;+\;\text{(terms in }q(x)\text{ only)}.
+\end{equation}
+Only the transition term $\Eq[\log p(x\given f)]$ couples $q(x)$ and $q(f)$.
+Everything in this document follows from analysing that one term.
+
+% ============================================================================
+\section{The transition term, stripped to its $f$-content}
+\label{sec:transition}
+% ============================================================================
+
+The Euler transition log-density is
+\begin{equation}
+\log p(x_{i+1}\given x_i,f)
+\;=\;
+-\,\frac{1}{2\Delta_i}
+\bigl[\delta_i - \Delta_i\, f(x_i)\bigr]^{\!\top}\!
+\Sigma^{-1}\,
+\bigl[\delta_i - \Delta_i\, f(x_i)\bigr]
+\;+\; \text{const}.
+\end{equation}
+The constant and the $\delta_i^\top\Sigma^{-1}\delta_i$ term do not involve $f$.
+Expanding for diagonal $\Sigma$, the part of $\log p(x_{i+1}\given x_i,f)$
+that depends on coordinate $f_r$ is
+\begin{equation}
+\boxed{\;
+\frac{1}{\sigma_r^2}\,\delta_{i,r}\, f_r(x_i)
+\;-\;
+\frac{\Delta_i}{2\sigma_r^2}\, f_r(x_i)^2.
+\;}
+\label{eq:f-quadratic}
+\end{equation}
+This is a Gaussian likelihood, quadratic in the function values $f_r(x_i)$.
+That is the \emph{only} fact about the transition we will need. The $q(f_r)$
+update reduces to combining \eqref{eq:f-quadratic} with the GP prior
+\eqref{eq:gp-prior}.
+
+\paragraph{Independence across $r$.}
+Because $\Sigma$ is diagonal and the priors on $f_r$ are independent, the
+$q(f_r)$ updates decouple across $r$. From now on we work coordinate-wise and
+suppress the index $r$ when convenient.
+
+% ============================================================================
+\section{Layer 1: GP regression with known $x$}
+\label{sec:known-x}
+% ============================================================================
+
+Pretend, for this section only, that the latent path
+$X = \{x_0,\ldots,x_{T-1}\}$ is observed. Define the pseudo-velocity
+\begin{equation}
+y_{i,r}^{\text{pseudo}}
+\;:=\; \frac{\delta_{i,r}}{\Delta_i}
+\;=\; \frac{x_{i+1,r}-x_{i,r}}{\Delta_i}.
+\end{equation}
+Completing the square in \eqref{eq:f-quadratic} shows the contribution from
+transition $i$ is
+\begin{equation}
+-\,\frac{\Delta_i}{2\sigma_r^2}
+\bigl(y_{i,r}^{\text{pseudo}} - f_r(x_i)\bigr)^{\!2}
+\;+\; \text{const},
+\end{equation}
+i.e.\ a Gaussian observation of $f_r(x_i)$ with precision
+\begin{equation}
+\lambda_{i,r} \;=\; \frac{\Delta_i}{\sigma_r^2}.
+\label{eq:precision}
+\end{equation}
+Stack the latent function values at the path locations,
+\begin{equation}
+f_{r,X}
+\;=\; \bigl[f_r(x_0),\ldots,f_r(x_{T-1})\bigr]^{\!\top}\in\mathbb{R}^{T},
+\qquad
+[K_X]_{ij} = k_\theta(x_i,x_j),
+\qquad
+\Lambda_r = \diag\!\bigl(\lambda_{i,r}\bigr),
+\end{equation}
+and let $y_r^{\text{pseudo}}\in\mathbb{R}^T$ collect the pseudo-velocities.
+The negative log posterior at $f_{r,X}$ is then
+\begin{equation}
+\tfrac12\, f_{r,X}^{\!\top} K_X^{-1} f_{r,X}
+\;+\;
+\tfrac12\,(y_r^{\text{pseudo}} - f_{r,X})^{\!\top}
+\Lambda_r
+(y_r^{\text{pseudo}} - f_{r,X})
+\;+\; \text{const},
+\end{equation}
+so $q(f_{r,X}) = \mathcal{N}(m_{r,X},\,C_{r,X})$ with the standard GP-regression
+identities
+\begin{equation}
+\boxed{\;
+C_{r,X}^{-1} \;=\; K_X^{-1} + \Lambda_r,
+\qquad
+C_{r,X}^{-1}\, m_{r,X} \;=\; \Lambda_r\, y_r^{\text{pseudo}}.
+\;}
+\label{eq:known-x}
+\end{equation}
+
+\medskip
+\noindent
+\textbf{Takeaway.} \emph{The $q(f)$ update is GP regression on latent
+velocities.} Sections \ref{sec:uncertain-x}--\ref{sec:efgp} will modify
+\eqref{eq:known-x}, but the derivation never escapes this template.
+
+% ============================================================================
+\section{Layer 2: uncertain $x$, in a finite basis}
+\label{sec:uncertain-x}
+% ============================================================================
+
+In SING, $X$ is not observed; only $q(x_{0:T})$ is available, a Gaussian
+Markov variational posterior with marginals
+\begin{equation}
+m_i = \E[x_i],\qquad
+S_i = \Cov(x_i),\qquad
+S_{i,i+1} = \Cov(x_i, x_{i+1}).
+\end{equation}
+The K-space packaging \eqref{eq:known-x} no longer applies directly: with
+$X$ random, both $f_{r,X}$ and $K_X$ are themselves random objects.
+But the mean-field update for $q(f_r)$ is still well-defined:
+\begin{equation}
+\log q^*(f_r)
+\;=\;
+\log p_\theta(f_r)
+\;+\;
+\sum_i \Eqxx\!\left[
+\frac{\delta_{i,r}\, f_r(x_i)}{\sigma_r^2}
+\;-\;\frac{\Delta_i\, f_r(x_i)^2}{2\sigma_r^2}
+\right]
+\;+\; \text{const}.
+\label{eq:logqstar}
+\end{equation}
+The expectation here is over $x$ only — $f_r$ is the variable we are
+updating, so it stays inside.
+
+\paragraph{Pick a basis.}
+Expand $f_r$ in any finite basis,
+\begin{equation}
+f_r(x) \;=\; \phi(x)^{*}\, w_r,
+\qquad w_r \sim \mathcal{N}(0, I_M),
+\label{eq:basis}
+\end{equation}
+chosen so that the GP prior on $f_r$ becomes the iid prior on the
+coefficients $w_r$. (Section~\ref{sec:efgp} specialises $\phi$ to Fourier
+features; for now any basis works.) Substituting \eqref{eq:basis} into
+\eqref{eq:logqstar},
+\begin{equation}
+\log q^*(w_r)
+\;=\;
+-\tfrac12\, w_r^{*} A_r\, w_r
+\;+\;
+\Re\!\bigl(h_r^{*} w_r\bigr)
+\;+\;\text{const},
+\end{equation}
+with
+\begin{equation}
+\boxed{\;
+A_r \;=\; I + \frac{1}{\sigma_r^2}\sum_i \Delta_i\,
+\Eqx\!\bigl[\phi(x_i)\phi(x_i)^{*}\bigr],
+\qquad
+h_r \;=\; \frac{1}{\sigma_r^2}\sum_i
+\Eqxx\!\bigl[\phi(x_i)\,(x_{i+1,r}-x_{i,r})\bigr].
+\;}
+\label{eq:Ah}
+\end{equation}
+The integration over $x$ contracts $\phi\phi^{*}$ and $\phi$ down to the
+deterministic $M\times M$ matrix and $M$-vector inside \eqref{eq:Ah}; the
+variable $w_r$ is never touched. So $\log q^*(w_r)$ is manifestly
+quadratic in $w_r$, and
+\begin{equation}
+q(w_r) \;=\; \mathcal{N}(\mu_r,\,A_r^{-1}),
+\qquad
+A_r\, \mu_r \;=\; h_r.
+\label{eq:Ah-system}
+\end{equation}
+This is the EFGP analogue of the K-space identities \eqref{eq:known-x},
+under the substitutions
+$K_X^{-1}+\Lambda_r \!\leftrightarrow\! A_r$ and
+$\Lambda_r y_r^{\text{pseudo}} \!\leftrightarrow\! h_r$. The expectation
+over $q(x)$ neither destroys $w_r$ nor breaks Gaussianity; it only
+determines the deterministic coefficients of the system.
+
+\subsection*{Stein identity for the linear term in $h_r$}
+
+The linear coefficient in \eqref{eq:Ah} is a pairwise expectation under
+$q(x_i, x_{i+1})$, which is awkward. Stein's lemma collapses it to
+marginal expectations plus a covariance correction. Let
+\begin{equation}
+d_i \;:=\; m_{i+1} - m_i,
+\qquad
+C_i \;:=\; S_{i,i+1} - S_i \;=\; \Cov(x_i,\, x_{i+1} - x_i).
+\end{equation}
+For any sufficiently smooth $g$ (vector- or scalar-valued), the Gaussian
+Stein identity gives
+\begin{equation}
+\E\bigl[g(x_i)\,(x_{i+1,r}-x_{i,r})\bigr]
+\;=\;
+\E[g(x_i)]\,d_{i,r}
+\;+\;
+\E[J_g(x_i)]\,C_{i,\cdot r},
+\end{equation}
+where $C_{i,\cdot r}$ is the $r$-th column of $C_i$. Applying this to
+$g=\phi$ (componentwise) inside \eqref{eq:Ah},
+\begin{equation}
+\boxed{\;
+h_r
+\;=\;
+\frac{1}{\sigma_r^2}\sum_i
+\Bigl\{
+\underbrace{\Eqx[\phi(x_i)]\,d_{i,r}}_{\text{mean-increment}}
+\;+\;
+\underbrace{\Eqx[J_\phi(x_i)]^{*}\,C_{i,\cdot r}}_{\text{Stein correction}}
+\Bigr\}.
+\;}
+\label{eq:hr-stein-abstract}
+\end{equation}
+After this collapse, every quantity in \eqref{eq:Ah-system} depends only
+on \emph{marginal} expectations under $q(x_i)$, plus the cross-cov
+correction $C_i$.
+
+% ============================================================================
+\section{Layer 3: EFGP — the Fourier-feature choice}
+\label{sec:efgp}
+% ============================================================================
+
+EFGP specialises the basis $\phi$ in \eqref{eq:basis} to Fourier features:
+\begin{equation}
+\phi_\theta(x) \;=\; D_\theta\, F_x,
+\qquad
+F_x[k] \;=\; e^{2\pi i\, x^\top \xi_k},
+\qquad
+\phi_\theta(x)^{*}\phi_\theta(x') \;\approx\; k_\theta(x,x'),
+\label{eq:efgp-features}
+\end{equation}
+where $\{\xi_k\}_{k=1}^{M}$ is an equispaced spectral grid and $D_\theta$
+is diagonal with square-root spectral weights chosen to match $k_\theta$.
+This is the only kernel approximation introduced. The system
+$A_r\,\mu_r=h_r$ from \eqref{eq:Ah-system} is unchanged; what we gain are
+two structural simplifications.
+
+\paragraph{Cheap Jacobian.}
+Differentiating \eqref{eq:efgp-features},
+\begin{equation}
+\frac{\partial \phi_k(x)}{\partial x_j} \;=\; 2\pi i\,\xi_{k,j}\,\phi_k(x),
+\label{eq:phi-jac}
+\end{equation}
+so $J_\phi$ is just frequency-multiplication of $\phi$. The Stein
+correction in \eqref{eq:hr-stein-abstract} costs no more than evaluating
+$\phi$ itself.
+
+\paragraph{BTTB structure of $\Eqx[\phi\phi^{*}]$.}
+For Fourier features, $\phi(x)\phi(x)^{*}$ has $(k,\ell)$ entry
+$D_\theta\,e^{2\pi i x^\top(\xi_\ell-\xi_k)}\,D_\theta$. The expectation
+under $q(x_i)$ depends on $\xi_\ell-\xi_k$ only:
+\begin{equation}
+\bigl(\Eqx[\phi\phi^{*}]\bigr)_{k\ell}
+\;=\;
+D_{\theta,k}\,\Eqx\!\bigl[e^{2\pi i\,x_i^\top(\xi_\ell-\xi_k)}\bigr]\,D_{\theta,\ell}.
+\end{equation}
+On an equispaced grid this makes $\Eqx[\phi\phi^{*}]$ Block-Toeplitz with
+Toeplitz Blocks (BTTB), so $A_r v$ costs $O(M\log M)$ via FFT instead of
+$O(M^2)$.
+
+\medskip
+\noindent
+\textbf{Where we are.} The variational objective \eqref{eq:logqstar} and
+the resulting linear system \eqref{eq:Ah-system}--\eqref{eq:hr-stein-abstract}
+are basis-agnostic. EFGP is the choice of basis that makes both pieces
+of $A_r$ and $h_r$ computable as Fourier transforms of weighted point
+clouds — the topic of the next section.
+
+% ============================================================================
+\section{Layer 4: computing the expectations}
+\label{sec:compute}
+% ============================================================================
+
+The remaining ingredients are the marginal expectations
+$\Eqx[\phi(x_i)\phi(x_i)^*]$, $\Eqx[\phi(x_i)]$, and $\Eqx[J_\phi(x_i)]$.
+These are evaluated by Monte Carlo over $q(x_i)$, then assembled via NUFFT
+and BTTB-Toeplitz primitives.
+
+\subsection*{Monte Carlo cloud}
+
+For each $i = 0,\ldots,T-2$ draw $S$ marginal samples
+\begin{equation}
+x_i^{(s)} \sim q(x_i),\qquad s = 1,\ldots,S,
+\end{equation}
+and stack them as $X = \{x_i^{(s)}\}_{i,s}\in\mathbb{R}^{(T-1)S\times D_x}$.
+Define
+\begin{equation}
+[F_X]_{k,(i,s)} \;=\; e^{2\pi i\,(x_i^{(s)})^\top \xi_k},
+\qquad
+\phi_\theta(x_i^{(s)}) \;=\; D_\theta\,(F_X)_{:,(i,s)}.
+\end{equation}
+
+\subsection*{The precision $A_r$ as a Toeplitz operator}
+
+Set the per-sample weight
+\begin{equation}
+(W_r)_{(i,s)} \;=\; \frac{\Delta_i}{S\,\sigma_r^2}.
+\end{equation}
+Then $A_r$ in \eqref{eq:Ah} becomes
+\begin{equation}
+A_r \;\approx\; I + D_\theta\,T_r\,D_\theta,
+\qquad
+T_r \;:=\; F_X^{*}\,W_r\,F_X.
+\end{equation}
+Crucially, the $(k,\ell)$ entry of $T_r$ depends on the frequency
+\emph{difference} $\xi_\ell - \xi_k$:
+\begin{equation}
+(T_r)_{k\ell}
+\;=\;
+\sum_{i,s}\frac{\Delta_i}{S\sigma_r^2}\,
+e^{2\pi i\,(x_i^{(s)})^\top(\xi_\ell - \xi_k)}.
+\end{equation}
+For an equispaced spectral grid, $T_r$ is therefore Block-Toeplitz with
+Toeplitz Blocks (BTTB), and a single Type-1 NUFFT over the cloud $X$ produces
+its generating kernel. Matvecs $A_r v$ are
+\begin{equation}
+A_r v \;=\; v + D_\theta\bigl(T_r\,(D_\theta v)\bigr),
+\end{equation}
+implemented in the code as
+\code{make\_A\_apply} (see
+\code{sing/efgp\_jax\_primitives.py}). The system $A_r\mu_r = h_r$ is then
+solved by Jacobi-preconditioned conjugate gradient.
+
+\subsection*{Building $h_r$}
+
+Define
+\begin{equation}
+(a_r)_{(i,s)} \;=\; \frac{d_{i,r}}{S\,\sigma_r^2},
+\qquad
+(c_{j,r})_{(i,s)} \;=\; \frac{[C_i]_{j,r}}{S\,\sigma_r^2}.
+\end{equation}
+Then \eqref{eq:hr-stein-abstract} estimates as
+\begin{equation}
+h_{1,r} \;\approx\; D_\theta\, F_X^{*} a_r,
+\qquad
+h_{2,r} \;\approx\; \sum_{j=1}^{D_x} (-2\pi i\,\xi_j) \odot D_\theta\, F_X^{*} c_{j,r},
+\qquad
+h_r = h_{1,r} + h_{2,r}.
+\label{eq:hr-mc}
+\end{equation}
+Each term costs one Type-1 NUFFT plus a frequency-weighted reduction.
+
+\paragraph{Sign of the Stein correction.}
+The factor in $h_{2,r}$ is $-2\pi i\,\xi_j$ (negative) because the term comes
+from the \emph{adjoint} Jacobian $J_\phi^{*}$, and
+$\overline{2\pi i\,\xi_{k,j}\,\phi_k(x)} = -2\pi i\,\xi_{k,j}\,\overline{\phi_k(x)}$.
+This sign is straightforward to miss from \eqref{eq:phi-jac} alone — see
+\code{compute\_mu\_r\_jax} in \code{sing/efgp\_jax\_drift.py} (and the
+\texttt{EFGP\_SING\_README.md} bug-fix history).
+
+\paragraph{Cross-covariance convention.}
+SING stores $\code{SSs}[t] = \Cov(x_{t+1},x_t)$, but the Stein identity needs
+$S_{i,i+1} = \Cov(x_i,x_{i+1})$, which is $\code{SSs}[t]^{\!\top}$.
+
+\subsection*{Pair-sampling remark}
+
+The Stein form \eqref{eq:hr-stein-abstract} can be checked against a naive
+pair-sampling estimator: draw transition pairs
+$(x_i^{(s)},x_{i+1}^{(s)}) \sim q(x_i,x_{i+1})$ and use sampled pseudo-velocities
+$y_{i,r}^{(s)} = (x_{i+1,r}^{(s)} - x_{i,r}^{(s)})/\Delta_i$ in \eqref{eq:known-x}.
+Both estimators target the same $h_r$; Stein replaces sampled increments by
+analytic mean/covariance corrections and has lower variance. SING uses Stein
+in production and pair-sampling only as a regression test.
+
+% ============================================================================
+\section{Posterior predictive moments}
+\label{sec:moments}
+% ============================================================================
+
+The $q(x)$ update needs three drift expectations at each $x_i$:
+$\bar f(x)$, $\E_{q(f)}[f(x)^\top \Sigma^{-1} f(x)]$, and the Jacobian
+$J_{\bar f}(x)$. With $q(w_r) = \mathcal{N}(\mu_r, A_r^{-1})$,
+\begin{align}
+\bar f_r(x) &\;=\; \phi(x)^* \mu_r, \\[2pt]
+\frac{\partial \bar f_r}{\partial x_j}(x)
+&\;=\; \phi(x)^*\!\bigl[(2\pi i\,\xi_j)\odot \mu_r\bigr], \\[2pt]
+\Cov_{q(f)}\!\bigl[f_r(x),f_r(x')\bigr]
+&\;=\; \phi(x)^* A_r^{-1} \phi(x').
+\end{align}
+For diagonal $\Sigma$ and independent output GPs,
+\begin{equation}
+\E_{q(f)}\!\bigl[f(x)^\top \Sigma^{-1} f(x)\bigr]
+\;=\;
+\sum_r \sigma_r^{-2}\!\left[\,\bar f_r(x)^2 + \phi(x)^* A_r^{-1}\phi(x)\,\right].
+\end{equation}
+Mean and Jacobian cost one Type-2 NUFFT each
+(\code{drift\_moments\_jax} in \code{sing/efgp\_jax\_drift.py}). The variance
+$\phi(x)^* A_r^{-1}\phi(x)$ is estimated without forming $A_r^{-1}$ via
+Hutchinson probes
+\begin{equation}
+\diag\!\bigl(\Phi_{\text{eval}} A_r^{-1} \Phi_{\text{eval}}^*\bigr)
+\;\approx\;
+\frac{1}{J}\sum_{j=1}^J z_j \odot \Phi_{\text{eval}} A_r^{-1} \Phi_{\text{eval}}^* z_j,
+\qquad z_j \sim \text{Rademacher},
+\end{equation}
+each requiring one adjoint Fourier apply, one CG solve with $A_r$, and one
+forward Fourier apply (\code{hutchinson\_diag} in
+\code{sing/efgp\_jax\_primitives.py}).
+
+% ============================================================================
+\section{Feeding back into the $q(x)$ update}
+\label{sec:qx}
+% ============================================================================
+
+With $q(f)$ frozen, the transition contribution to the ELBO is
+\begin{equation}
+\E_{q(f)}\!\bigl[\log p(x_{i+1}\given x_i,f)\bigr]
+\;=\;
+-\,\frac{\delta_i^\top \Sigma^{-1}\delta_i}{2\Delta_i}
++ \delta_i^\top \Sigma^{-1}\bar f(x_i)
+- \frac{\Delta_i}{2}\,\bar f(x_i)^\top \Sigma^{-1}\bar f(x_i)
++ \text{const},
+\label{eq:transition-frozen}
+\end{equation}
+where $\bar f(x) = \phi(x)^{*}\mu_r$ is the EFGP posterior-mean drift.
+SING's natural-gradient update needs the value and the $(m_i, S_i)$-derivatives
+of \eqref{eq:transition-frozen} integrated against $q(x_i, x_{i+1}) =
+\mathcal{N}\bigl((m_i, m_{i+1}),\,(S_i, S_{i,i+1}; S_{i,i+1}^\top, S_{i+1})\bigr)$.
+None of those integrals are closed-form because $\bar f$ is nonlinear.
+
+\paragraph{The approximation, in one line.}
+Replace $\bar f$ by its first-order Taylor expansion at $m_i$:
+\begin{equation}
+\boxed{\;
+\widetilde f(x_i) \;:=\; \bar f(m_i) \;+\; J_{\bar f}(m_i)\,(x_i - m_i),
+\qquad
+J_{\bar f}(m_i)_{rj} \;=\; \frac{\partial \bar f_r}{\partial x_j}\bigg|_{x=m_i}.
+\;}
+\label{eq:linearisation}
+\end{equation}
+$\widetilde f$ is affine in $x_i$. \emph{All} expectations and derivatives below
+are taken \emph{exactly} after substituting $\widetilde f$ for $\bar f$ in
+\eqref{eq:transition-frozen}; nothing else is approximated. Curvature of
+$\bar f$ (Hessian and higher) is the only thing dropped.
+
+\paragraph{Expectations under \eqref{eq:linearisation}.}
+With $x_i \sim \mathcal{N}(m_i, S_i)$, $\widetilde f(x_i)$ is Gaussian. Direct
+computation (using $\E[x_i-m_i]=0$ and $\E[(x_i-m_i)(x_i-m_i)^\top]=S_i$):
+\begin{align}
+\Eqx[\widetilde f(x_i)] &\;=\; \bar f(m_i),\\
+\Eqx[J_{\widetilde f}(x_i)] &\;=\; J_{\bar f}(m_i)
+\quad\text{(the linearisation pinned $J$ at $m_i$),}\\
+\Eqx\!\bigl[\widetilde f(x_i)^\top \Sigma^{-1} \widetilde f(x_i)\bigr]
+&\;=\; \bar f(m_i)^\top\Sigma^{-1}\bar f(m_i)
+\;+\; \tr\!\bigl[J_{\bar f}(m_i)^\top\Sigma^{-1} J_{\bar f}(m_i)\,S_i\bigr].
+\label{eq:Eff-exact}
+\end{align}
+The cross term in \eqref{eq:transition-frozen} integrates against
+$q(x_i, x_{i+1})$; the same Stein identity used in
+\S\ref{sec:uncertain-x} (with $\widetilde f$ in place of $g$) gives
+\begin{equation}
+\Eqxx\!\bigl[\delta_i^\top\Sigma^{-1}\widetilde f(x_i)\bigr]
+\;=\;
+d_i^\top\Sigma^{-1}\bar f(m_i)
+\;+\;
+\tr\!\bigl[\Sigma^{-1} J_{\bar f}(m_i)\,C_i^\top\bigr],
+\end{equation}
+so the cross-covariance $S_{i,i+1}$ enters only through
+$C_i = S_{i,i+1} - S_i$.
+
+\paragraph{Derivatives.}
+The expressions above are explicit functions of $(m_i, S_i)$; differentiate
+them. The chain rule produces $\partial \bar f(m_i)/\partial m_i =
+J_{\bar f}(m_i)$ and $\partial J_{\bar f}(m_i)/\partial m_i = H_{\bar f}(m_i)$;
+the Hessian terms are then dropped, since carrying them would re-introduce
+exactly the curvature that \eqref{eq:linearisation} already discarded. (This
+is the only consistency rule needed: $\bar f$ enters at most to first order in
+$x_i - m_i$, hence $J_{\bar f}$ is treated as a constant w.r.t.\ $m_i$.)
+Result:
+\begin{center}
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{l|ccc}
+quantity & value & $\partial/\partial m_i$ & $\partial/\partial S_i$ \\\hline
+$\Eqx[\widetilde f]$
+& $\bar f(m_i)$
+& $J_{\bar f}(m_i)$
+& $0$ \\
+$\Eqx[J_{\widetilde f}]$
+& $J_{\bar f}(m_i)$
+& $0$ (Hessian dropped)
+& $0$ \\
+$\Eqx[\widetilde f^\top \Sigma^{-1}\widetilde f]$
+& $\bar f^\top\Sigma^{-1}\bar f + \tr[J^\top\Sigma^{-1}J\,S_i]$
+& $2\,J_{\bar f}(m_i)^\top\Sigma^{-1}\bar f(m_i)$
+& $J_{\bar f}(m_i)^\top\Sigma^{-1} J_{\bar f}(m_i)$
+\end{tabular}
+\end{center}
+Each $\partial/\partial m_i$ uses
+$\partial \bar f(m)/\partial m = J_{\bar f}(m)$ and treats $J$ as constant
+w.r.t.\ $m$. Each $\partial/\partial S_i$ uses
+$\partial \tr[A\,S]/\partial S = A$.
+
+\paragraph{Implementation note.}
+The code (\code{ef\_with\_jac\_grad}, \code{eff\_with\_grads} in
+\code{sing/efgp\_jax\_drift.py}) computes the row-3 \emph{value} as just
+$\bar f(m_i)^\top\Sigma^{-1}\bar f(m_i)$ — the trace correction in
+\eqref{eq:Eff-exact} is omitted. The row-3 \emph{gradients} match the
+linearisation in the table, in particular keeping
+$\partial/\partial S_i = J_{\bar f}^\top\Sigma^{-1}J_{\bar f}$ (which is
+exactly $\partial_{S_i}\tr[J^\top\Sigma^{-1}J\,S_i]$, the $S_i$-derivative
+of the trace term).
+
+This asymmetry is purely cosmetic for the optimization:
+\begin{itemize}
+\item $q(x)$ updates are \emph{unchanged} — they consume only the
+gradients, which are identical to the consistent-linearisation gradients.
+The ``shrink $S_i$ when $J^\top\Sigma^{-1}J$ is large'' signal that drives
+the variational variance toward the drift-sharpness scale is preserved.
+\item $q(f)$ updates are unchanged (they don't use these moments at all;
+see \S\ref{sec:efgp}).
+\item The M-step is unchanged (it uses the EFGP marginal log-likelihood,
+not these moments).
+\item Only the \emph{reported ELBO value} is affected: it is biased low
+by $\tfrac{\Delta_i}{2}\tr[J_{\bar f}^\top\Sigma^{-1} J_{\bar f}\,S_i]$
+per transition. This matters for convergence diagnostics, not for the
+fixed point reached.
+\end{itemize}
+Were the trace dropped from the $S_i$-gradient as well (a strictly weaker
+zero-th-order approximation), $\partial/\partial S_i$ would collapse to
+$0$ and $q(x)$ \emph{would} change — losing the drift-sharpness pull on
+$S_i$. The asymmetric drop deliberately keeps the gradient signal while
+simplifying the value computation.
+
+Posterior-variance contributions $\E_{q(f)}[f^\top\Sigma^{-1}f] -
+\bar f^\top\Sigma^{-1}\bar f = \tr[\Sigma^{-1}\phi(x_i)^{*} A_r^{-1}\phi(x_i)]$
+(Hutchinson) follow the same pattern — included in values when needed,
+not back-propagated through the CG solve.
+
+% ============================================================================
+\section{Algorithm summary}
+\label{sec:algorithm}
+% ============================================================================
+
+Given current $q(x_{0:T})$ (marginals $m_i, S_i$ and cross-covariances
+$S_{i,i+1}$), kernel hyperparameters $\theta$, diffusion $\Sigma$, spectral
+grid $\{\xi_k\}$ with weights $D_\theta$, sample count $S$, and Hutchinson
+probe count $J$:
+
+\begin{enumerate}
+\item \textbf{Increments.} $d_i = m_{i+1}-m_i$,\quad $C_i = S_{i,i+1}-S_i$.
+\item \textbf{Cloud.} Sample $x_i^{(s)} \sim q(x_i)$ for $i=0,\ldots,T-2$,
+$s=1,\ldots,S$.
+\item \textbf{Precision.} Type-1 NUFFT over the cloud with weights
+$\Delta_i / (S\sigma_r^2)$ to get the BTTB generator $T_r$; $A_r$ acts as
+$v\mapsto v + D_\theta T_r D_\theta v$.
+\item \textbf{RHS.} Type-1 NUFFTs over the cloud with weights
+$d_{i,r}/(S\sigma_r^2)$ and $[C_i]_{j,r}/(S\sigma_r^2)$ produce $h_{1,r}$ and
+$h_{2,r}$ via \eqref{eq:hr-mc}.
+\item \textbf{Solve.} Jacobi-preconditioned CG: $A_r\mu_r = h_r$.
+\item \textbf{Predict.} For each evaluation point (typically $x = m_i$), one
+Type-2 NUFFT each gives $\bar f(x)$ and $J_{\bar f}(x)$; Hutchinson probes
+give $\diag(\Phi A_r^{-1}\Phi^*)$.
+\item \textbf{$q(x)$ update.} Plug $\bar f$, $J_{\bar f}$, and the second
+moment into SING's natural-gradient update via \code{FrozenEFGPDrift}'s
+custom VJPs.
+\end{enumerate}
+
+% ============================================================================
+\section{Complexity}
+\label{sec:complexity}
+% ============================================================================
+
+Let $N=(T-1)S$ be the cloud size, $M$ the number of Fourier features, $k$ the
+number of CG iterations, and $J$ the number of Hutchinson probes. The $q(f)$
+update costs
+\begin{equation}
+\underbrace{O(N)}_{\text{cloud assembly}}
+\;+\;
+\underbrace{O(M\log M)}_{\text{NUFFTs / BTTB}}
+\;+\;
+\underbrace{O(k\, D_x\, M\log M)}_{\text{CG over output dims}}.
+\end{equation}
+Drift moments at $T$ points cost $O(T) + O(D_x M\log M)$; Hutchinson variance
+adds $O(J\,k\,M\log M)$. The implementation rule is to never materialise
+$K$, $\Phi$, $\Phi^*W\Phi$, $A_r^{-1}$, or any dense covariance matrix: every
+required action is a Fourier matvec, a BTTB matvec, a CG solve, or a
+Hutchinson probe.
+
+% ============================================================================
+\appendix
+\section{Math-to-code dictionary}
+\label{app:dictionary}
+% ============================================================================
+
+\noindent
+\begin{tabular}{ll}
+\hline
+Math & Code \\
+\hline
+Spectral grid weights $D_\theta = \diag(\sqrt{S(\xi_k)\,h^d})$
+& \code{grid.ws} (real part) \\
+Frequency points $\xi_k$
+& \code{grid.xis\_flat} \\
+Adjoint Type-1 NUFFT $F_X^{*}$
+& \code{nufft1} \\
+Forward Type-2 NUFFT $\phi(x)^*\mu$
+& \code{nufft2} \\
+BTTB generator $T_r = F_X^{*}W_r F_X$
+& \code{bttb\_conv\_vec\_weighted} $\to$ \code{make\_toeplitz} \\
+Operator $A_r v = v + D_\theta T_r D_\theta v$
+& \code{make\_A\_apply} \\
+Solve $A_r \mu_r = h_r$ (Jacobi-preconditioned CG)
+& \code{cg\_solve} \\
+$h_r = h_{1,r} + h_{2,r}$ build
+& \code{compute\_mu\_r\_jax} \\
+$\bar f(x)$, $J_{\bar f}(x)$, $\E[f^\top\Sigma^{-1}f]$
+& \code{drift\_moments\_jax} \\
+$\diag(\Phi A_r^{-1}\Phi^*)$ (Hutchinson)
+& \code{hutchinson\_diag} \\
+Local-quadratic VJPs into $q(x)$ update
+& \code{ef\_with\_jac\_grad}, \code{eff\_with\_grads} \\
+$q(x)$ consumer
+& \code{nat\_grad\_transition} (\code{sing/sing.py}) \\
+\hline
+\end{tabular}
+
+\medskip
+\noindent
+\begin{tabular}{ll}
+\hline
+$q(x)$ statistic & Code \\
+\hline
+$m_i$ (marginal mean) & \code{ms} \\
+$S_i$ (marginal covariance) & \code{Ss} \\
+$\Cov(x_i,x_{i+1}) = S_{i,i+1}$ & \code{SSs.transpose(0,2,1)} \\
+$d_i = m_{i+1}-m_i$ & \code{d\_a} \\
+$C_i = S_{i,i+1}-S_i$ & \code{C\_a} \\
+\hline
+\end{tabular}
+
+\end{document}

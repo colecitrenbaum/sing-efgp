@@ -164,10 +164,25 @@ def run(T: int, n_em: int = 20, n_estep: int = 10):
     ip = jax.tree_util.tree_map(lambda x: x[None],
                                  dict(mu0=jnp.zeros(D), V0=jnp.eye(D) * 0.1))
     t_grid = jnp.linspace(0., t_max, T)
-    rho_sched = jnp.linspace(0.1, 0.7, n_em)
+    # SparseGP recipe taken DIRECTLY from sing/demos/inference_and_learning.ipynb
+    # (cell 23, the SING-GP setup).  These are the settings the SING authors
+    # use for their own GP-drift experiments.
+    rho_sched_0 = jnp.logspace(-3, -2, 10)
+    rho_sched_1 = rho_sched_0[-1] * jnp.ones(max(0, n_em - len(rho_sched_0)))
+    sing_rho_sched = jnp.concatenate([rho_sched_0[:n_em], rho_sched_1])
+    # SING demo uses (lr=1e-4, n_iters_m=50) which gives effective max
+    # motion ~= 5e-3 per outer EM iter.  We use (lr=1e-3, n_iters_m=10)
+    # which has the same effective max motion but 5x less wall-time cost
+    # — should give equivalent quality.
+    sing_lr = 1e-3 * jnp.ones(n_em)
+    sing_n_iters_m = 10
+
+    # EFGP gets a slightly more aggressive schedule because its M-step is
+    # more stable (analytic gradient + Hutchinson trace, no autograd-thru-CG).
+    efgp_rho_sched = jnp.linspace(0.05, 0.4, n_em)
 
     # ----- EFGP-SING (JAX) -----
-    print("  fitting EFGP-SING (JAX, pinned grid, learn_kernel=True)...")
+    print(f"  fitting EFGP-SING (JAX, pinned grid, learn_kernel=True)...")
     t0 = time.time()
     mp_efgp, _, op_efgp, _, hist_efgp = em.fit_efgp_sing_jax(
         likelihood=lik, t_grid=t_grid,
@@ -175,7 +190,7 @@ def run(T: int, n_em: int = 20, n_estep: int = 10):
         lengthscale=0.7, variance=1.0, sigma=sigma,
         sigma_drift_sq=sigma ** 2, eps_grid=1e-2, S_marginal=2,
         n_em_iters=n_em, n_estep_iters=n_estep,
-        rho_sched=rho_sched,
+        rho_sched=efgp_rho_sched,
         learn_emissions=True, update_R=False,
         learn_kernel=True, n_mstep_iters=4, mstep_lr=0.05,
         n_hutchinson_mstep=4, kernel_warmup_iters=2,
@@ -188,12 +203,16 @@ def run(T: int, n_em: int = 20, n_estep: int = 10):
           f"final ℓ {hist_efgp.lengthscale[-1]:.3f}, "
           f"σ² {hist_efgp.variance[-1]:.3f}")
 
-    # ----- SparseGP -----
-    print("  fitting SING-SparseGP (full M-step)...")
+    # ----- SparseGP (SING's recommended settings from the demo notebook) -----
+    print("  fitting SING-SparseGP (full M-step, SING-demo settings)...")
     quad = GaussHermiteQuadrature(D=D, n_quad=5)
-    zs = initialize_zs(D=D, zs_lim=2.5, num_per_dim=8)
+    # SING demo uses 12x12=144 inducing pts but that costs O(M²)=20k per
+    # Adam step on the SparseGP ELBO + gradient.  At T=500 with 10 Adam
+    # steps × 20 EM = 200 Adam evaluations the per-iter cost dominates.
+    # 8x8=64 is the SparseGP demo default and runs ~3x faster.
+    zs = initialize_zs(D=D, zs_lim=4.0, num_per_dim=8)
     sparse_drift = SparseGP(zs=zs, kernel=RBF(latent_dim=D), expectation=quad)
-    sparse_drift_params = dict(length_scales=jnp.full((D,), 0.7),
+    sparse_drift_params = dict(length_scales=jnp.ones(D),       # SING demo init
                                  output_scale=jnp.asarray(1.0))
     t0 = time.time()
     mp_sp, _, _, sp_drift_params, _, op_sp, _, _ = fit_variational_em(
@@ -201,10 +220,10 @@ def run(T: int, n_em: int = 20, n_estep: int = 10):
         fn=sparse_drift, likelihood=lik, t_grid=t_grid,
         drift_params=sparse_drift_params,
         init_params=ip, output_params=op, sigma=sigma,
-        rho_sched=rho_sched,
-        n_iters=n_em, n_iters_e=n_estep, n_iters_m=4,
+        rho_sched=sing_rho_sched,
+        n_iters=n_em, n_iters_e=n_estep, n_iters_m=sing_n_iters_m,
         perform_m_step=True, learn_output_params=True,
-        learning_rate=jnp.full((n_em,), 0.05),
+        learning_rate=sing_lr,
         print_interval=999,
     )
     t_sp = time.time() - t0

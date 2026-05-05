@@ -1,14 +1,10 @@
 """
 Pure-JAX q(f) update + drift-moment evaluation for SING-EFGP.
 
-Mirrors :meth:`sing.efgp_drift.EFGPDrift.update_dynamics_params` and
-:meth:`drift_moments_at_marginals` exactly, but in JAX so the resulting
-``mu_r``, ``Ef``, ``Eff``, ``Edfdx`` are JAX arrays and the whole thing is
-jit-traceable.
-
-Once this is in place, :mod:`sing.efgp_em` can fold q(f) update + drift
-moments INSIDE the existing jit'd ``_build_jit_estep`` and ``lax.scan`` the
-entire inner E-step.  This is what closes the wall-time gap to SparseGP.
+Provides the EFGP drift-block primitives used by :mod:`sing.efgp_em`'s
+jit-compiled EM loop.  ``mu_r``, ``Ef``, ``Eff``, ``Edfdx`` are JAX
+arrays and the whole pipeline is jit-traceable, so q(f) update + drift
+moments + SING natural-grad live in a single compiled graph.
 
 Math symbol → expression in this module
 ---------------------------------------
@@ -16,6 +12,8 @@ Math symbol → expression in this module
   Stein-corrected q(f) update     compute_mu_r_jax
   E[f(m)], E[J_f(m)] at marginals drift_moments_jax
   Combined "one inner-iter step"  qf_and_moments_jax
+  Collapsed kernel M-step          m_step_kernel_jax
+  SDE wrapper (custom-VJP shim)    FrozenEFGPDrift
 """
 from __future__ import annotations
 
@@ -79,11 +77,17 @@ eff_with_grads.defvjp(_eff_fwd, _eff_bwd)
 
 class FrozenEFGPDrift(SDE):
     """Pure-JAX SDE shim: returns precomputed (Ef, Eff, Edfdx) per time
-    step with delta-method custom VJPs through (m, S).  No torch deps.
+    step with delta-method custom VJPs through (m, S).
 
-    See :mod:`sing.efgp_drift` for the rationale (we cache the drift
-    moments off-graph and expose only their values + first-order
-    sensitivities to SING's natural-grad update).
+    The drift moments are computed off-graph (typically once per inner
+    E-step iter via :func:`compute_mu_r_jax` + :func:`drift_moments_jax`)
+    and exposed only as values + first-order sensitivities to SING's
+    natural-grad update.  This is the local-quadratic transition
+    approximation:
+
+        E[f(x)]                ≈  f(m)              ∂/∂m: J_f(m)        ∂/∂S: 0
+        E[f^T Σ⁻¹ f]           ≈  f(m)^T Σ⁻¹ f(m)   ∂/∂m: 2 Jᵀ Σ⁻¹ f    ∂/∂S: Jᵀ Σ⁻¹ J
+        E[J_f(x)]              ≈  J_f(m)            (treat constant)
     """
 
     def __init__(self, *, latent_dim: int, t_grid: Array,
@@ -149,14 +153,13 @@ def compute_mu_r_jax(
     D_lat: int,
     D_out: int,
     cg_tol: float = 1e-5,
-    max_cg_iter: int = 200,
+    max_cg_iter: int = 2000,    # generous; with Jacobi precond CG usually converges in <50
     nufft_eps: float = 6e-8,
 ) -> Tuple[Array, Array, jp.ToeplitzNDJax]:
     """Pure-JAX Stein-corrected q(f) update.  Returns (mu_r, X_flat, top).
 
-    ``mu_r`` shape: (D_out, M).  Same math as
-    :meth:`EFGPDrift.update_dynamics_params` for the no-inputs case with
-    σ_r² tied across r.
+    ``mu_r`` shape: (D_out, M).  Implements the no-inputs case of the
+    EFGP q(f) update with σ_r² tied across output dims (v0).
     """
     T = ms.shape[0]
     M = grid.M
@@ -164,7 +167,13 @@ def compute_mu_r_jax(
 
     # Stein quantities
     d_a = ms[1:] - ms[:-1]                                      # (T-1, D_lat)
-    C_a = SSs - Ss[:-1]                                          # (T-1, D_lat, D_lat)
+    # SING convention: SSs[t] = Cov(x_{t+1}, x_t) (see sing/utils/sing_helpers.py
+    # and the docstring in compute_neg_CE_single).  The Stein-correction PDF
+    # uses S_{i, i+1} = Cov(x_t, x_{t+1}) = SSs[t].T.  In practice SSs is
+    # near-symmetric for the smoothed posterior so the transpose is a small
+    # effect, but we apply it for theoretical correctness.
+    SSs_T = jnp.transpose(SSs, (0, 2, 1))                       # = Cov(x_t, x_{t+1})
+    C_a = SSs_T - Ss[:-1]                                       # (T-1, D_lat, D_lat)
 
     # Pseudo-input cloud
     X_flat = _build_pseudo_cloud(ms, Ss, key, S_marginal, D_lat)
@@ -179,6 +188,19 @@ def compute_mu_r_jax(
     A_apply = jp.make_A_apply(grid.ws, top, sigmasq=1.0)
     ws_real_c = grid.ws.real.astype(cdtype)
 
+    # Jacobi preconditioner: diag(A)_k = 1 + |ws_k|^2 * T_diag where
+    # T_diag = central value of v_kernel = sum of weights = O(N).  Without
+    # preconditioning, CG iters scale as sqrt(cond(A)) ~ sqrt(N), which is
+    # fine for N ~ 10K but borderline at 20K+ pseudo-points.  Jacobi gives
+    # ~10x CG speedup at our largest T values and prevents the eval drift
+    # blow-up at T=10K (debugged 2026-05-02).
+    center_idx = tuple((s - 1) // 2 for s in v_kernel.shape)
+    T_diag = v_kernel[center_idx].real.astype(jnp.float32)
+    ws_sq = (grid.ws * jnp.conj(grid.ws)).real.astype(jnp.float32)
+    diag_A = 1.0 + ws_sq * T_diag
+    M_inv_diag = (1.0 / diag_A).astype(cdtype)
+    M_inv_apply = lambda v: M_inv_diag * v
+
     # Build h_r per output dim r in a vmap
     def per_r(r):
         # h_1,r = D F_X* a_r,    (a_r)_a,s = d_{a,r} / (S σ²)
@@ -189,7 +211,9 @@ def compute_mu_r_jax(
                              eps=nufft_eps).reshape(-1)
         h1 = ws_real_c * Fstar_a
 
-        # h_2,r = Σ_j (2πi ξ_j) ⊙ D F_X* c_{j,r}
+        # h_2,r = Σ_j conj(2πi ξ_j) ⊙ D F_X* c_{j,r} = Σ_j (-2πi ξ_j) ⊙ ...
+        # The factor comes from J_φ^* (adjoint Jacobian) — conjugate of
+        # ∂φ_k/∂x_j = 2πi ξ_{kj} φ_k, so (-2πi ξ).
         def per_j(j):
             c_jr = jnp.repeat(C_a[:, j, r], S_marginal) \
                 / (S_marginal * sigma_drift_sq)
@@ -198,17 +222,19 @@ def compute_mu_r_jax(
                                  out_shape=grid.mtot_per_dim,
                                  eps=nufft_eps).reshape(-1)
             xi_j = grid.xis_flat[:, j].astype(cdtype)
-            return (2j * math.pi * xi_j) * (ws_real_c * Fstar_c)
+            return (-2j * math.pi * xi_j) * (ws_real_c * Fstar_c)
 
         h2 = jax.vmap(per_j)(jnp.arange(D_lat)).sum(axis=0)
         h_r = h1 + h2
-        # CG solve.  Skip if RHS is essentially zero (initial iter).
+        # CG solve (Jacobi preconditioned).  Skip if RHS is essentially
+        # zero (initial iter).
         rhs_norm = jnp.linalg.norm(h_r).real
         mu = jax.lax.cond(
             rhs_norm < 1e-30,
             lambda _: jnp.zeros_like(h_r),
             lambda _: jp.cg_solve(A_apply, h_r, tol=cg_tol,
-                                   max_iter=max_cg_iter),
+                                   max_iter=max_cg_iter,
+                                   M_inv_apply=M_inv_apply),
             operand=None,
         )
         return mu
@@ -272,7 +298,7 @@ def qf_and_moments_jax(
     grid: jp.JaxGridState, key: Array, *,
     sigma_drift_sq: float, S_marginal: int,
     D_lat: int, D_out: int,
-    cg_tol: float = 1e-5, max_cg_iter: int = 200,
+    cg_tol: float = 1e-5, max_cg_iter: int = 2000,
     nufft_eps: float = 6e-8,
 ) -> Tuple[Array, Array, Array, Array]:
     """One full q(f) update + drift moment evaluation, all JAX, all jit-able.
@@ -295,132 +321,123 @@ def qf_and_moments_jax(
 # ---------------------------------------------------------------------------
 def _ws_real_se(log_ls: Array, log_var: Array, xis_flat: Array, h: Array,
                   D_lat: int) -> Array:
-    """Differentiable spectral weights ws_k(θ) = sqrt(S(ξ_k) * h^d)."""
+    """Differentiable spectral weights ws_k(θ) = sqrt(S(ξ_k) * h^d).
+
+    Computed via log-space to avoid the sqrt(0) gradient singularity: at
+    high-frequency modes the spectral density underflows to 0.0 in float32,
+    and d/dx sqrt(x) = 1/(2 sqrt(x)) → inf/nan at x=0.  Using exp(log_ws)
+    gives gradient = exp(log_ws) * d(log_ws)/dx = 0 * finite = 0.
+    """
     import math as _math
-    ls = jnp.exp(log_ls)
-    var = jnp.exp(log_var)
-    ls_sq = ls * ls
+    ls_sq = jnp.exp(2.0 * log_ls)
     xi_norm_sq = (xis_flat * xis_flat).sum(axis=1)
-    log_S = (D_lat / 2.0) * jnp.log(2 * _math.pi * ls_sq) + jnp.log(var) \
+    log_S = (D_lat / 2.0) * jnp.log(2 * _math.pi * ls_sq) + log_var \
             - 2 * (_math.pi ** 2) * ls_sq * xi_norm_sq
-    return jnp.sqrt(jnp.exp(log_S) * (h ** D_lat))
+    log_ws = 0.5 * log_S + (D_lat / 2.0) * jnp.log(jnp.asarray(h, dtype=jnp.float32))
+    return jnp.exp(log_ws)
 
 
 def m_step_kernel_jax(
     log_ls0: float, log_var0: float,
     *,
-    mu_r_fixed: Array,                 # (D_out, M) — held fixed during M-step
+    mu_r_fixed: Array,                 # ignored; kept for signature compat
     z_r: Array,                        # (D_out, M) — RHS summary, h_r = D ⊙ z_r
     top: jp.ToeplitzNDJax,             # cached BTTB on the current cloud + weights
     xis_flat: Array, h_per_dim: Array, # spectral grid
     D_lat: int, D_out: int,
     n_inner: int = 10, lr: float = 0.05,
-    n_hutchinson: int = 4, include_trace: bool = True,
-    cg_tol_trace: float = 1e-4, max_cg_iter_trace: int = None,
-    key: Array = None,
+    n_hutchinson: int = 4, include_trace: bool = True,        # ignored
+    cg_tol_trace: float = 1e-4, max_cg_iter_trace: int = None, # ignored
+    key: Array = None,                                         # ignored
 ) -> Tuple[Array, Array, list]:
-    """JAX MAP-form collapsed kernel M-step.  Same math as
-    :meth:`sing.efgp_drift.EFGPDrift.m_step_kernel`, but JAX/optax instead
-    of torch.autograd/torch.optim.
+    """Collapsed kernel M-step using EXACT dense Cholesky-based trace.
+
+    Minimises ``-(Re(h*μ) − ½ μ* A μ) + ½ log|A| × D_out`` over
+    ``(log_ℓ, log_σ²)`` with optax/Adam.  At each Adam step the full
+    loss is computed via dense linear algebra on the explicit
+    ``A = I + diag(ws) · T_mat · diag(ws)`` matrix, and differentiated
+    by ``jax.grad`` — autodiff handles ``log|A|`` and the implicit
+    ``μ = A⁻¹h`` (envelope theorem) automatically.
+
+    A is hermitian positive-definite by construction, so we use a
+    *single* Cholesky factorization per Adam step that gives BOTH
+    ``log|A|`` (from ``2 Σ log L_ii``) AND ``μ = A⁻¹h`` (via two
+    triangular solves).  Algebraic simplification: since ``Aμ = h``,
+    we have ``⟨μ, Aμ⟩ = ⟨μ, h⟩``, so the deterministic loss collapses
+    to ``-½ Σ_r ⟨h_r, μ_r⟩``.
+
+    Cost per Adam step: O(M³/3) for Cholesky + O(D_out · M²) for the
+    triangular solves.  One-time O(M² log M) build of ``T_mat`` outside
+    the Adam loop.  Practical for M ≲ 2000-4000; for larger M, switch
+    to a Hutchinson trace estimator with batched CG + enough probes
+    (≥ 64) to control variance — see repo history for the previous
+    Hutchinson code path, and ``diag_hutch_n_cgtol_sweep`` for evidence
+    that ``n=64`` is needed to match exact-slogdet on this problem.
+
+    Hutchinson kwargs (n_hutchinson, include_trace, cg_tol_trace,
+    max_cg_iter_trace, key) are accepted for backwards compatibility
+    but ignored.
 
     Returns (log_ls_new, log_var_new, loss_history).
     """
     import optax
-    if key is None:
-        key = jr.PRNGKey(0)
+    import jax.scipy.linalg as jla
     h_scalar = h_per_dim[0]                    # isotropic h in v0
     M = int(xis_flat.shape[0])
-    if max_cg_iter_trace is None:
-        max_cg_iter_trace = 2 * M
+    cdtype = top.v_fft.dtype
+
+    # Precompute dense T_mat once (top is fixed across the M-step) by
+    # direct indexing into the BTTB conv vector — O(M²), avoiding the
+    # M Toeplitz applies (O(M² log M)) the closure-form path would do.
+    # Recover the conv vector v of shape (2m_i - 1) per dim from the
+    # FFT-cached form via one O(M log M) inverse FFT + crop.
+    eye_c = jnp.eye(M, dtype=cdtype)
+    _v_pad = jnp.fft.ifftn(top.v_fft).astype(cdtype)
+    _ns_v = tuple(2 * n - 1 for n in top.ns)
+    _v_conv = _v_pad[tuple(slice(0, L) for L in _ns_v)]
+    _d = len(top.ns)
+    _mi = jnp.indices(top.ns).reshape(_d, -1)        # (d, M)
+    _offset = jnp.array([n - 1 for n in top.ns], dtype=jnp.int32)
+    _diff = (_mi[:, :, None] - _mi[:, None, :]
+             + _offset[:, None, None])               # (d, M, M)
+    T_mat = _v_conv[tuple(_diff[k] for k in range(_d))]   # (M, M)
+
+    def total_loss(log_ls, log_var):
+        ws_real = _ws_real_se(log_ls, log_var, xis_flat, h_scalar, D_lat)
+        ws_c = ws_real.astype(cdtype)
+        # A = I + diag(ws) · T_mat · diag(ws) via row+col scaling (O(M²))
+        A = eye_c + ws_c[:, None] * T_mat * ws_c[None, :]
+        # Single Cholesky factorization gives both log|A| and the solver.
+        # A is hermitian PSD by construction (T_mat is BTTB from positive
+        # weights → hermitian PSD; diagonal scaling preserves this).
+        L = jnp.linalg.cholesky(A)
+        # log|A| = 2 Σ log(L_ii) — diagonals are real positive in the
+        # Cholesky convention.
+        logdet = 2.0 * jnp.sum(jnp.log(jnp.diag(L).real))
+        # μ = A⁻¹ h via forward + back triangular solve.
+        h = ws_c[None, :] * z_r
+        def solve_one(b):
+            y = jla.solve_triangular(L, b, lower=True)
+            return jla.solve_triangular(L.conj().T, y, lower=False)
+        mu = jax.vmap(solve_one)(h)
+        # Deterministic loss = -(Re⟨h, μ⟩ - ½ Re⟨μ, Aμ⟩) summed over r.
+        # Since Aμ = h, ⟨μ, Aμ⟩ = ⟨μ, h⟩, so this collapses to
+        # -½ Σ_r Re⟨h_r, μ_r⟩.
+        det_loss = -0.5 * jnp.sum(
+            jnp.real(jnp.sum(jnp.conj(h) * mu, axis=-1)))
+        return det_loss + 0.5 * D_out * logdet
+
+    grad_fn = jax.jit(jax.value_and_grad(total_loss, argnums=(0, 1)))
 
     opt = optax.adam(lr)
     params = (jnp.asarray(log_ls0, dtype=jnp.float32),
               jnp.asarray(log_var0, dtype=jnp.float32))
     opt_state = opt.init(params)
 
-    def deterministic_loss(params):
-        log_ls, log_var = params
-        ws = _ws_real_se(log_ls, log_var, xis_flat, h_scalar, D_lat)
-        ws_c = ws.astype(top.v_fft.dtype)
-
-        def per_r(r):
-            mu = mu_r_fixed[r]
-            h_r = ws_c * z_r[r]
-            term1 = jnp.vdot(h_r, mu).real
-            Tv = jp.toeplitz_apply(top, ws_c * mu)
-            Av = ws_c * Tv + mu
-            term2 = jnp.vdot(mu, Av).real * 0.5
-            return -(term1 - term2)
-        return jax.vmap(per_r)(jnp.arange(D_out)).sum()
-
-    grad_det_fn = jax.jit(jax.value_and_grad(deterministic_loss))
-
-    def hutchinson_trace_grads(params, key_h):
-        """Estimate ∂_θ log|A| × D_out  via J Rademacher probes.
-
-        The negative-log-det loss contribution is +½ log|A| × D_out per the
-        sign convention used in :meth:`EFGPDrift.m_step_kernel` (we MINIMIZE
-        the negative of L^coll which itself is the log-marginal-likelihood
-        plus the negative of the log-det).
-        """
-        log_ls, log_var = params
-        ws = _ws_real_se(log_ls, log_var, xis_flat, h_scalar, D_lat)
-        ws_c = ws.astype(top.v_fft.dtype)
-
-        # ∂(log ws²)/∂(log ℓ) = d - 4π² ℓ² ||ξ||²
-        # ∂(log ws²)/∂(log σ²) = 1
-        # ∂ws/∂θ = ws/2 × ∂(log ws²)/∂θ
-        ls = jnp.exp(log_ls)
-        ls_sq = ls * ls
-        xi_norm_sq = (xis_flat * xis_flat).sum(axis=1)
-        import math as _math
-        dws_dlogls = ws * 0.5 * (D_lat - 4 * _math.pi * _math.pi * ls_sq * xi_norm_sq)
-        dws_dlogvar = ws * 0.5
-
-        def A_apply_d(v):
-            tv = jp.toeplitz_apply(top, ws_c * v)
-            return ws_c * tv + v
-
-        def dA_apply(dD, v):
-            Dv = ws_c * v
-            TDv = jp.toeplitz_apply(top, Dv)
-            first = dD.astype(top.v_fft.dtype) * TDv
-            second = ws_c * jp.toeplitz_apply(top,
-                                              dD.astype(top.v_fft.dtype) * v)
-            return first + second
-
-        def one_probe(key_p):
-            v_real = (jax.random.bernoulli(key_p, shape=(M,))
-                      .astype(jnp.float32) * 2.0 - 1.0)
-            v = v_real.astype(top.v_fft.dtype)
-            b_ls = dA_apply(dws_dlogls, v)
-            u_ls = jp.cg_solve(A_apply_d, b_ls, tol=cg_tol_trace,
-                               max_iter=max_cg_iter_trace)
-            b_var = dA_apply(dws_dlogvar, v)
-            u_var = jp.cg_solve(A_apply_d, b_var, tol=cg_tol_trace,
-                                max_iter=max_cg_iter_trace)
-            return jnp.array([jnp.vdot(v, u_ls).real,
-                              jnp.vdot(v, u_var).real])
-
-        keys = jr.split(key_h, n_hutchinson)
-        probes = jax.vmap(one_probe)(keys)
-        traces = probes.mean(axis=0)
-        # Loss contribution: +½ tr[A^-1 ∂A] × D_out (per the docstring above)
-        return 0.5 * traces[0] * D_out, 0.5 * traces[1] * D_out
-
-    if include_trace:
-        hutchinson_trace_grads_jit = jax.jit(hutchinson_trace_grads)
-
     loss_history = []
     for step in range(n_inner):
-        loss, (g_ls, g_var) = grad_det_fn(params)
-        if include_trace:
-            key, sub = jr.split(key)
-            tg_ls, tg_var = hutchinson_trace_grads_jit(params, sub)
-            g_ls = g_ls + tg_ls
-            g_var = g_var + tg_var
-        grads = (g_ls, g_var)
-        updates, opt_state = opt.update(grads, opt_state, params)
+        loss, (g_ls, g_var) = grad_fn(params[0], params[1])
+        updates, opt_state = opt.update((g_ls, g_var), opt_state, params)
         params = optax.apply_updates(params, updates)
         loss_history.append(float(loss))
 

@@ -1,0 +1,21 @@
+\contentsline {section}{\numberline {1}Setup}{1}{section.1}%
+\contentsline {section}{\numberline {2}The transition term, stripped to its $f$-content}{2}{section.2}%
+\contentsline {paragraph}{Independence across $r$.}{2}{section*.4}%
+\contentsline {section}{\numberline {3}Layer 1: GP regression with known $x$}{2}{section.3}%
+\contentsline {section}{\numberline {4}Layer 2: uncertain $x$, in a finite basis}{3}{section.4}%
+\contentsline {paragraph}{Pick a basis.}{3}{section*.5}%
+\contentsline {section}{\numberline {5}Layer 3: EFGP — the Fourier-feature choice}{4}{section.5}%
+\contentsline {paragraph}{Cheap Jacobian.}{4}{section*.7}%
+\contentsline {paragraph}{BTTB structure of $\mathbb {E}_{q(x_i)}[\phi \phi ^{*}]$.}{5}{section*.8}%
+\contentsline {section}{\numberline {6}Layer 4: computing the expectations}{5}{section.6}%
+\contentsline {paragraph}{Sign of the Stein correction.}{6}{section*.12}%
+\contentsline {paragraph}{Cross-covariance convention.}{6}{section*.13}%
+\contentsline {section}{\numberline {7}Posterior predictive moments}{6}{section.7}%
+\contentsline {section}{\numberline {8}Feeding back into the $q(x)$ update}{7}{section.8}%
+\contentsline {paragraph}{The approximation, in one line.}{7}{section*.15}%
+\contentsline {paragraph}{Expectations under \eqref {eq:linearisation}.}{7}{section*.16}%
+\contentsline {paragraph}{Derivatives.}{7}{section*.17}%
+\contentsline {paragraph}{Implementation note.}{8}{section*.18}%
+\contentsline {section}{\numberline {9}Algorithm summary}{8}{section.9}%
+\contentsline {section}{\numberline {10}Complexity}{9}{section.10}%
+\contentsline {section}{\numberline {A}Math-to-code dictionary}{9}{appendix.A}%

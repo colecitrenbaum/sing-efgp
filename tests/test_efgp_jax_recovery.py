@@ -145,6 +145,83 @@ def test_lengthscale_recovery_jax():
         f"true {ls_true}")
 
 
+@pytest.mark.slow
+def test_fixed_kernel_linear_recovery_with_emission_warmup():
+    """Regression test for the early-emissions bad basin.
+
+    With a slow SING schedule and Gaussian observations, the EFGP JAX path
+    used to diverge badly from SparseGP even when the kernel was fixed at the
+    same value. The root cause was the closed-form Gaussian emissions update
+    running from iteration 1, while q(x) was still close to the diffusion-only
+    initialization. Emission warmup should keep the linear latent recovery in
+    the SparseGP regime.
+    """
+    D = 2
+    T = 250
+    t_max = 6.0
+    sigma = 0.3
+    N = 8
+    A_true = jnp.array([[-0.6, 1.0], [-1.0, -0.6]])
+
+    xs = simulate_sde(
+        jr.PRNGKey(7), x0=jnp.array([2.0, 0.0]),
+        f=lambda x, t: A_true @ x,
+        t_max=t_max, n_timesteps=T,
+        sigma=lambda x, t: sigma * jnp.eye(D))
+    xs_np = np.asarray(xs)
+
+    rng = np.random.default_rng(0)
+    C_true = rng.standard_normal((N, D)) * 0.5
+    out_true = dict(C=jnp.asarray(C_true), d=jnp.zeros(N),
+                    R=jnp.full((N,), 0.05))
+    ys = simulate_gaussian_obs(jr.PRNGKey(1), xs, out_true)
+
+    class GLik(Likelihood):
+        def ell(self, y, m, v, op):
+            R = op['R']
+            return jnp.sum(-0.5 * jnp.log(2 * jnp.pi * R)
+                           - 0.5 * ((y - m) ** 2 + v) / R)
+
+    lik = GLik(ys[None], jnp.ones((1, T), dtype=bool))
+
+    yc = ys - ys.mean(0)
+    U, s, _ = np.linalg.svd(yc.T, full_matrices=False)
+    op = dict(C=jnp.asarray(U[:, :D] * s[:D] / np.sqrt(T)),
+              d=jnp.zeros(N),
+              R=jnp.full((N,), 0.1))
+    ip = jax.tree_util.tree_map(
+        lambda x: x[None],
+        dict(mu0=jnp.zeros(D), V0=jnp.eye(D) * 0.5))
+
+    mp, _, op_out, _, _ = em.fit_efgp_sing_jax(
+        likelihood=lik, t_grid=jnp.linspace(0., t_max, T),
+        output_params=op, init_params=ip, latent_dim=D,
+        lengthscale=1.5, variance=1.0, sigma=sigma,
+        rho_sched=jnp.logspace(-2, -1, 15),
+        n_em_iters=15, n_estep_iters=8,
+        learn_kernel=False,
+        X_template=(jnp.linspace(-3., 3., T)[:, None] * jnp.ones((1, D))),
+        seed=42,
+        verbose=False,
+    )
+
+    Xi = np.asarray(mp['m'][0]); Xt = xs_np
+    bi = Xi.mean(0); bt = Xt.mean(0)
+    A_T, *_ = np.linalg.lstsq(Xi - bi, Xt - bt, rcond=None)
+    A = A_T.T
+    b = bt - A @ bi
+    rmse = float(np.sqrt(np.mean((Xi @ A.T + b - Xt) ** 2)))
+    R_mean = float(jnp.mean(op_out['R']))
+    print(f"\n  fixed-kernel linear RMSE={rmse:.4f}, mean(R)={R_mean:.4f}")
+
+    assert rmse < 0.12, (
+        f"Fixed-kernel EFGP latent RMSE regressed to {rmse:.4f}; "
+        "this usually means early Gaussian-emissions updates are pulling "
+        "q(x) into the bad basin again.")
+    assert 0.03 < R_mean < 0.08, (
+        f"Gaussian emission variance update looks wrong: mean(R)={R_mean:.4f}")
+
+
 def test_mstep_jax_gradient_matches_finite_difference():
     """JAX m_step_kernel_jax: verify the analytic gradient (deterministic
     part only — Hutchinson trace is stochastic) agrees with a finite-

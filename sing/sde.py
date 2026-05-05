@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import jax.scipy.linalg as jla
 from jax import vmap, jacfwd
 from functools import partial
 import tensorflow_probability.substrates.jax as tfp
@@ -260,9 +261,15 @@ class NeuralSDE(SDE):
 class GPPost(TypedDict):
     """
     Represents the GP variational posterior according to the sparse variational GP framework (see Titsias, 2009 and Duncker et al., 2019)
-    
+
     - q_u_mu: a shape (n_inducing) array, the posterior mean over inducing points
     - q_u_sigma: a shape (n_inducing, n_inducing) array, the posterior variance over inducing points
+    - q_u_sigma_L_A: lower-triangular Cholesky factor of A = Kzz + σ⁻² Σ_t E_KzxKxz,
+        the matrix whose inverse appears in q_u_sigma = Kzz A⁻¹ Kzz.  Stored
+        so the prior-KL term can compute log|q_u_sigma| = 2 log|Kzz| - log|A|
+        and tr(Kzz⁻¹ q_u_sigma) = tr(A⁻¹ Kzz) without ever Cholesky-factoring
+        q_u_sigma itself (whose eigenvalues are ~jitter² and would NaN in
+        float32).
     """
 
     q_u_mu: jnp.array
@@ -274,7 +281,7 @@ class SparseGP(SDE):
 
     Approximate inference is performed on the GP prior drift using the sparse variational GP framework (see Titsias, 2009 and Duncker et al., 2019)
     """
-    def __init__(self, zs: jnp.array, kernel: Kernel, expectation: Optional[Expectation] = None, jitter: float = 1e-4) -> None:
+    def __init__(self, zs: jnp.array, kernel: Kernel, expectation: Optional[Expectation] = None, jitter: float = 1e-3) -> None:
         """
         Params:
         ------------
@@ -282,7 +289,15 @@ class SparseGP(SDE):
         either a GaussHermiteQuadrature or GaussianMonteCarlo object
         zs: a shape (n_inducing, D) array, represents the grid of inducing points on R^D that determine the variational posterior
         kernel: the positive semi-definite kernel function K: R^D x R^D -> R_+ that defines the Gaussian process prior
-        jitter
+        jitter: floor on the smallest eigenvalue of Kzz.  Default ``1e-3``;
+            this stabilises the q_u_sigma = Kzz A^{-1} Kzz expression in
+            float32 when its eigenvalues, bounded below by ~jitter^2 /
+            cond(A), would otherwise drop below the float32 epsilon and
+            propagate NaNs through the M-step.  The smaller default of
+            ``1e-4`` is fine when the M-step is conservative (small lr,
+            many inner steps, e.g. lr=1e-4 / n_iters_m=50 used in the
+            pre-EFGP demos) but breaks at the more aggressive matched-EFGP
+            schedule (lr=1e-2 / n_iters_m=4 on Duffing T=2000).
         """
         self.zs = zs
         self.kernel = kernel
@@ -294,13 +309,44 @@ class SparseGP(SDE):
         
     def prior_term(self, drift_params: Dict[str, Any], gp_post: GPPost) -> float:
         """
-        Computes sum of KL[q(u_d)||p(u_d)]] across D dimensions d = 1, ..., D
+        Computes sum of KL[q(u_d)||p(u_d)]] across D dimensions d = 1, ..., D.
+
+        Computes the KL by hand using the identities
+
+            log|q_u_sigma| = 2 log|Kzz| − log|A|
+            tr(Kzz⁻¹ q_u_sigma) = tr(A⁻¹ Kzz)
+
+        where A = Kzz + σ⁻² Σ_t E_KzxKxz is the matrix whose inverse appears
+        in q_u_sigma = Kzz A⁻¹ Kzz (assembled in update_dynamics_params).
+        Both Kzz and A are well-conditioned at default jitter, so their
+        Cholesky factorisations are stable in float32; q_u_sigma itself has
+        eigenvalues squared in jitter and would NaN if Cholesky-factored
+        directly (this is what previously broke
+        ``tfd.MultivariateNormalFullCovariance(0, q_u_sigma).log_prob(...)``
+        inside the old TFD-based implementation, e.g. on the Duffing T=2000
+        lr=1e-2 EM run within ~10 iterations).  L_A is stashed in gp_post.
         """
-        Kzz = vmap(vmap(partial(self.kernel.K, kernel_params=drift_params), (None, 0)), (0, None))(self.zs, self.zs) + self.jitter * jnp.eye(len(self.zs)) # (n_inducing, n_inducing)
-        q_dist = tfd.MultivariateNormalFullCovariance(gp_post['q_u_mu'], gp_post['q_u_sigma'])
-        p_dist = tfd.MultivariateNormalFullCovariance(0, Kzz) # one sample is shape (n_inducing) (prior dist is same across dimensions)
-        kl = tfd.kl_divergence(q_dist, p_dist).sum()
-        return -kl
+        D = gp_post['q_u_mu'].shape[0]
+        n = len(self.zs)
+        Kzz = vmap(vmap(partial(self.kernel.K, kernel_params=drift_params), (None, 0)), (0, None))(self.zs, self.zs) + self.jitter * jnp.eye(n)
+        L_Kzz = jnp.linalg.cholesky(Kzz)
+        L_A = gp_post['q_u_sigma_L_A']
+
+        log_det_Kzz = 2.0 * jnp.sum(jnp.log(jnp.diag(L_Kzz)))
+        log_det_A = 2.0 * jnp.sum(jnp.log(jnp.diag(L_A)))
+
+        # tr(Kzz⁻¹ q_S) = tr(A⁻¹ Kzz) (D-independent since q_S is shared).
+        trace_term = jnp.trace(jla.cho_solve((L_A, True), Kzz))
+
+        # μ_d^T Kzz⁻¹ μ_d per output dim.
+        q_mu = gp_post['q_u_mu']  # (D, n)
+        Kzz_inv_qmu = jla.cho_solve((L_Kzz, True), q_mu.T)  # (n, D)
+        quad_per_dim = jnp.einsum('di,id->d', q_mu, Kzz_inv_qmu)  # (D,)
+
+        # Σ_d KL_d = (D/2)[−log|Kzz| + log|A| + tr(A⁻¹ Kzz) − n] + 0.5 Σ_d μ_d^T Kzz⁻¹ μ_d.
+        kl_total = 0.5 * D * (-log_det_Kzz + log_det_A + trace_term - n) \
+                   + 0.5 * quad_per_dim.sum()
+        return -kl_total
 
     def get_posterior_f_mean(self, gp_post: GPPost, drift_params: Dict[str, Any], xs: jnp.array) -> jnp.array:
         """
@@ -308,51 +354,67 @@ class SparseGP(SDE):
         """
         Kxz = make_gram(self.kernel.K, drift_params, xs, self.zs, jitter=None)
         Kzz = make_gram(self.kernel.K, drift_params, self.zs, self.zs, jitter=self.jitter)
-        f_mean = (Kxz @ jnp.linalg.solve(Kzz, gp_post['q_u_mu'].T))
+        Kzz_chol = jla.cho_factor(Kzz, lower=True)
+        f_mean = (Kxz @ jla.cho_solve(Kzz_chol, gp_post['q_u_mu'].T))
         return f_mean
-    
+
     def get_posterior_f_var(self, gp_post: GPPost, drift_params: Dict[str, Any], xs: jnp.array) -> jnp.array:
         """
         Computes posterior variance under q(f) at a grid of points xs.
 
-        Returns: 
+        Returns:
         -----------
-        f_var: a shape (N_pts, N_pts) array, the posterior variance of f on the specified grid of xs 
-        """      
+        f_var: a shape (N_pts, N_pts) array, the posterior variance of f on the specified grid of xs
+        """
         Kxx = make_gram(self.kernel.K, drift_params, xs, xs, jitter=self.jitter)
         Kxz = make_gram(self.kernel.K, drift_params, xs, self.zs, jitter=None)
         Kzz = make_gram(self.kernel.K, drift_params, self.zs, self.zs, jitter=self.jitter)
-
-        f_var = jnp.diagonal(Kxx - Kxz @ jnp.linalg.solve(Kzz, Kxz.T) + Kxz @ jnp.linalg.solve(Kzz, gp_post['q_u_sigma']) @ jnp.linalg.solve(Kzz, Kxz.T), axis1=-2, axis2=-1)
+        Kzz_chol = jla.cho_factor(Kzz, lower=True)
+        Kzz_inv_KxzT = jla.cho_solve(Kzz_chol, Kxz.T)
+        Kzz_inv_qS = jla.cho_solve(Kzz_chol, gp_post['q_u_sigma'])
+        f_var = jnp.diagonal(
+            Kxx - Kxz @ Kzz_inv_KxzT + Kxz @ Kzz_inv_qS @ Kzz_inv_KxzT,
+            axis1=-2, axis2=-1)
         return f_var
 
     # --------- Closed-form expectations wrt q(f) and q(x) ----------
     def f(self, drift_params: Dict[str, Any], key: jr.PRNGKey, t: jnp.array, m: jnp.array, S: jnp.array, gp_post: GPPost) -> jnp.array:
         M, D = self.zs.shape
         Kzz = make_gram(self.kernel.K, drift_params, self.zs, self.zs, jitter=self.jitter)
-        Kzz_inv = jnp.linalg.inv(Kzz)
+        Kzz_chol = jla.cho_factor(Kzz, lower=True)
         E_Kxz = vmap(partial(self.kernel.E_Kxz, self.expectation, key, m=m, S=S, kernel_params=drift_params))(self.zs)[None] # (1, n_inducing)
-        E_f = E_Kxz @ Kzz_inv @ gp_post['q_u_mu'].T
+        E_f = E_Kxz @ jla.cho_solve(Kzz_chol, gp_post['q_u_mu'].T)
         return E_f[0]
 
     def ff(self, drift_params: Dict[str, Any], key: jr.PRNGKey, t: jnp.array, m: jnp.array, S: jnp.array, gp_post: GPPost) -> jnp.array:
         keys = jr.split(key, 2)
         M, D = self.zs.shape
         Kzz = make_gram(self.kernel.K, drift_params, self.zs, self.zs, jitter=self.jitter)
-        Kzz_inv = jnp.linalg.inv(Kzz)
+        Kzz_chol = jla.cho_factor(Kzz, lower=True)
         E_KzxKxz = vmap(vmap(partial(self.kernel.E_KzxKxz, self.expectation, keys[0], m=m, S=S, kernel_params=drift_params), (None, 0)), (0, None))(self.zs, self.zs) # (n_inducing, n_inducing)
 
-        term1 = D * (self.kernel.E_Kxx(self.expectation, keys[1], m, S, drift_params) - jnp.trace(Kzz_inv @ E_KzxKxz))
-        term2 = jnp.trace(Kzz_inv @ gp_post['q_u_sigma'].sum(0) @ Kzz_inv @ E_KzxKxz)
-        term3 = jnp.trace(E_KzxKxz @ Kzz_inv @ gp_post['q_u_mu'].T @ gp_post['q_u_mu'] @ Kzz_inv)
+        # Pre-compute the two Kzz^{-1} @ X products we need.
+        Kzz_inv_E_KzxKxz = jla.cho_solve(Kzz_chol, E_KzxKxz)              # (M, M)
+        Kzz_inv_q_u_sigma_sum = jla.cho_solve(Kzz_chol, gp_post['q_u_sigma'].sum(0))  # (M, M)
+        Kzz_inv_q_u_mu_T = jla.cho_solve(Kzz_chol, gp_post['q_u_mu'].T)   # (M, D)
+
+        term1 = D * (self.kernel.E_Kxx(self.expectation, keys[1], m, S, drift_params) - jnp.trace(Kzz_inv_E_KzxKxz))
+        # trace(A B C D) is invariant under cyclic perms; we form pieces that
+        # never explicitly invert Kzz.
+        # term2 = trace(Kzz^-1 q_u_sigma_sum Kzz^-1 E_KzxKxz)
+        #       = trace((Kzz^-1 q_u_sigma_sum) (Kzz^-1 E_KzxKxz))
+        term2 = jnp.trace(Kzz_inv_q_u_sigma_sum @ Kzz_inv_E_KzxKxz)
+        # term3 = trace(E_KzxKxz Kzz^-1 q_u_mu^T q_u_mu Kzz^-1)
+        #       = trace(q_u_mu (Kzz^-1 E_KzxKxz) (Kzz^-1 q_u_mu^T))   [cyclic]
+        term3 = jnp.trace(gp_post['q_u_mu'] @ Kzz_inv_E_KzxKxz @ Kzz_inv_q_u_mu_T)
         return term1 + term2 + term3
 
     def dfdx(self, drift_params: Dict[str, Any], key: jr.PRNGKey, t: jnp.array, m: jnp.array, S: jnp.array, gp_post: GPPost) -> jnp.array:
         M, D = self.zs.shape
         Kzz = make_gram(self.kernel.K, drift_params, self.zs, self.zs, jitter=self.jitter)
-        Kzz_inv = jnp.linalg.inv(Kzz)
+        Kzz_chol = jla.cho_factor(Kzz, lower=True)
         E_dKzxdx = vmap(partial(self.kernel.E_dKzxdx, self.expectation, key, m=m, S=S, kernel_params=drift_params))(self.zs)
-        return gp_post['q_u_mu'] @ Kzz_inv @ E_dKzxdx # (D, D)
+        return gp_post['q_u_mu'] @ jla.cho_solve(Kzz_chol, E_dKzxdx) # (D, D)
 
     def update_dynamics_params(self, key: jr.PRNGKey, t_grid: jnp.array, marginal_params: MarginalParams, trial_mask: jnp.array, drift_params: dict[str, Any], inputs: jnp.array, input_effect: jnp.array, sigma: int = 1.) -> GPPost:
         del_t = t_grid[1:] - t_grid[:-1] # (T-1)
@@ -401,14 +463,28 @@ class SparseGP(SDE):
             int_E_dKzxdx_Ss_diff = (E_dKzxdx_on_grid @ Ss_diff).sum(0)
             return int_E_dKzxdx_Ss_diff  # (M, D)
 
-        Kzz = make_gram(self.kernel.K, drift_params, self.zs, self.zs, jitter=self.jitter)        
+        Kzz = make_gram(self.kernel.K, drift_params, self.zs, self.zs, jitter=self.jitter)
         int_E_KzxKxz = vmap(partial(_q_u_sigma_helper, del_t=del_t, kernel_params=drift_params))(ms, Ss, trans_mask).sum(0) # vmap over batches
-        q_u_sigma = Kzz @ jnp.linalg.solve(Kzz + (1/(sigma**2)) * int_E_KzxKxz, Kzz)
-        q_u_sigma = q_u_sigma[None].repeat(ms.shape[-1], 0) # (D, n_inducing, n_inducing)
+        # Form q_u_sigma = Kzz A^{-1} Kzz via Cholesky of A = Kzz + σ⁻² ΣE_KzxKxz.
+        # We build q_u_sigma as a Gram product (L_A^{-1} Kzz)^T (L_A^{-1} Kzz)
+        # so it is structurally PSD up to symmetry, but its eigenvalues are
+        # bounded below by ~jitter² / cond(A) and become tiny.  We therefore
+        # stash L_A in gp_post so the prior KL term can use the identities
+        # log|q_u_sigma| = 2 log|Kzz| − log|A| and
+        # tr(Kzz⁻¹ q_u_sigma) = tr(A⁻¹ Kzz) instead of Cholesky-factoring
+        # q_u_sigma itself.
+        A = Kzz + (1.0 / (sigma ** 2)) * int_E_KzxKxz
+        A = 0.5 * (A + A.T)
+        L_A = jnp.linalg.cholesky(A)
+        L_A_inv_Kzz = jla.solve_triangular(L_A, Kzz, lower=True)
+        q_u_sigma = L_A_inv_Kzz.T @ L_A_inv_Kzz
+        q_u_sigma = q_u_sigma[None].repeat(ms.shape[-1], 0)  # (D, n_inducing, n_inducing)
 
         int1 = vmap(partial(_q_u_mu_helper1, del_t=del_t, B=input_effect, kernel_params=drift_params))(ms, Ss, inputs, trans_mask).sum(0) # vmap over batches
         int2 = vmap(partial(_q_u_mu_helper2, kernel_params=drift_params))(ms, Ss, SSs, trans_mask).sum(0) # vmap over batches
-        q_u_mu = (1/(sigma)**2) * (Kzz @ jnp.linalg.solve(Kzz + (1/(sigma**2)) * int_E_KzxKxz, int1 + int2)).T
+        A_chol = (L_A, True)
+        q_u_mu = (1/(sigma)**2) * (Kzz @ jla.cho_solve(A_chol, int1 + int2)).T
 
-        gp_post = {'q_u_mu': q_u_mu, 'q_u_sigma': q_u_sigma}
+        gp_post = {'q_u_mu': q_u_mu, 'q_u_sigma': q_u_sigma,
+                   'q_u_sigma_L_A': L_A}
         return gp_post

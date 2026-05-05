@@ -1,21 +1,21 @@
 """
 JAX-native EFGP primitives.
 
-Mirrors the PyTorch primitives used by ``TorchEFGPBackend`` (which wrap
-``efgpnd``).  Once these pass parity + timing tests, a ``JaxEFGPBackend``
-in :mod:`sing.efgp_backend` will use them so the entire SING E-step can
-be ``jax.jit`` + ``lax.scan``'d.
+These primitives wrap ``jax_finufft`` and pure JAX ops to provide the
+NUFFT / Toeplitz / CG / Hutchinson building blocks used by
+:mod:`sing.efgp_jax_drift` and :mod:`sing.efgp_em`.  Everything is
+``jax.jit`` + ``lax.scan`` friendly so the entire SING E-step lives in
+a single compiled graph.
 
 Import-order constraint
 -----------------------
-``pytorch_finufft`` (used by ``efgpnd``) and ``jax_finufft`` both wrap
-the same upstream ``libfinufft``.  If torch's binding is initialised
-first, the next ``jax_finufft`` call segfaults the process.  We force
-``jax_finufft`` to load *first* by importing it at the top of this
-module — but anyone running torch + JAX together in the same process
-must therefore import this module *before* importing ``efgpnd`` /
-``pytorch_finufft``.  The parity tests work around this by running
-torch and JAX in separate subprocesses.
+``pytorch_finufft`` and ``jax_finufft`` both wrap the same upstream
+``libfinufft``.  If torch's binding is initialised first, the next
+``jax_finufft`` call segfaults the process.  We force ``jax_finufft``
+to load *first* by importing it at the top of this module — anyone
+running torch + JAX together in the same process must therefore import
+this module *before* importing anything that pulls in
+``pytorch_finufft``.
 
 Math symbol → function in this module
 -------------------------------------
@@ -28,10 +28,6 @@ Math symbol → function in this module
     A_r v = v + D_θ T D_θ v                         make_A_apply
     Solve A μ = h via CG                            cg_solve
     diag(Φ A⁻¹ Φ*)  via Hutchinson                   hutchinson_diag
-
-# TODO(efgp-jax): this module is the single point of integration with
-# JAX-native EFGP.  When efgp_jax (the sibling package) becomes the
-# canonical backend, swap the imports below to point at it directly.
 """
 from __future__ import annotations
 
@@ -63,7 +59,7 @@ def _cmplx(real_dtype):
 # 1. Spectral grid for SE kernel
 # ---------------------------------------------------------------------------
 class JaxGridState(NamedTuple):
-    """JAX-side analogue of :class:`sing.efgp_backend.GridState`.
+    """Spectral-grid state for the EFGP NUFFT/Toeplitz primitives.
 
     Fields are JAX arrays where it matters for tracing (xis_flat, ws,
     h_per_dim, xcen) and Python ints elsewhere (mtot_per_dim, M, d).
@@ -107,7 +103,7 @@ def spectral_grid_se(
     X: Array,
     *,
     eps: float = 1e-3,
-    dtype=jnp.float32,
+    dtype=None,
 ) -> JaxGridState:
     """Build the EFGP spectral grid for an SE kernel + cloud extent ``X``.
 
@@ -116,6 +112,9 @@ def spectral_grid_se(
     bisection runs in plain numpy (not under JAX tracing); the resulting
     ``mtot_per_dim`` is a Python tuple of ints, fixed at trace time.
     """
+    if dtype is None:
+        dtype = jnp.asarray(X).dtype if jnp.issubdtype(
+            jnp.asarray(X).dtype, jnp.floating) else jnp.zeros(1).dtype
     d = int(X.shape[1])
     cdtype = _cmplx(dtype)
 
@@ -168,6 +167,123 @@ def spectral_grid_se(
 
     h_per_dim = jnp.full((d,), h, dtype=dtype)
     xcen = 0.5 * jnp.asarray(X_min + X_max, dtype=dtype)
+
+    return JaxGridState(xis_flat=xis_flat, ws=ws, h_per_dim=h_per_dim,
+                        mtot_per_dim=mtot_per_dim, xcen=xcen, M=M, d=d)
+
+
+def choose_K_for_min_lengthscale(
+    ls_min: float, variance: float, X_extent: float, *,
+    eps: float = 1e-3, d: int = 2,
+) -> int:
+    """Pick a fixed integer-mode lattice K (per dim) that resolves the
+    SHARPEST lengthscale we expect to see during EM (= ``ls_min``).
+
+    Larger K = more capacity = handles smaller ls.  Pick once at EM init
+    based on the smallest plausible ls (e.g., ``ls_init / 2``); the
+    integer lattice never changes after.  Adaptive ``h(θ)`` then varies
+    only the physical spacing within this fixed lattice — no JIT
+    recompilation as θ moves.
+
+    Returns a single Python ``int K`` with ``mtot = 2K + 1`` per dim.
+    """
+    L = float(X_extent)
+    L = max(L, 1.0)
+    ls = float(ls_min)
+    var = float(variance)
+
+    def k_se(r):
+        return var * math.exp(-0.5 * r * r / (ls * ls))
+
+    def khat_modified(r):
+        s0 = (2 * math.pi * ls * ls) ** (d / 2.0) * var
+        s = s0 * math.exp(-2 * math.pi * math.pi * ls * ls * r * r)
+        return abs(r) ** (d - 1) * s / s0
+
+    Ltime = _bisect_decreasing(k_se, eps)
+    Lfreq = _bisect_decreasing(khat_modified, eps)
+    h_spatial = 1.0 / (L + Ltime)
+    K = int(math.ceil(Lfreq / h_spatial))
+    return K
+
+
+def spectral_grid_se_fixed_K(
+    log_ls: Array,
+    log_var: Array,
+    *,
+    K_per_dim: int,
+    X_extent: float,
+    xcen: Array,
+    d: int,
+    eps: float = 1e-3,
+    dtype=None,
+) -> JaxGridState:
+    """Adaptive-h spectral grid: integer mode lattice {-K, ..., K}^d is
+    FIXED (Python int → static under jit), but ``h(θ)`` is a dynamic
+    JAX scalar derived from ``log_ls``.
+
+    Lets a single jit cache serve all ℓ values that the M-step visits,
+    while still adapting the physical spacing so the spectral truncation
+    stays at ~``eps``.
+
+    ``X_extent`` is the cloud half-extent (a Python float / static).  We
+    use it to pick ``h`` so spatial coverage is satisfied; Lfreq(ℓ) sets
+    the lower bound on ``h``.
+
+    Returns a fresh ``JaxGridState`` whose ``mtot_per_dim`` is fixed but
+    whose ``xis_flat``, ``ws``, ``h_per_dim`` are dynamic JAX arrays.
+    """
+    if dtype is None:
+        dtype = jnp.asarray(log_ls).dtype if jnp.issubdtype(
+            jnp.asarray(log_ls).dtype, jnp.floating) else jnp.zeros(1).dtype
+    K = int(K_per_dim)
+    mtot_per_dim = tuple(2 * K + 1 for _ in range(d))
+    M = int((2 * K + 1) ** d)
+    cdtype = _cmplx(dtype)
+
+    ls = jnp.exp(log_ls)
+    var = jnp.exp(log_var)
+
+    # Closed-form Lfreq for SE: solve khat ≈ eps.  Using the leading
+    # exponential decay (drop the |r|^{d-1} prefactor): Lfreq = √(-log eps)/(π ℓ √2).
+    # The neglected log-prefactor adds a small constant correction; in
+    # practice we choose K conservatively above so this approximation
+    # only matters for the precise h value, not for grid correctness.
+    Lfreq = jnp.sqrt(-jnp.log(jnp.array(eps, dtype=dtype))) \
+            / (math.pi * ls * math.sqrt(2.0))
+
+    # Spatial coverage: h ≤ 1/(L + Ltime) where Ltime ≈ ℓ √(-2 log eps).
+    Ltime = ls * jnp.sqrt(-2.0 * jnp.log(jnp.array(eps, dtype=dtype)))
+    h_spatial_max = 1.0 / (X_extent + Ltime)
+
+    # Frequency coverage: h ≥ Lfreq / K
+    h_freq_min = Lfreq / K
+
+    # Pick h = max(spatial-needed, freq-needed).  When K was chosen for
+    # the smallest expected ls, h_spatial_max ≥ h_freq_min and we use the
+    # frequency-derived h (smaller, safer for spatial too).  If ℓ drops
+    # below ls_min the user picked K for, jnp.maximum keeps us safe — at
+    # the cost of slightly under-resolving the spectrum at the edges.
+    h = jnp.maximum(h_freq_min, h_spatial_max).astype(dtype)
+
+    # 1-D integer lattice → ξ_k = h * k
+    k_lattice = jnp.arange(-K, K + 1, dtype=dtype)
+    xis_1d = h * k_lattice
+    if d == 1:
+        xis_flat = xis_1d.reshape(-1, 1)
+    else:
+        grids = jnp.meshgrid(*[xis_1d for _ in range(d)], indexing="ij")
+        xis_flat = jnp.stack([g.ravel() for g in grids], axis=-1)
+
+    # ws = sqrt(S(ξ) * h^d), S = (2π ℓ²)^{d/2} var exp(-2π² ℓ² ‖ξ‖²)
+    xi_norm_sq = (xis_flat * xis_flat).sum(axis=1)
+    log_S = (d / 2.0) * jnp.log(2 * math.pi * ls * ls) + log_var \
+            - 2 * (math.pi ** 2) * ls * ls * xi_norm_sq
+    h_d = h ** d
+    ws_real = jnp.sqrt(jnp.exp(log_S) * h_d)
+    ws = ws_real.astype(cdtype)
+
+    h_per_dim = jnp.full((d,), h, dtype=dtype)
 
     return JaxGridState(xis_flat=xis_flat, ws=ws, h_per_dim=h_per_dim,
                         mtot_per_dim=mtot_per_dim, xcen=xcen, M=M, d=d)

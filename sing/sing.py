@@ -227,9 +227,10 @@ def fit_variational_em(key: jr.PRNGKey,
                        n_iters_e: int = 25, 
                        perform_m_step: bool = True, 
                        learn_output_params: bool = True,
-                       n_iters_m: int = 25, 
-                       learning_rate: Optional[jnp.array] = None, 
-                       print_interval: int = 1) -> Tuple[MarginalParams, NaturalParams, GPPost, Dict[str, Any], InitParams, Dict[str, jnp.array], jnp.array, list[float]]:
+                       n_iters_m: int = 25,
+                       learning_rate: Optional[jnp.array] = None,
+                       print_interval: int = 1,
+                       drift_params_history: Optional[list] = None) -> Tuple[MarginalParams, NaturalParams, GPPost, Dict[str, Any], InitParams, Dict[str, jnp.array], jnp.array, list[float]]:
     """
     Performs variational EM (inference and learning) with SING.
 
@@ -382,5 +383,8 @@ def fit_variational_em(key: jr.PRNGKey,
         if (i + 1) % print_interval == 0:
             print(f"Iteration {i + 1} / {n_iters}, ELBO: {elbo}, ell: {ell_term}, KL: {KL_term}, prior: {prior_term}")
         elbos.append(elbo)
+        if drift_params_history is not None:
+            import numpy as _np
+            drift_params_history.append(jax.tree_util.tree_map(lambda x: _np.array(x), drift_params))
 
     return marginal_params, natural_params, gp_post, drift_params, init_params, output_params, input_effect, elbos

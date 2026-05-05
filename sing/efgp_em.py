@@ -59,7 +59,8 @@ class EFGPEMHistory:
 # JAX-native EM loop (lax.scan'd inner E-step, no torch round-trip)
 # ============================================================================
 def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
-                                S_marginal, n_estep_iters):
+                                S_marginal, n_estep_iters,
+                                qf_cg_tol, qf_max_cg_iter, qf_nufft_eps):
     """Compile a function that runs ``n_estep_iters`` inner E-step iterations
     via ``lax.scan``, all JAX, no torch.
 
@@ -79,9 +80,9 @@ def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
     nat_to_marg_b = jax.jit(vmap(natural_to_marginal_params))
 
     @partial(jax.jit, static_argnames=('mtot_per_dim',))
-    def scan_estep(natural_params, init_params, ys_obs, t_mask,
-                    output_params, key, rho,
-                    xis_flat, ws, h_per_dim, xcen, mtot_per_dim):
+    def scan_estep_inner_refresh(natural_params, init_params, ys_obs, t_mask,
+                                 output_params, key, rho,
+                                 xis_flat, ws, h_per_dim, xcen, mtot_per_dim):
         # Reconstruct the JaxGridState pytree inside the trace.  M and d
         # are derived from xis_flat shape, so they are static at trace time.
         grid = jp.JaxGridState(
@@ -103,6 +104,8 @@ def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
                 ms, Ss, SSs, del_t, grid, key_qf,
                 sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
                 D_lat=D, D_out=D,
+                cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                nufft_eps=qf_nufft_eps,
             )
             frozen = _FrozenEFGPDrift(
                 latent_dim=D, t_grid=t_grid,
@@ -127,7 +130,38 @@ def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
         final_nat_p, _ = jax.lax.scan(one_iter, natural_params, keys)
         return final_nat_p
 
-    return scan_estep, nat_to_marg_b
+    @jax.jit
+    def scan_estep_frozen_qf(natural_params, init_params, ys_obs, t_mask,
+                             output_params, key, rho,
+                             Ef, Eff, Edfdx):
+        frozen = _FrozenEFGPDrift(
+            latent_dim=D, t_grid=t_grid,
+            Ef_per_t=Ef, Eff_per_t=Eff, Edfdx_per_t=Edfdx)
+        trial_mask = jnp.ones((1, T), dtype=bool)
+
+        def one_iter(carry, key_grad):
+            nat_p = carry
+            mean_params_b, _ = vmap(natural_to_mean_params)(nat_p, trial_mask)
+            lik_g = vmap(lambda mp_, tm_, ys_: nat_grad_likelihood(
+                mp_, tm_, ys_, lik, output_params))(mean_params_b, t_mask, ys_obs)
+            tr_g = vmap(lambda k, mp_, tm_, ip_: nat_grad_transition(
+                k, frozen, None, {}, tm_, ip_, t_grid, mp_,
+                inputs, input_effect, sigma))(jr.split(key_grad, 1),
+                                              mean_params_b, trial_mask, init_params)
+            new_nat_p = {
+                'J': (1 - rho) * nat_p['J']
+                     + rho * (lik_g['J'] + tr_g['J']),
+                'L': (1 - rho) * nat_p['L'] + rho * tr_g['L'],
+                'h': (1 - rho) * nat_p['h']
+                     + rho * (lik_g['h'] + tr_g['h']),
+            }
+            return new_nat_p, None
+
+        keys = jr.split(key, n_estep_iters)
+        final_nat_p, _ = jax.lax.scan(one_iter, natural_params, keys)
+        return final_nat_p
+
+    return scan_estep_inner_refresh, scan_estep_frozen_qf, nat_to_marg_b
 
 
 def fit_efgp_sing_jax(
@@ -148,10 +182,20 @@ def fit_efgp_sing_jax(
     rho_sched: Optional[jnp.ndarray] = None,
     learn_emissions: bool = True,
     update_R: bool = True,
+    # Closed-form Gaussian emission updates can be too aggressive while the
+    # latent posterior is still close to the diffusion-only initialization.
+    # Delay them until q(x) has sharpened enough to avoid a bad early
+    # emissions/latents feedback loop.
+    emission_warmup_iters: int = 8,
     learn_kernel: bool = False,
     n_mstep_iters: int = 4,
     mstep_lr: float = 0.05,
     n_hutchinson_mstep: int = 4,
+    # If True, refresh q(f) on every inner SING iteration. If False,
+    # compute q(f) once per outer EM iteration and freeze it through the
+    # inner natural-gradient scan, matching SparseGP's variational-EM
+    # structure more closely and improving stability.
+    refresh_qf_every_estep_iter: bool = True,
     # Warmup: run at least this many E-step iters before the first M-step.
     # With rho_sched starting at 0.01, the smoother needs ~8 outer EM iters
     # (64+ inner SING steps) before its pseudo-velocities are smooth enough
@@ -164,8 +208,9 @@ def fit_efgp_sing_jax(
     #   1) ``pin_grid=True``           — legacy: build once, never rebuild.
     #   2) ``K_per_dim`` set explicitly — adaptive-h with user-supplied K.
     #   3) ``K_min_lengthscale`` set    — adaptive-h, auto K from this min ℓ.
-    #   4) DEFAULT                     — adaptive-h, K_per_dim=10
-    #                                    (≈ 21 modes per dim).
+    #   4) DEFAULT                     — adaptive-h, K matched to the
+    #                                    initial tailored grid at the
+    #                                    requested ``eps_grid``.
     # Adaptive-h means: integer mode lattice ``mtot = 2K+1`` is fixed, but
     # the physical spacing ``h(θ)`` adapts to the current ℓ each outer EM
     # iter.  No JIT retrace as ℓ moves; spacing tracks the kernel.
@@ -177,13 +222,25 @@ def fit_efgp_sing_jax(
     # right resolution for the converged ℓ.  Costs one JAX retrace.
     adaptive_pin_after: Optional[int] = None,
     adaptive_pin_factor: float = 0.5,
+    # Diagnostic mode: rebuild a fully tailored spectral grid from the
+    # current (ℓ, σ²) every outer EM iter instead of using the jit-friendly
+    # fixed-K / adaptive-h policy. This can retrace when mtot changes, so it
+    # is meant for comparison experiments rather than routine use.
+    tailored_grid_every_iter: bool = False,
     K_per_dim: Optional[int] = None,
     K_min_lengthscale: Optional[float] = None,  # used to auto-pick K if not given
     K_eps: Optional[float] = None,         # tolerance for the K choice (defaults eps_grid)
     X_template: Optional[jnp.ndarray] = None,
+    qf_cg_tol: float = 1e-5,
+    qf_max_cg_iter: int = 2000,
+    qf_nufft_eps: float = 6e-8,
     seed: int = 0,
     true_xs: Optional[np.ndarray] = None,
     verbose: bool = True,
+    # Optionally warm-start natural params from an earlier fit (e.g. a
+    # final-stage refinement at tighter eps_grid).  Defaults to the
+    # diffusion-only Brownian-chain init.
+    init_natural_params: Optional[NaturalParams] = None,
 ) -> Tuple[MarginalParams, NaturalParams, Dict[str, jnp.ndarray],
            InitParams, EFGPEMHistory]:
     """Fully JAX-native fit: inner E-step is ``lax.scan``'d inside ``jit``.
@@ -209,27 +266,39 @@ def fit_efgp_sing_jax(
     ls = float(lengthscale)
     var = float(variance)
 
-    # Build a *representative* cloud at the prior marginals so the spectral
-    # grid (and thus the jit'd graph) is built once.  Caller can supply a
-    # custom one if the latent posterior is expected to roam beyond the
-    # prior covariance.
+    # Build a representative cloud that sets the spectral grid support.
+    # A prior-covariance-sized cloud is often too narrow in practice: the
+    # adaptive-h grid can then be centered on a domain much smaller than the
+    # actual latent trajectory, which hurts both q(f) quality and the kernel
+    # M-step on broader nonlinear flows. Use at least a [-3, 3]^D box around
+    # the initial mean, expanding further if the prior variance is larger.
+    # Caller can still supply a custom template when they know a better
+    # support box for the problem.
     if X_template is None:
-        diag_V0 = jnp.diag(jnp.asarray(init_params['V0'][0]))
-        X_template = (jnp.sqrt(diag_V0)[None, :]
-                      * jnp.linspace(-2., 2., max(T, 16))[:, None]
-                      + jnp.asarray(init_params['mu0'][0])[None, :])
+        diag_std0 = jnp.sqrt(jnp.diag(jnp.asarray(init_params['V0'][0])))
+        half_span = jnp.maximum(
+            jnp.full_like(diag_std0, 3.0),
+            4.0 * diag_std0,
+        )
+        X_template = (
+            jnp.asarray(init_params['mu0'][0])[None, :]
+            + jnp.linspace(-1., 1., max(T, 16))[:, None] * half_span[None, :]
+        )
 
-    # ---- Initialise natural params with a "diffusion-only" SDE ----
-    # Use a Brownian-like initial chain: we don't import any torch-backed
-    # drift module to seed natural params.
+    # ---- Initialise natural params ----
     nat_to_marg_b = jax.jit(vmap(natural_to_marginal_params))
-    A_init = jnp.zeros((T - 1, D, D))
-    b_init = jnp.zeros((T, D)).at[0].set(jnp.asarray(init_params['mu0'][0]))
-    Q_init = jnp.tile((sigma ** 2) * jnp.eye(D), (T, 1, 1)).at[0].set(
-        jnp.asarray(init_params['V0'][0]))
-    from sing.utils.sing_helpers import dynamics_to_natural_params
-    nat_one = dynamics_to_natural_params(A_init, b_init, Q_init, trial_mask[0])
-    natural_params = jax.tree_util.tree_map(lambda x: x[None], nat_one)
+    if init_natural_params is not None:
+        natural_params = init_natural_params
+    else:
+        # Default: diffusion-only Brownian-chain seed.
+        A_init = jnp.zeros((T - 1, D, D))
+        b_init = jnp.zeros((T, D)).at[0].set(jnp.asarray(init_params['mu0'][0]))
+        Q_init = jnp.tile((sigma ** 2) * jnp.eye(D), (T, 1, 1)).at[0].set(
+            jnp.asarray(init_params['V0'][0]))
+        from sing.utils.sing_helpers import dynamics_to_natural_params
+        nat_one = dynamics_to_natural_params(
+            A_init, b_init, Q_init, trial_mask[0])
+        natural_params = jax.tree_util.tree_map(lambda x: x[None], nat_one)
 
     init_key, key = jr.split(jr.PRNGKey(seed), 2)
 
@@ -237,10 +306,12 @@ def fit_efgp_sing_jax(
     # JIT INPUT, and ``mtot_per_dim`` is a static_argnames — JAX
     # automatically caches one compiled artifact per ``mtot_per_dim``
     # value.
-    scan_estep, _ = _build_jit_estep_scan_jax(
+    scan_estep_inner_refresh, scan_estep_frozen_qf, _ = _build_jit_estep_scan_jax(
         D=D, T=T, t_grid=t_grid, lik=likelihood, sigma=sigma,
         sigma_drift_sq=sigma_drift_sq,
         S_marginal=S_marginal, n_estep_iters=n_estep_iters,
+        qf_cg_tol=qf_cg_tol, qf_max_cg_iter=qf_max_cg_iter,
+        qf_nufft_eps=qf_nufft_eps,
     )
 
     def _make_grid(ls_, var_, eps_):
@@ -253,18 +324,24 @@ def fit_efgp_sing_jax(
     # neither ``K_per_dim`` nor ``K_min_lengthscale`` is given, auto-pick K
     # from the initial ℓ with 2× headroom for shrinkage.
     use_adaptive_h = (not pin_grid)
-    if use_adaptive_h:
+    if use_adaptive_h and tailored_grid_every_iter:
+        grid = _make_grid(ls, var, eps_grid)
+        if verbose:
+            print(f"  [jax] tailored-grid: M={grid.M}, "
+                  f"mtot_per_dim={grid.mtot_per_dim}")
+    elif use_adaptive_h:
         K_eps_used = K_eps if K_eps is not None else eps_grid
         if K_per_dim is None and K_min_lengthscale is None:
-            K_per_dim = 10
+            init_grid = _make_grid(ls, var, K_eps_used)
+            K_per_dim = (int(init_grid.mtot_per_dim[0]) - 1) // 2
             if verbose:
-                print(f"  [jax] adaptive-h default: K_per_dim=10 "
-                      f"(21 modes/dim)")
+                print(f"  [jax] adaptive-h default: K_per_dim={K_per_dim} "
+                      f"(matches initial tailored grid)")
         # Use cloud extent from X_template
         X_min = np.asarray(X_template.min(axis=0))
         X_max = np.asarray(X_template.max(axis=0))
         X_extent = float((X_max - X_min).max())
-        xcen_arr = jnp.asarray(0.5 * (X_min + X_max), dtype=jnp.float32)
+        xcen_arr = jnp.asarray(0.5 * (X_min + X_max))
 
         if K_per_dim is None:
             ls_min = float(K_min_lengthscale)
@@ -273,8 +350,8 @@ def fit_efgp_sing_jax(
 
         def _make_grid_adaptive(ls_, var_):
             return jp.spectral_grid_se_fixed_K(
-                log_ls=jnp.log(jnp.asarray(ls_, dtype=jnp.float32)),
-                log_var=jnp.log(jnp.asarray(var_, dtype=jnp.float32)),
+                log_ls=jnp.log(jnp.asarray(ls_)),
+                log_var=jnp.log(jnp.asarray(var_)),
                 K_per_dim=K_per_dim, X_extent=X_extent, xcen=xcen_arr,
                 d=D, eps=K_eps_used,
             )
@@ -299,14 +376,35 @@ def fit_efgp_sing_jax(
     log_var = float(np.log(var))
 
     for it in range(n_em_iters):
-        rho_jax = jnp.asarray(float(rho_sched[it]), dtype=jnp.float32)
+        rho_jax = jnp.asarray(float(rho_sched[it]))
         em_key, key = jr.split(key, 2)
-        natural_params = scan_estep(natural_params, init_params,
-                                     ys_obs, t_mask, output_params,
-                                     em_key, rho_jax,
-                                     grid.xis_flat, grid.ws,
-                                     grid.h_per_dim, grid.xcen,
-                                     mtot_per_dim=grid.mtot_per_dim)
+        if refresh_qf_every_estep_iter:
+            natural_params = scan_estep_inner_refresh(
+                natural_params, init_params,
+                ys_obs, t_mask, output_params,
+                em_key, rho_jax,
+                grid.xis_flat, grid.ws,
+                grid.h_per_dim, grid.xcen,
+                mtot_per_dim=grid.mtot_per_dim)
+        else:
+            mp_prev_b, _ = nat_to_marg_b(natural_params, trial_mask)
+            ms_prev = mp_prev_b['m'][0]
+            Ss_prev = mp_prev_b['S'][0]
+            SSs_prev = mp_prev_b['SS'][0]
+            qf_key, scan_key = jr.split(em_key, 2)
+            del_t = t_grid[1:] - t_grid[:-1]
+            _, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_jax(
+                ms_prev, Ss_prev, SSs_prev, del_t, grid, qf_key,
+                sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+                D_lat=D, D_out=D,
+                cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                nufft_eps=qf_nufft_eps,
+            )
+            natural_params = scan_estep_frozen_qf(
+                natural_params, init_params,
+                ys_obs, t_mask, output_params,
+                scan_key, rho_jax,
+                Ef_prev, Eff_prev, Edfdx_prev)
 
         # ---- M-step ----
         mp_b, _ = nat_to_marg_b(natural_params, trial_mask)
@@ -315,7 +413,7 @@ def fit_efgp_sing_jax(
         SSs_t = mp_b['SS'][0]
 
         # 1) Closed-form (C, d, R) for Gaussian emissions
-        if learn_emissions:
+        if learn_emissions and it >= emission_warmup_iters:
             C_new, d_new, R_new = update_emissions_gaussian(
                 ms_t, Ss_t, ys_obs[0], t_mask[0], update_R=update_R)
             output_params = {**output_params, 'C': C_new, 'd': d_new}
@@ -331,6 +429,8 @@ def fit_efgp_sing_jax(
                 ms_t, Ss_t, SSs_t, del_t, grid, mstep_key,
                 sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
                 D_lat=D, D_out=D,
+                cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                nufft_eps=qf_nufft_eps,
             )
             # z_r = h_θ,r / ws  (so M-step varies hypers via ws and recovers h_r = ws ⊙ z_r)
             ws_real_c = grid.ws.real.astype(grid.ws.dtype)
@@ -363,7 +463,9 @@ def fit_efgp_sing_jax(
                 # Rebuild the grid for the new ℓ.  Default adaptive-h
                 # keeps ``mtot`` fixed (no JIT retrace) and only updates
                 # spacing ``h(θ)``.  Legacy ``pin_grid=True`` skips this.
-                if use_adaptive_h:
+                if use_adaptive_h and tailored_grid_every_iter:
+                    grid = _make_grid(ls, var, eps_grid)
+                elif use_adaptive_h:
                     grid = _make_grid_adaptive(ls, var)
 
         # Adaptive pin: ONCE, at iteration `adaptive_pin_after`, refresh
