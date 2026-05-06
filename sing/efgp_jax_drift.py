@@ -75,6 +75,7 @@ def _eff_bwd(res, g):
 eff_with_grads.defvjp(_eff_fwd, _eff_bwd)
 
 
+@jax.tree_util.register_pytree_node_class
 class FrozenEFGPDrift(SDE):
     """Pure-JAX SDE shim: returns precomputed (Ef, Eff, Edfdx) per time
     step with delta-method custom VJPs through (m, S).
@@ -88,6 +89,10 @@ class FrozenEFGPDrift(SDE):
         E[f(x)]                ≈  f(m)              ∂/∂m: J_f(m)        ∂/∂S: 0
         E[f^T Σ⁻¹ f]           ≈  f(m)^T Σ⁻¹ f(m)   ∂/∂m: 2 Jᵀ Σ⁻¹ f    ∂/∂S: Jᵀ Σ⁻¹ J
         E[J_f(x)]              ≈  J_f(m)            (treat constant)
+
+    Registered as a JAX pytree so it can be passed across ``jax.vmap``
+    over a leading trial axis: leaves ``(Ef, Eff, Edfdx)`` get sliced,
+    aux ``(latent_dim, t_grid)`` is shared.
     """
 
     def __init__(self, *, latent_dim: int, t_grid: Array,
@@ -97,6 +102,18 @@ class FrozenEFGPDrift(SDE):
         self._Ef = Ef_per_t
         self._Eff = Eff_per_t
         self._Edfdx = Edfdx_per_t
+
+    def tree_flatten(self):
+        children = (self._Ef, self._Eff, self._Edfdx)
+        aux = (self.latent_dim, self._t_grid)
+        return children, aux
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        latent_dim, t_grid = aux
+        Ef, Eff, Edfdx = children
+        return cls(latent_dim=latent_dim, t_grid=t_grid,
+                   Ef_per_t=Ef, Eff_per_t=Eff, Edfdx_per_t=Edfdx)
 
     def _idx(self, t):
         return jnp.argmin(jnp.abs(self._t_grid - t))
@@ -118,33 +135,37 @@ class FrozenEFGPDrift(SDE):
 
 
 def _build_pseudo_cloud(
-    ms: Array,           # (T, D_lat)
-    Ss: Array,           # (T, D_lat, D_lat)
+    m_src: Array,        # (N_src, D_lat)
+    S_src: Array,        # (N_src, D_lat, D_lat)
     key: Array,
     S_marginal: int,
     D_lat: int,
-) -> Tuple[Array, Array]:
-    """Sample the pseudo-input cloud x_a^(s) ~ N(m_a, S_a) for a=0..T-2.
+) -> Array:
+    """Sample S_marginal pseudo-points per source: x^(s) ~ N(m_i, S_i).
 
-    Returns (X_flat, delta_unit_per_pseudo) where:
-      * X_flat:  (T-1)*S_marginal x D_lat
-      * delta_unit_per_pseudo: (T-1)*S_marginal x 1, replicated del_t
-        weights (callers multiply by del_t / (S σ²)).
+    Returns ``X_flat`` of shape ``(N_src * S_marginal, D_lat)``.
+
+    Sources here are flat across trials and transitions: callers (the
+    multi-trial qf_and_moments_*_jax wrappers) flatten ``(K, T-1, D)``
+    Stein quantities into ``(K*(T-1), D)`` before calling.  Padded
+    transitions (where trial_mask=0) enter with their associated
+    ``weights`` set to 0, so the corresponding pseudo-points contribute
+    nothing to the BTTB or RHS regardless of where they sit in space.
     """
-    T = ms.shape[0]
-    # eps shape (T-1, S, D_lat)
-    eps = jax.random.normal(key, (T - 1, S_marginal, D_lat))
-    L_chol = jnp.linalg.cholesky(Ss[:-1] + 1e-9 * jnp.eye(D_lat))
-    X_cloud = ms[:-1, None, :] + jnp.einsum('tij,tsj->tsi', L_chol, eps)
+    N_src = m_src.shape[0]
+    eps = jax.random.normal(key, (N_src, S_marginal, D_lat))
+    L_chol = jnp.linalg.cholesky(S_src + 1e-9 * jnp.eye(D_lat))
+    X_cloud = m_src[:, None, :] + jnp.einsum('iab,isb->isa', L_chol, eps)
     X_flat = X_cloud.reshape(-1, D_lat)
     return X_flat
 
 
 def compute_mu_r_jax(
-    ms: Array,                        # (T, D_lat)
-    Ss: Array,                        # (T, D_lat, D_lat)
-    SSs: Array,                       # (T-1, D_lat, D_lat)  (cross-cov)
-    del_t: Array,                     # (T-1,)
+    m_src: Array,                     # (N_src, D_lat)
+    S_src: Array,                     # (N_src, D_lat, D_lat)
+    d_src: Array,                     # (N_src, D_lat)         — Stein d_{·, :}
+    C_src: Array,                     # (N_src, D_lat, D_lat)  — Stein C_{·, :, :}
+    weights: Array,                   # (N_src,)               — del_t * trans_mask
     grid: jp.JaxGridState,
     key: Array,
     *,
@@ -158,31 +179,25 @@ def compute_mu_r_jax(
 ) -> Tuple[Array, Array, jp.ToeplitzNDJax]:
     """Pure-JAX Stein-corrected q(f) update.  Returns (mu_r, X_flat, top).
 
+    Inputs are pre-flattened across trials and transitions so this
+    function is K-agnostic: ``N_src = K * (T-1)`` for K trials of length
+    T.  Padded transitions enter with ``weights[i] = 0`` and contribute
+    nothing to the BTTB Toeplitz or RHS.
+
     ``mu_r`` shape: (D_out, M).  Implements the no-inputs case of the
     EFGP q(f) update with σ_r² tied across output dims (v0).
     """
-    T = ms.shape[0]
     M = grid.M
     cdtype = grid.ws.dtype
 
-    # Stein quantities
-    d_a = ms[1:] - ms[:-1]                                      # (T-1, D_lat)
-    # SING convention: SSs[t] = Cov(x_{t+1}, x_t) (see sing/utils/sing_helpers.py
-    # and the docstring in compute_neg_CE_single).  The Stein-correction PDF
-    # uses S_{i, i+1} = Cov(x_t, x_{t+1}) = SSs[t].T.  In practice SSs is
-    # near-symmetric for the smoothed posterior so the transpose is a small
-    # effect, but we apply it for theoretical correctness.
-    SSs_T = jnp.transpose(SSs, (0, 2, 1))                       # = Cov(x_t, x_{t+1})
-    C_a = SSs_T - Ss[:-1]                                       # (T-1, D_lat, D_lat)
-
-    # Pseudo-input cloud
-    X_flat = _build_pseudo_cloud(ms, Ss, key, S_marginal, D_lat)
-    delta_per_pseudo = jnp.repeat(del_t, S_marginal)             # ((T-1)*S,)
+    # Pseudo-input cloud (S_marginal samples per source)
+    X_flat = _build_pseudo_cloud(m_src, S_src, key, S_marginal, D_lat)
+    weights_per_pseudo = jnp.repeat(weights, S_marginal)         # (N_src*S,)
 
     # BTTB Toeplitz
-    weights = delta_per_pseudo / (S_marginal * sigma_drift_sq)
+    bttb_w = weights_per_pseudo / (S_marginal * sigma_drift_sq)
     v_kernel = jp.bttb_conv_vec_weighted(
-        X_flat, weights.astype(cdtype), grid.xcen, grid.h_per_dim,
+        X_flat, bttb_w.astype(cdtype), grid.xcen, grid.h_per_dim,
         grid.mtot_per_dim, eps=nufft_eps)
     top = jp.make_toeplitz(v_kernel, force_pow2=True)
     A_apply = jp.make_A_apply(grid.ws, top, sigmasq=1.0)
@@ -201,10 +216,14 @@ def compute_mu_r_jax(
     M_inv_diag = (1.0 / diag_A).astype(cdtype)
     M_inv_apply = lambda v: M_inv_diag * v
 
+    # Per-output-dim RHS: pseudo-cloud factor ``1/(S σ²)``.  The per-source
+    # mask is already folded into d_src / C_src by the caller's
+    # ``_flatten_stein``, so padded transitions contribute nothing.
+
     # Build h_r per output dim r in a vmap
     def per_r(r):
-        # h_1,r = D F_X* a_r,    (a_r)_a,s = d_{a,r} / (S σ²)
-        a_r = jnp.repeat(d_a[:, r], S_marginal) / (S_marginal * sigma_drift_sq)
+        # h_1,r = D F_X* a_r,    (a_r)_{i,s} = d_{i,r} / (S σ²)
+        a_r = jnp.repeat(d_src[:, r], S_marginal) / (S_marginal * sigma_drift_sq)
         Fstar_a = jp.nufft1(X_flat, a_r.astype(cdtype), grid.xcen,
                              grid.h_per_dim,
                              out_shape=grid.mtot_per_dim,
@@ -215,7 +234,7 @@ def compute_mu_r_jax(
         # The factor comes from J_φ^* (adjoint Jacobian) — conjugate of
         # ∂φ_k/∂x_j = 2πi ξ_{kj} φ_k, so (-2πi ξ).
         def per_j(j):
-            c_jr = jnp.repeat(C_a[:, j, r], S_marginal) \
+            c_jr = jnp.repeat(C_src[:, j, r], S_marginal) \
                 / (S_marginal * sigma_drift_sq)
             Fstar_c = jp.nufft1(X_flat, c_jr.astype(cdtype), grid.xcen,
                                  grid.h_per_dim,
@@ -243,70 +262,314 @@ def compute_mu_r_jax(
     return mu_r, X_flat, top
 
 
+# ---------------------------------------------------------------------------
+# Closed-form variant: Gaussian-mixture spreader (no MC over q(x))
+# ---------------------------------------------------------------------------
+def compute_mu_r_gmix_jax(
+    m_src: Array,                     # (N_src, D_lat)
+    S_src: Array,                     # (N_src, D_lat, D_lat)
+    d_src: Array,                     # (N_src, D_lat)         — Stein d_{·, :}
+    C_src: Array,                     # (N_src, D_lat, D_lat)  — Stein C_{·, :, :}
+    weights: Array,                   # (N_src,)               — del_t * trans_mask
+    grid: jp.JaxGridState,
+    *,
+    sigma_drift_sq: float,
+    D_lat: int,
+    D_out: int,
+    fine_N: int,                      # static FFT grid size per dim
+    stencil_r: int,                   # static stencil half-width
+    cg_tol: float = 1e-5,
+    max_cg_iter: int = 2000,
+) -> Tuple[Array, Array, jp.ToeplitzNDJax]:
+    """Closed-form q(f) update via per-source Gaussian-mixture spreader.
+
+    Replaces the MC NUFFTs in :func:`compute_mu_r_jax` with a custom
+    Gaussian spreader that computes the q(x_i)-expectation of e^{2πi
+    x_i^T ξ} exactly (Gaussian characteristic function) and then a single
+    FFT.  Keeps BTTB structure, CG, and the rest of the pipeline
+    unchanged.
+
+    Inputs are pre-flattened across trials and transitions:
+    ``N_src = K * (T-1)`` for K trials of length T.  Padded transitions
+    enter with ``weights[i] = 0``.
+
+    See ``efgp_estep_charfun.tex`` for the math, and ``efgp_gmix_spreader.py``
+    for the spread + FFT primitive.
+
+    Returns
+    -------
+    (mu_r, X_flat_or_None, top)
+        ``mu_r``: (D_out, M).  ``X_flat_or_None`` is always ``None`` for
+        the gmix variant (no cloud).  ``top`` is the BTTB Toeplitz built
+        from the closed-form generator.
+    """
+    from sing.efgp_gmix_spreader import _spread_2d
+    cdtype = grid.ws.dtype
+    rdtype = m_src.dtype
+    h_spec = grid.h_per_dim[0]
+    M_per_dim = int(grid.mtot_per_dim[0])
+    K_modes = (M_per_dim - 1) // 2
+
+    if D_lat != 2:
+        raise NotImplementedError(
+            "compute_mu_r_gmix_jax: only D_lat == 2 in v0.")
+
+    # ---- Closed-form spread + FFT helper ----
+    h_grid = 1.0 / (fine_N * h_spec)
+
+    def _gmix_fft(w):
+        """Spread w_i N(x; m_i, S_i) and FFT.  Returns (fine_N, fine_N) complex
+        on centered FFT grid (frequency h_spec * j for j in [-N//2, N//2))."""
+        g = _spread_2d(m_src, S_src, w.astype(cdtype),
+                       xcen=grid.xcen, h_grid=h_grid, N=fine_N, r=stencil_r)
+        G = jnp.fft.fftshift(jnp.fft.ifft2(jnp.fft.ifftshift(g)))
+        # Centering phase: e^{2πi ξ^T xcen}  (grid is centered at xcen)
+        j_axis = jnp.arange(-(fine_N // 2), fine_N - (fine_N // 2),
+                              dtype=rdtype)
+        JX, JY = jnp.meshgrid(j_axis, j_axis, indexing='ij')
+        xi_x = JX * h_spec
+        xi_y = JY * h_spec
+        phase = jnp.exp(2j * math.pi
+                         * (xi_x * grid.xcen[0] + xi_y * grid.xcen[1]))
+        # Riemann-sum factor: (N h_grid)^D = (1/h_spec)^D
+        return G * phase * (fine_N * h_grid) ** 2
+
+    def _crop_centered(F, M):
+        c = fine_N // 2
+        half = M // 2
+        return F[c - half:c + half + 1, c - half:c + half + 1]
+
+    # ---- BTTB generator from closed form ----
+    # Output is on the BTTB difference grid: (4K+1, 4K+1)
+    # Note: existing make_toeplitz expects shape (2*mtot - 1) per dim.
+    # For mtot = 2K+1, that's 4K+1.  Our crop matches.
+    w_T = (weights / sigma_drift_sq).astype(cdtype)
+    F_T = _gmix_fft(w_T)
+    M_diff_per_dim = 2 * M_per_dim - 1                          # = 4K+1
+    # MC's bttb_conv_vec_weighted uses nufft1 with iflag=-1; gmix uses
+    # iflag=+1.  Conjugate to match MC's BTTB-generator convention.
+    v_kernel = jnp.conj(_crop_centered(F_T, M_diff_per_dim))
+    top = jp.make_toeplitz(v_kernel, force_pow2=True)
+    A_apply = jp.make_A_apply(grid.ws, top, sigmasq=1.0)
+    ws_real_c = grid.ws.real.astype(cdtype)
+
+    # Jacobi preconditioner
+    center_idx = tuple((s - 1) // 2 for s in v_kernel.shape)
+    T_diag = v_kernel[center_idx].real.astype(jnp.float32)
+    ws_sq = (grid.ws * jnp.conj(grid.ws)).real.astype(jnp.float32)
+    diag_A = 1.0 + ws_sq * T_diag
+    M_inv_diag = (1.0 / diag_A).astype(cdtype)
+    M_inv_apply = lambda v: M_inv_diag * v
+
+    # ---- h_r per output dim r ----
+    # Stein quantities ``d_src`` / ``C_src`` are already pre-masked by
+    # the caller's ``_flatten_stein``, so padded transitions contribute
+    # nothing.  The RHS does NOT carry a ``del_t`` factor (only the BTTB
+    # generator does); see ``efgp_estep_charfun.tex``.
+    def per_r(r):
+        # h_1,r: closed-form FT of  sum_i (d_{i,r} / σ²) N(x; m_i, S_i)
+        w_h1 = (d_src[:, r] / sigma_drift_sq).astype(cdtype)
+        F_h1 = _gmix_fft(w_h1)
+        Fh1_spec = _crop_centered(F_h1, M_per_dim).reshape(-1)   # (M,)
+        # h_1,r = D ⊙ adjoint-FT of sources weighted by d_{i,r}/σ²
+        # In the MC formulation we used  D ⊙ F_X^* a_r .  F_X^* uses iflag=-1
+        # (negative-i convention), while our gmix_nufft_2d uses iflag=+1.
+        # Reconcile by conjugating: F_X^* w  = conj( gmix_nufft_2d( conj(w) ) ).
+        # For real-valued input weights this just conjugates the output.
+        h1 = ws_real_c * jnp.conj(Fh1_spec)
+
+        # h_2,r = sum_j (-2πi ξ_j) ⊙ D ⊙ adjoint-FT of sources weighted by C_{i,j,r}/σ²
+        def per_j(j):
+            w_h2 = (C_src[:, j, r] / sigma_drift_sq).astype(cdtype)
+            F_h2 = _gmix_fft(w_h2)
+            Fh2_spec = _crop_centered(F_h2, M_per_dim).reshape(-1)
+            xi_j = grid.xis_flat[:, j].astype(cdtype)
+            return (-2j * math.pi * xi_j) * (ws_real_c * jnp.conj(Fh2_spec))
+        h2 = jax.vmap(per_j)(jnp.arange(D_lat)).sum(axis=0)
+        h_r = h1 + h2
+
+        rhs_norm = jnp.linalg.norm(h_r).real
+        mu = jax.lax.cond(
+            rhs_norm < 1e-30,
+            lambda _: jnp.zeros_like(h_r),
+            lambda _: jp.cg_solve(A_apply, h_r, tol=cg_tol,
+                                   max_iter=max_cg_iter,
+                                   M_inv_apply=M_inv_apply),
+            operand=None,
+        )
+        return mu
+
+    mu_r = jax.vmap(per_r)(jnp.arange(D_out))
+    return mu_r, None, top
+
+
+def _flatten_stein(
+    ms: Array,        # (K, T, D)
+    Ss: Array,        # (K, T, D, D)
+    SSs: Array,       # (K, T-1, D, D)   cross-cov
+    del_t: Array,     # (K, T-1) or (T-1,) (broadcast)
+    trial_mask: Array,  # (K, T) bool
+):
+    """Flatten multi-trial Stein quantities into supersource arrays.
+
+    Padded transitions (where trans_mask=0) are zeroed in the BTTB
+    weight ``del_t * trans_mask`` and the Stein quantities ``d_src``,
+    ``C_src``.  Source positions ``m_src`` / ``S_src`` may still hold
+    arbitrary values at padded slots, but they contribute nothing
+    because every weighted reduction (BTTB convolution / RHS NUFFT /
+    gmix spread) carries the padded zeros through.
+
+    Returns
+    -------
+    m_src  : (K*(T-1), D)        — source means
+    S_src  : (K*(T-1), D, D)     — source covariances
+    d_src  : (K*(T-1), D)        — Stein d, masked
+    C_src  : (K*(T-1), D, D)     — Stein C, masked
+    weights: (K*(T-1),)          — del_t * trans_mask  (BTTB weights)
+    """
+    K_, T_ = ms.shape[0], ms.shape[1]
+    D_ = ms.shape[2]
+    trans_mask = trial_mask[:, :-1] & trial_mask[:, 1:]            # (K, T-1)
+    tm_f = trans_mask.astype(ms.dtype)                             # (K, T-1)
+
+    # Replace padded covariance slots with the identity to avoid
+    # divide-by-zero in downstream Gaussian-mixture spreaders (where
+    # det(S) appears in the denominator); the matching weights are zero
+    # so these slots contribute nothing.
+    eye_d = jnp.eye(D_, dtype=Ss.dtype)
+    Ss_safe = jnp.where(tm_f[..., None, None].astype(bool),
+                         Ss[:, :-1], eye_d)                         # (K, T-1, D, D)
+
+    m_src = ms[:, :-1].reshape(-1, D_)
+    S_src = Ss_safe.reshape(-1, D_, D_)
+
+    d_a = (ms[:, 1:] - ms[:, :-1])                                 # (K, T-1, D)
+    # SING convention: SSs[t] = Cov(x_{t+1}, x_t).  Stein-correction
+    # PDF uses Cov(x_t, x_{t+1}) = SSs[t].T.
+    SSs_T = jnp.swapaxes(SSs, -1, -2)                              # (K, T-1, D, D)
+    C_a = SSs_T - Ss[:, :-1]
+
+    # Mask padded transitions
+    d_a = d_a * tm_f[..., None]
+    C_a = C_a * tm_f[..., None, None]
+    d_src = d_a.reshape(-1, D_)
+    C_src = C_a.reshape(-1, D_, D_)
+
+    if del_t.ndim == 1:
+        del_t_b = jnp.broadcast_to(del_t, (K_, T_ - 1))
+    else:
+        del_t_b = del_t                                            # (K, T-1)
+    weights = (del_t_b * tm_f).reshape(-1)
+    return m_src, S_src, d_src, C_src, weights
+
+
+def qf_and_moments_gmix_jax(
+    ms: Array,           # (K, T, D)
+    Ss: Array,           # (K, T, D, D)
+    SSs: Array,          # (K, T-1, D, D)
+    del_t: Array,        # (K, T-1) or (T-1,) (broadcast)
+    trial_mask: Array,   # (K, T) bool
+    grid: jp.JaxGridState, *,
+    sigma_drift_sq: float, D_lat: int, D_out: int,
+    fine_N: int, stencil_r: int,
+    cg_tol: float = 1e-5, max_cg_iter: int = 2000,
+    nufft_eps: float = 6e-8,
+) -> Tuple[Array, Array, Array, Array]:
+    """Closed-form multi-trial variant of qf_and_moments_jax.
+
+    K trials of length T (padded; ``trial_mask`` zeros padded slots).
+    Returns ``(mu_r, Ef, Eff, Edfdx)`` with ``Ef: (K, T, D_out)``,
+    ``Eff: (K, T)``, ``Edfdx: (K, T, D_out, D_lat)``.
+    """
+    m_src, S_src, d_src, C_src, weights = _flatten_stein(
+        ms, Ss, SSs, del_t, trial_mask)
+    mu_r, _, _ = compute_mu_r_gmix_jax(
+        m_src, S_src, d_src, C_src, weights, grid,
+        sigma_drift_sq=sigma_drift_sq, D_lat=D_lat, D_out=D_out,
+        fine_N=fine_N, stencil_r=stencil_r,
+        cg_tol=cg_tol, max_cg_iter=max_cg_iter,
+    )
+    Ef, Eff, Edfdx = drift_moments_jax(
+        mu_r, grid, ms, D_lat=D_lat, D_out=D_out, nufft_eps=nufft_eps)
+    return mu_r, Ef, Eff, Edfdx
+
+
 def drift_moments_jax(
     mu_r: Array,                  # (D_out, M)
     grid: jp.JaxGridState,
-    ms: Array,                    # (T, D_lat)
+    ms: Array,                    # (K, T, D_lat)  — multi-trial
     *,
     D_lat: int, D_out: int,
     nufft_eps: float = 6e-8,
 ) -> Tuple[Array, Array, Array]:
     """Posterior mean drift, second moment (delta-method), and Jacobian.
 
-    Returns (Ef, Eff, Edfdx) with shapes (T, D_out), (T,), (T, D_out, D_lat).
+    Multi-trial: vmaps the per-trial NUFFT2 evaluation over the leading
+    K axis of ``ms``.
+
+    Returns (Ef, Eff, Edfdx) with shapes
+    ``(K, T, D_out)``, ``(K, T)``, ``(K, T, D_out, D_lat)``.
     """
-    T = ms.shape[0]
     cdtype = grid.ws.dtype
     rdtype = grid.xcen.dtype
     ws_real_c = grid.ws.real.astype(cdtype)
     ms_c = ms.astype(rdtype)
 
-    # ------- mean: Φ(m_t) μ_r per r -------
+    # Mean coefficients (same across trials)
     fk_mean = ws_real_c[None, :] * mu_r                          # (D_out, M)
 
-    def eval_mean_r(fk):
-        out = jp.nufft2(ms_c, fk.reshape(*grid.mtot_per_dim),
-                        grid.xcen, grid.h_per_dim, eps=nufft_eps)
-        return out.real                                            # (T,)
-
-    Ef_per_r = jax.vmap(eval_mean_r)(fk_mean)                     # (D_out, T)
-    Ef = Ef_per_r.T                                               # (T, D_out)
-
-    # ------- Jacobian: Φ(m_t) [(2πi ξ_j) ⊙ μ_r] per (r, j) -------
-    def eval_jac_j(j):
+    # Jacobian coefficients per latent-input dim j
+    def jac_fk_j(j):
         xi_j = grid.xis_flat[:, j].astype(cdtype)
-        fk_j = ((2j * math.pi * xi_j)[None, :]
+        return ((2j * math.pi * xi_j)[None, :]
                 * (ws_real_c[None, :] * mu_r))                    # (D_out, M)
+    fk_jac = jax.vmap(jac_fk_j)(jnp.arange(D_lat))                # (D_lat, D_out, M)
 
-        def eval_per_r(fk):
-            out = jp.nufft2(ms_c, fk.reshape(*grid.mtot_per_dim),
+    # Per-trial helper: do NUFFT2 of each fk-coefficient vector at the
+    # trial's latent path m_t.
+    def per_trial(ms_k):                                          # ms_k: (T, D)
+        def eval_mean_r(fk):
+            out = jp.nufft2(ms_k, fk.reshape(*grid.mtot_per_dim),
                             grid.xcen, grid.h_per_dim, eps=nufft_eps)
-            return out.real
-        return jax.vmap(eval_per_r)(fk_j)                          # (D_out, T)
+            return out.real                                        # (T,)
 
-    Edfdx_dot = jax.vmap(eval_jac_j)(jnp.arange(D_lat))            # (D_lat, D_out, T)
-    Edfdx = jnp.transpose(Edfdx_dot, (2, 1, 0))                     # (T, D_out, D_lat)
+        Ef_per_r = jax.vmap(eval_mean_r)(fk_mean)                 # (D_out, T)
+        Ef_k = Ef_per_r.T                                         # (T, D_out)
 
-    # ------- Eff (delta-method): Σ_r f_r(m)² -------
-    Eff = (Ef * Ef).sum(axis=1)                                    # (T,)
+        def eval_jac_j(fk_j_per_r):
+            return jax.vmap(eval_mean_r)(fk_j_per_r)              # (D_out, T)
 
+        Edfdx_dot = jax.vmap(eval_jac_j)(fk_jac)                  # (D_lat, D_out, T)
+        Edfdx_k = jnp.transpose(Edfdx_dot, (2, 1, 0))              # (T, D_out, D_lat)
+        Eff_k = (Ef_k * Ef_k).sum(axis=1)                         # (T,)
+        return Ef_k, Eff_k, Edfdx_k
+
+    Ef, Eff, Edfdx = jax.vmap(per_trial)(ms_c)                    # (K, ...)
     return Ef, Eff, Edfdx
 
 
 def qf_and_moments_jax(
-    ms: Array, Ss: Array, SSs: Array, del_t: Array,
+    ms: Array,           # (K, T, D)
+    Ss: Array,           # (K, T, D, D)
+    SSs: Array,          # (K, T-1, D, D)
+    del_t: Array,        # (K, T-1) or (T-1,)
+    trial_mask: Array,   # (K, T) bool
     grid: jp.JaxGridState, key: Array, *,
     sigma_drift_sq: float, S_marginal: int,
     D_lat: int, D_out: int,
     cg_tol: float = 1e-5, max_cg_iter: int = 2000,
     nufft_eps: float = 6e-8,
 ) -> Tuple[Array, Array, Array, Array]:
-    """One full q(f) update + drift moment evaluation, all JAX, all jit-able.
+    """Multi-trial q(f) update + drift moment evaluation, all JAX, all jit-able.
 
-    Returns (mu_r, Ef, Eff, Edfdx).
+    K trials of length T (padded; ``trial_mask`` zeros padded slots).
+    Returns ``(mu_r, Ef, Eff, Edfdx)`` with ``Ef: (K, T, D_out)``,
+    ``Eff: (K, T)``, ``Edfdx: (K, T, D_out, D_lat)``.
     """
+    m_src, S_src, d_src, C_src, weights = _flatten_stein(
+        ms, Ss, SSs, del_t, trial_mask)
     mu_r, _, _ = compute_mu_r_jax(
-        ms, Ss, SSs, del_t, grid, key,
+        m_src, S_src, d_src, C_src, weights, grid, key,
         sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
         D_lat=D_lat, D_out=D_out,
         cg_tol=cg_tol, max_cg_iter=max_cg_iter, nufft_eps=nufft_eps,

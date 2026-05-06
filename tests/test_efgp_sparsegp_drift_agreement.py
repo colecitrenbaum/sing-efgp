@@ -170,8 +170,11 @@ def test_efgp_sparsegp_drift_posterior_agrees_at_fixed_qx():
     grid_jax = jp.spectral_grid_se(ls, var_kernel, X_template, eps=1e-3)
     print(f"[interface-J] EFGP grid: M={grid_jax.M}, "
           f"mtot_per_dim={grid_jax.mtot_per_dim}")
+    trial_mask_K1 = jnp.ones((1, T), dtype=bool)
+    m_src, S_src, d_src, C_src, w_src = jpd._flatten_stein(
+        ms[None], Ss[None], SSs[None], del_t, trial_mask_K1)
     mu_r, _, _ = jpd.compute_mu_r_jax(
-        ms, Ss, SSs, del_t, grid_jax, jr.PRNGKey(99),
+        m_src, S_src, d_src, C_src, w_src, grid_jax, jr.PRNGKey(99),
         sigma_drift_sq=sigma ** 2, S_marginal=8,
         D_lat=D, D_out=D,
         cg_tol=1e-7, max_cg_iter=4 * grid_jax.M,
@@ -195,10 +198,10 @@ def test_efgp_sparsegp_drift_posterior_agrees_at_fixed_qx():
         sparse_drift, sp_drift_params, gp_post_sp, X_eval_j))     # (N, D, D)
 
     # EFGP mean and Jacobian (drift_moments_jax evaluates Φ(X) μ_r)
-    f_efgp_j, _, J_efgp_j = jpd.drift_moments_jax(
-        mu_r, grid_jax, X_eval_j, D_lat=D, D_out=D)
-    f_efgp = np.asarray(f_efgp_j)                                 # (N, D)
-    J_efgp = np.asarray(J_efgp_j)                                 # (N, D, D)
+    f_efgp_K, _, J_efgp_K = jpd.drift_moments_jax(
+        mu_r, grid_jax, X_eval_j[None], D_lat=D, D_out=D)
+    f_efgp = np.asarray(f_efgp_K[0])                              # (N, D)
+    J_efgp = np.asarray(J_efgp_K[0])                              # (N, D, D)
 
     # ---- 5. Compare ----
     rmse_f = float(np.sqrt(np.mean((f_sp - f_efgp) ** 2)))

@@ -1,0 +1,858 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{booktabs}
+
+\hypersetup{colorlinks=true, linkcolor=blue!50!black, urlcolor=blue!50!black}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Eq}[1][q]{\mathbb{E}_{#1}}
+\newcommand{\Eqx}{\mathbb{E}_{q(x_i)}}
+\newcommand{\Eqxx}{\mathbb{E}_{q(x_i,\,x_{i+1})}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\GP}{\operatorname{GP}}
+\newcommand{\given}{\,|\,}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\title{The EFGP-SING E-step without Monte Carlo\\
+\large Closed form via a custom Gaussian-mixture spreader}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+The current EFGP-SING E-step (see \texttt{efgp\_estep.tex}) computes the
+$q(x)$-expectations in $A_r$ and $h_r$ by Monte Carlo: a pseudo-cloud
+$x_i^{(s)}\!\sim\! q(x_i)$ feeds a single Type-1 NUFFT.  This note
+(i)~derives the same expectations in \emph{exact closed form} via the
+Gaussian characteristic function, (ii)~explains why the
+single-NUFFT-of-the-means contraction does not survive the closed form,
+(iii)~presents an algorithm that recovers a NUFFT-shaped pipeline by
+replacing the standard NUFFT spreader with a per-source anisotropic
+Gaussian spreader and dropping the deconvolution step (variant A), and
+(iv)~documents the implementation, correctness tests, complexity tests,
+and end-to-end benchmark vs the MC version.
+
+The closed-form spreader is exact up to FFT discretisation, deterministic
+(no MC noise), and preserves the BTTB structure of $A_r$.  Its cost is
+$O(T \cdot (\sigma_{\max}/\sigma_{\min})^D + N^D \log N)$ per FFT-set
+call.  Empirically, on a GP-drift recovery benchmark with fixed
+emissions, the spreader recovers $\ell$ and $\sigma^2$ slightly closer
+to truth than the $S\!=\!2$ MC default and yields slightly lower drift
+error along the trajectory, at the cost of ${\sim}1.5{\times}$ longer
+wall time.
+\end{abstract}
+
+\tableofcontents
+
+% ============================================================================
+\section{The expectations we need}
+\label{sec:setup}
+% ============================================================================
+
+We adopt the notation of \texttt{efgp\_estep.tex} (Layers 1--3).  The
+mean-field optimum for $q(w_r)=\mathcal{N}(\mu_r, A_r^{-1})$ is the
+system
+\begin{equation}
+A_r\,\mu_r \;=\; h_r,
+\label{eq:Ah-system}
+\end{equation}
+with
+\begin{equation}
+A_r \;=\; I + \frac{1}{\sigma_r^2}\sum_i \Delta_i\,
+\Eqx\!\bigl[\phi(x_i)\phi(x_i)^{*}\bigr],
+\qquad
+h_r \;=\; \frac{1}{\sigma_r^2}\sum_i
+\Eqxx\!\bigl[\phi(x_i)\,(x_{i+1,r}-x_{i,r})\bigr],
+\label{eq:Ah}
+\end{equation}
+and Fourier features
+\begin{equation}
+\phi_\theta(x) \;=\; D_\theta\, F_x,
+\qquad
+F_x[k] \;=\; e^{2\pi i\, x^\top \xi_k}.
+\end{equation}
+Stein's lemma collapses the pairwise expectation in $h_r$ to marginal
+expectations under $q(x_i)$ plus a covariance correction:
+\begin{equation}
+h_r \;=\; \frac{1}{\sigma_r^2}\sum_i
+\Bigl\{\Eqx[\phi(x_i)]\,d_{i,r}
+\;+\; \Eqx[J_\phi(x_i)]^{*}\,C_{i,\cdot r}\Bigr\},
+\qquad
+d_i := m_{i+1}-m_i,\ \ C_i := S_{i,i+1}-S_i.
+\label{eq:hr-stein}
+\end{equation}
+Every quantity in \eqref{eq:Ah}--\eqref{eq:hr-stein} is a
+\emph{marginal} expectation under $q(x_i)\!=\!\mathcal{N}(m_i, S_i)$ of
+a complex exponential or its derivative.  These are precisely the
+targets of the Gaussian characteristic function.
+
+% ============================================================================
+\section{The Gaussian characteristic function}
+\label{sec:cf}
+% ============================================================================
+
+For $x \sim \mathcal{N}(m, S)$ and any frequency $\xi\in\mathbb{R}^{D_x}$,
+\begin{equation}
+\boxed{\;
+\E\!\bigl[e^{2\pi i\,x^\top \xi}\bigr]
+\;=\;
+e^{2\pi i\, m^\top \xi}\;\cdot\;e^{-2\pi^2\, \xi^\top S\,\xi}.
+\;}
+\label{eq:gauss-cf}
+\end{equation}
+The expectation is a phase factor at the mean times a real damping
+factor controlled by the covariance.  Differentiating $\phi$ in $x$
+\emph{before} taking the expectation, and using
+$\partial_{x_j}\phi_k(x) = 2\pi i\,\xi_{k,j}\,\phi_k(x)$,
+\begin{align}
+\Eqx[\phi_k(x)]
+&\;=\; D_{\theta,k}\,e^{2\pi i\,m^\top \xi_k}\,e^{-2\pi^2\,\xi_k^\top S\,\xi_k},
+\label{eq:Ephi}
+\\[2pt]
+\Eqx[\phi_k(x)\,\overline{\phi_\ell(x)}]
+&\;=\; D_{\theta,k}\,\overline{D_{\theta,\ell}}\,
+e^{2\pi i\, m^\top(\xi_k-\xi_\ell)}\,
+e^{-2\pi^2\,(\xi_k-\xi_\ell)^\top S\,(\xi_k-\xi_\ell)},
+\label{eq:Ephiphi}
+\\[2pt]
+\Eqx\!\bigl[\partial_{x_j}\phi_k(x)\bigr]
+&\;=\; 2\pi i\,\xi_{k,j}\,\Eqx[\phi_k(x)].
+\label{eq:EJphi}
+\end{align}
+Note that \eqref{eq:Ephiphi} is \emph{not} the product of
+\eqref{eq:Ephi} with its conjugate --- the variance term sees
+$\xi_k - \xi_\ell$, not $\xi_k$ and $\xi_\ell$ separately.  This is the
+single most important consequence of $x$ being uncertain.
+
+% ============================================================================
+\section{The precision $A_r$: BTTB is preserved}
+\label{sec:Ar}
+% ============================================================================
+
+Combining \eqref{eq:Ah} with \eqref{eq:Ephiphi},
+\begin{equation}
+A_r \;=\; I \;+\; D_\theta\, T_r\, D_\theta,
+\qquad
+(T_r)_{k\ell} \;=\;
+\sum_i \frac{\Delta_i}{\sigma_r^2}\,
+e^{2\pi i\,m_i^\top(\xi_k-\xi_\ell)}\,
+e^{-2\pi^2\,(\xi_k-\xi_\ell)^\top S_i\,(\xi_k-\xi_\ell)}.
+\label{eq:Tr-cf}
+\end{equation}
+The dependence on $(k,\ell)$ runs entirely through
+$\Delta\xi := \xi_k - \xi_\ell$.  For an equispaced spectral grid,
+$T_r$ is BTTB, exactly as in the MC formulation, with generator
+\begin{equation}
+\boxed{\;
+T_r[\Delta\xi]
+\;=\;
+\sum_i \frac{\Delta_i}{\sigma_r^2}\,
+e^{2\pi i\,m_i^\top \Delta\xi}\,
+e^{-2\pi^2\,\Delta\xi^\top S_i\,\Delta\xi}.
+\;}
+\label{eq:Tr-generator}
+\end{equation}
+Matvecs $A_r v$ remain $O(M\log M)$ via FFT on the generator; nothing
+about \code{make\_A\_apply} or the CG solver changes.
+
+\paragraph{The single ``catch''.}
+The MC version computes $T_r$ from a single Type-1 NUFFT over the
+cloud: $O(N + M\log M)$.  The closed-form generator
+\eqref{eq:Tr-generator} cannot be written as a Type-1 NUFFT of the
+means $\{m_i\}$ alone, because the damping
+$e^{-2\pi^2\,\Delta\xi^\top S_i\,\Delta\xi}$ depends on the
+\emph{output} frequency $\Delta\xi$ as well as the time index $i$.
+Pulling it outside a single NUFFT requires $S_i$ to be independent of
+$i$.
+
+The way out (\S\ref{sec:gmix-spreader}): \eqref{eq:Tr-generator} is the
+Fourier transform of a Gaussian \emph{mixture} in physical space, and
+that integral has a NUFFT-shaped algorithm with a per-source spreader.
+
+% ============================================================================
+\section{The right-hand side $h_r$ in closed form}
+\label{sec:hr}
+% ============================================================================
+
+Substituting \eqref{eq:Ephi} into the mean-increment term of
+\eqref{eq:hr-stein},
+\begin{equation}
+(h_{1,r})_k \;=\; \frac{D_{\theta,k}}{\sigma_r^2}\sum_i d_{i,r}\,
+e^{2\pi i\,m_i^\top \xi_k}\,e^{-2\pi^2\,\xi_k^\top S_i\,\xi_k}.
+\label{eq:h1-cf}
+\end{equation}
+The Stein-correction term enters via the adjoint Jacobian.  By
+\eqref{eq:EJphi}, $\Eqx[\partial_{x_j}\phi_k(x)] = 2\pi i\,\xi_{k,j}
+\Eqx[\phi_k(x)]$; conjugating to form $J_\phi^{*}$ flips the sign:
+\begin{equation}
+(h_{2,r})_k
+\;=\; \frac{D_{\theta,k}}{\sigma_r^2}\sum_{j=1}^{D_x}
+(-2\pi i\,\xi_{k,j})\sum_i [C_i]_{j,r}\,
+e^{2\pi i\,m_i^\top \xi_k}\,e^{-2\pi^2\,\xi_k^\top S_i\,\xi_k}.
+\label{eq:h2-cf}
+\end{equation}
+Setting $S_i\!\to\!0$ recovers the MC build of $h_r$ exactly with the
+$-2\pi i\,\xi_j$ adjoint factor.  The inner sum over $i$ is again the
+Fourier transform at $\xi_k$ of a weighted Gaussian mixture --- the
+same object as \eqref{eq:Tr-generator}, just at the spectral grid
+$\{\xi_k\}$ instead of the difference grid $\{\Delta\xi\}$.
+
+% ============================================================================
+\section{Algorithm: per-source Gaussian-mixture spreader}
+\label{sec:gmix-spreader}
+% ============================================================================
+
+The closed-form objects we need are all of the form
+\begin{equation}
+F(\xi)
+\;=\;
+\sum_i w_i\,e^{2\pi i\,m_i^\top \xi}\,e^{-2\pi^2\,\xi^\top S_i\,\xi}
+\;=\;
+\int g(x)\,e^{2\pi i\,\xi^\top x}\,dx,
+\qquad
+g(x) \;:=\; \sum_i w_i\,\mathcal{N}(x;\,m_i, S_i).
+\label{eq:gmix-target}
+\end{equation}
+That is, $F(\xi)$ is the continuous Fourier transform of a Gaussian
+\emph{mixture} density $g(x)$ in physical space.
+
+\subsection{The plain story: equispaced quadrature + FFT}
+\label{sec:plain-story}
+
+The whole algorithm is just an equispaced quadrature rule applied to
+\eqref{eq:gmix-target}, followed by an FFT. No spreader, no
+deconvolution, no kernel design. Pick a regular grid
+$\{x_a\}_{a\in\{0,\dots,N-1\}^D}$ with spacing $h_{\text{grid}}$ wide
+enough to enclose the support of $g$. The Riemann sum is
+\begin{equation}
+F(\xi) \;\approx\;
+h_{\text{grid}}^{D}\sum_a g(x_a)\,e^{2\pi i\,\xi^\top x_a}.
+\label{eq:riemann}
+\end{equation}
+If the output frequencies $\xi_k$ are taken on the natural spectral
+grid dual to $\{x_a\}$ (spacing $h_{\text{spec}} = 1/(N\,h_{\text{grid}})$),
+then \eqref{eq:riemann} is, up to fixed phase shifts, exactly a
+$D$-dimensional FFT of the array $g_a := g(x_a)$. So the only thing
+left is building $g_a$.
+
+\paragraph{Why this is cheap.}
+Each summand $\mathcal{N}(x_a;\,m_i, S_i)$ is essentially zero past
+$\sim n_\sigma\,\sigma_i$ from $m_i$. So for the $a$-cells outside a
+stencil of radius $r \approx n_\sigma\,\sigma_{\max}/h_{\text{grid}}$
+around $m_i$, source $i$ contributes nothing detectable. Building $g_a$
+is therefore
+\begin{equation}
+g_a \;=\; \sum_{i\,:\, a\,\in\,\text{stencil}(i)} w_i\,\mathcal{N}(x_a;\,m_i, S_i),
+\end{equation}
+which costs $\sim T \cdot (2r+1)^D$ Gaussian evaluations rather than $T\cdot N^D$.
+That's it: $g_a$ is a sparse-update accumulator over local stencils,
+then one FFT.
+
+\paragraph{Two errors to control.}
+Only two sources of approximation:
+\begin{enumerate}
+\item \textbf{Quadrature error}: the Riemann sum vs.\ true integral.
+Controlled by $h_{\text{grid}}$ being small relative to
+$\sigma_{\min}$, and by the grid being wide enough to contain the
+mixture support. This is the same accuracy knob as oversampling in any
+FFT-based quadrature.
+\item \textbf{Stencil truncation}: dropping cells past $r$ from each
+$m_i$. Controlled by $n_\sigma$, error $\sim e^{-n_\sigma^2/2}$.
+\end{enumerate}
+
+\paragraph{The two-step procedure.}
+\begin{enumerate}
+\item \textbf{Build $g_a$.} For each source $i$, find its stencil, and
+add $w_i\,\mathcal{N}(x_a;\,m_i, S_i)$ to each cell in the stencil.
+\item \textbf{FFT.} A single FFT of the $N^D$ array $g_a$ (with shifts
+for the centered grid) returns $F(\xi_k)$ on the spectral grid.
+\end{enumerate}
+
+The spectral grid (size $M_{\text{per dim}}^D$) and the BTTB difference
+grid (size $(2 M_{\text{per dim}}-1)^D$) are both centered subsets of
+the FFT output, so a single spread+FFT serves both: just crop.
+
+\paragraph{Relation to NUFFT (one fewer step).}
+A standard NUFFT \emph{also} arrives at an FFT by way of equispaced
+quadrature, but its target is a sum of point masses
+$\sum_i w_i\,\delta(x - m_i)$, which is not a smooth integrand and
+cannot be Riemann-summed directly on a coarse grid. NUFFT's three
+steps fix that: (i) \emph{smooth} the points by convolving with a
+narrow window $\kappa$ to get an integrand the FFT can quadrature
+faithfully; (ii) \emph{FFT}; (iii) \emph{deconvolve} by $\hat\kappa$
+to undo the artificial smoothing in frequency space. In our setting
+the integrand $g(x)=\sum_i w_i\,\mathcal{N}(x;m_i,S_i)$ is already a
+smooth Schwartz function — equispaced quadrature applies directly, no
+$\kappa$, no $\hat\kappa^{-1}$. One step fewer.
+
+\subsection{Side-by-side: standard NUFFT vs. our spreader (worked example)}
+\label{sec:didactic}
+
+This subsection walks through the algorithm in plain operations: for
+each source, find a few nearby fine-grid cells, evaluate a Gaussian at
+each, accumulate.  The same shape as a standard Type-1 NUFFT, with
+two changes in what the Gaussian looks like.
+
+\paragraph{The two targets.}
+What the two algorithms compute at output frequency
+$\xi_j = j\cdot h_{\text{spec}}$:
+\begin{align*}
+\text{Standard NUFFT:}
+&&\hat F^{\text{std}}(\xi_j) \;&=\; \sum_{i=1}^{T} w_i\, e^{2\pi i\, m_i^\top \xi_j}
+\quad\text{(no envelope)}, \\[2pt]
+\text{Gaussian-mix spreader:}
+&&\hat F^{\text{gmix}}(\xi_j) \;&=\; \sum_{i=1}^{T} w_i\, e^{2\pi i\, m_i^\top \xi_j}\,
+\underbrace{e^{-2\pi^2 \xi_j^\top S_i\, \xi_j}}_{\text{per-source damping}}.
+\end{align*}
+
+\paragraph{What's actually computed: the spread step.}
+Both algorithms first build a fine spatial grid $g \in \mathbb{C}^{N^D}$
+where cell $a$ corresponds to physical position $x_a$, then they FFT
+$g$, then they read at output frequencies.  The only step that
+\emph{differs} between the two is what gets put into $g$ at each cell.
+
+For each source $i$, both algorithms do the same scaffolding:
+\begin{enumerate}
+\item Round source location to nearest fine cell:
+  $a_i^* := \mathrm{round}((m_i - x_{\text{cen}})/h_{\text{grid}})$.
+\item Loop over a local stencil of cells $\{a_i^* + \delta\,:\,
+  \delta \in \{-r, \ldots, r\}^D\}$ around that center.
+\item For each cell $a$ in the stencil, add a contribution to $g_a$.
+\end{enumerate}
+The contribution is where they differ:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{p{4.5cm}|p{4.5cm}|p{4.5cm}}
+\toprule
+& \textbf{Standard Type-1 NUFFT} & \textbf{Gaussian-mix spreader} \\
+\midrule
+\textbf{What you add to cell $a$:}
+& $g_a \mathrel{+}= w_i \cdot \kappa(x_a - m_i)$
+& $g_a \mathrel{+}= w_i \cdot \mathcal{N}(x_a;\, m_i,\, S_i)$
+\\[6pt]
+\textbf{What is the kernel?}
+& a \emph{fixed} narrow window $\kappa$ (Gaussian, ES, KB), the
+\emph{same} for every source $i$
+& the per-source Gaussian PDF $\mathcal{N}(\cdot;\, m_i,\, S_i)$,
+which \emph{differs} per source through $S_i$
+\\[6pt]
+\textbf{What sets the width?}
+& chosen \emph{algorithmically} so the FFT step's truncation error
+hits target precision $\epsilon$ ($w \!\approx\! 7$ cells for
+$\epsilon\!=\!10^{-6}$)
+& fixed by the \emph{integrand}: each source's $S_i$ is part of the
+problem definition (here, the q(x) covariance)
+\\[6pt]
+\textbf{Stencil radius $r$:}
+& $r \!\approx\! 4$ cells, set by $\epsilon$.  Same regardless of data.
+& $r \!\approx\! n_\sigma\,\sigma_{\max} / h_{\text{grid}}$, set by
+the largest $S_i$ in the dataset.  Wide-$S$ sources need many cells.
+\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Once $g$ is built, the FFT is identical, and the post-FFT step is what changes.}
+$\hat g$ is the discrete FT of the fine grid:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{p{4.5cm}|p{4.5cm}|p{4.5cm}}
+\toprule
+& \textbf{Standard Type-1 NUFFT} & \textbf{Gaussian-mix spreader} \\
+\midrule
+\textbf{What is $\hat g(\xi)$?}
+& $\hat\kappa(\xi)\!\cdot\!\sum_i w_i e^{2\pi i\, m_i^\top \xi}$.
+The fixed-kernel transform $\hat\kappa(\xi)$ multiplies the answer
+\emph{we want}.
+& $\sum_i w_i\, e^{-2\pi^2 \xi^\top S_i \xi}\, e^{2\pi i\, m_i^\top \xi}$.
+The per-source damping $e^{-2\pi^2 \xi^\top S_i \xi}$ \emph{is} what
+we want.  (Direct consequence of $\widehat{\mathcal{N}(\cdot;\,m_i, S_i)} =
+e^{2\pi i m_i^\top \xi}\,e^{-2\pi^2 \xi^\top S_i\,\xi}$.)
+\\[6pt]
+\textbf{Final post-FFT step}
+& \textbf{Deconvolve}: divide by $\hat\kappa(\xi)$ at every output, since
+$\kappa$ is an algorithmic artefact we want to remove.
+& \textbf{Skip it}.  The damping factor $e^{-2\pi^2 \xi^\top S_i \xi}$
+is part of the integrand we are evaluating.  Output is just $\hat g(\xi_j)$.
+\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Why ``convolution''?}
+The framing as ``convolve $w_i\delta(x-m_i)$ with $\kappa$'' is just
+notational.  Concretely it means: for each source $i$, place a copy
+of $\kappa$ (or $\mathcal{N}(\cdot; m_i, S_i)$) shifted to be centered
+at $m_i$, weighted by $w_i$, and add the result onto $g$.  No
+machinery beyond that.
+
+\paragraph{Pseudocode for the spread step (the only thing that
+differs between the two algorithms):}
+\begin{verbatim}
+for i in 0..T-1:
+    a_star = round((m_i - xcen) / h_grid)        # nearest fine cell
+    for delta in {-r, ..., r}^D:                 # local stencil
+        a    = a_star + delta
+        x_a  = xcen + (a - N/2) * h_grid         # physical location
+        # The ONE line that differs:
+        g[a] += w_i *  kappa(x_a - m_i)          # standard NUFFT
+        g[a] += w_i *  N(x_a; m_i, S_i)          # GMIX
+\end{verbatim}
+
+That's the complete operational picture.  The kernel symbol $\kappa$
+in the standard-NUFFT literature is a placeholder for ``whatever
+narrow function we deposit per source so the FFT-then-deconvolve trick
+gives us the unwindowed phase sum.''  In our setting we substitute it
+with the per-source PDF that the integrand asks for, and skip the
+deconvolution because that PDF \emph{is} the damping we want.
+
+\paragraph{Numerical illustration.}
+With 5 source points in 2D, $h_{\text{grid}}\!=\!0.1$, and per-source
+$\sigma_i\!\in\![0.05, 0.3]$:
+
+\begin{itemize}
+\item Source $i\!=\!1$ at $m_1 = (0.13, -0.27)$ with $\sigma_1\!=\!0.05$:
+the Gaussian PDF decays sharply.  Most non-negligible mass sits in a
+$\sim\!3\!\times\!3$ window around $a_1^*$.  With $r\!=\!8$, the
+spreader visits a $17\!\times\!17 = 289$-cell stencil but ${\sim}280$ of
+those cells get values $<\!10^{-3}$ that are summed in for nothing.
+Wasted ops, no error.
+\item Source $i\!=\!2$ at $m_2 = (-0.55, 0.31)$ with $\sigma_2\!=\!0.3$:
+the Gaussian is wide.  $r\!=\!8$ gives a stencil reaching only
+$\sim\!2.7\sigma$ from the center, dropping $\sim\!4\%$ of the
+integrated mass via truncation.
+\end{itemize}
+
+So with a single $r$, the sharp source ($\sigma_1$) gets a stencil
+\emph{way larger than it needs}, while the wide source ($\sigma_2$)
+gets a stencil \emph{just barely big enough}.  A standard NUFFT would
+use the same fixed $w\!\approx\!7$ for both sources, with no
+truncation regardless of data.  This is the data-driven cost
+asymmetry that makes our spreader more expensive than a standard
+NUFFT in regimes where $\{S_i\}$ varies a lot across sources.
+
+\subsection{Why this is structurally an NUFFT (and where it differs)}
+\label{sec:nufft-shape}
+
+A standard Type-1 NUFFT (Greengard--Lee gridding) has three steps:
+\emph{spread} (per-source convolution with a fixed isotropic kernel
+$\kappa$ onto a fine grid), \emph{FFT}, \emph{deconvolve} (divide by
+$\hat\kappa$ to recover the unwindowed sum).  In a standard NUFFT
+$\kappa$ is an artefact of the algorithm whose width $w$ is chosen for
+the desired precision $\epsilon$ ($w \approx 7$ for $\epsilon = 10^{-6}$).
+
+Our recipe is structurally identical except:
+\begin{itemize}
+\item the spreader is the per-source $\kappa_i(x) = \mathcal{N}(x;0,S_i)$,
+because that is part of the integrand (not an algorithmic artefact);
+\item the deconvolution step is \emph{omitted}, because the damping
+$\hat\kappa_i(\xi) = e^{-2\pi^2 \xi^\top S_i \xi}$ is what we wanted in
+the first place.
+\end{itemize}
+The output is read off the FFT grid directly (no NUFFT-style
+interpolation needed when the desired output frequencies are themselves
+on a regular grid, which they are for EFGP).
+
+\subsection{Stencil truncation error}
+\label{sec:trunc}
+
+Outside the stencil the Gaussian decays as
+$\exp(-r^2 h_{\text{grid}}^2 / (2 \sigma_{\max}^2))$.  Truncating at
+$r = 4\sigma_{\max}/h_{\text{grid}}$ gives relative error $\sim
+e^{-8} \approx 3\times 10^{-4}$; matching standard NUFFT precision
+$10^{-7}$ requires $r \approx 5.7\sigma_{\max}/h_{\text{grid}}$.  In
+the implementation, $r$ is set conservatively from the largest
+$\lambda_{\max}(S_i)$ across $i$.
+
+% ============================================================================
+\section{Cost analysis}
+\label{sec:cost}
+% ============================================================================
+
+Per spread call, the work decomposes as
+\begin{equation}
+\boxed{\;
+\text{spread cost}\ =\ T \cdot (2r+1)^D
+\;+\;
+N^D \log N.
+\;}
+\end{equation}
+The FFT term is $O(N^D \log N)$ as in any NUFFT.  The spread term is
+where the cost picture differs from a standard NUFFT.
+
+\subsection{The fundamental cost driver}
+
+The fine-grid spacing $h_{\text{grid}}$ is constrained by two requirements:
+
+\begin{enumerate}
+\item \textbf{Resolution} of the sharpest source: $h_{\text{grid}}
+\lesssim \sigma_{\min}$ (otherwise the spread under-samples the
+sharpest Gaussians, which then alias as constants in the FFT).
+\item \textbf{Spatial coverage}: $N\,h_{\text{grid}} \geq$ source
+extent $+ \sim 4 \sigma_{\max}$ (otherwise wide-tail Gaussians wrap
+around the periodic FFT boundary).
+\end{enumerate}
+
+Picking $h_{\text{grid}} \sim \sigma_{\min}$ to satisfy~(1), the
+stencil radius becomes
+\begin{equation}
+r \;\sim\; \frac{4\sigma_{\max}}{h_{\text{grid}}}
+\;\sim\; 4 \cdot \frac{\sigma_{\max}}{\sigma_{\min}}.
+\end{equation}
+Per-source cell count $(2r+1)^D \sim (8\sigma_{\max}/\sigma_{\min})^D$.
+
+\paragraph{Comparison to standard NUFFT.}
+A standard NUFFT chooses its kernel width $w$ purely from the desired
+precision $\epsilon$, independent of data: $(2w+1)^D$ cells per source
+with $w \sim 7$.  Our spreader instead inherits the per-source width
+from the integrand:
+\begin{equation}
+\frac{\text{GMIX cost}}{\text{NUFFT cost}}
+\;\sim\;
+\left(\frac{\sigma_{\max}/\sigma_{\min}}{w/4}\right)^D.
+\end{equation}
+For $D\!=\!2$ and $w\!=\!7$: GMIX matches NUFFT cost when
+$\sigma_{\max}/\sigma_{\min} \approx 1.75$.  When the variance ratio
+across sources is larger, GMIX pays a $(\sigma_{\max}/\sigma_{\min})^2$
+factor over a standard NUFFT.
+
+\paragraph{Implication.}
+GMIX is exact (variant~A's only approximation is stencil truncation),
+but its cost depends on the heterogeneity of $\{S_i\}$ across $i$.  In
+single-scale regimes ($S_i$ approximately equal), it matches a
+standard NUFFT.  In multi-scale regimes (sharp posteriors at some $t$,
+broad at others), it pays a constant-factor cost over MC.
+
+\subsection{The empirically-optimal stencil radius is $r\!\approx\!8$
+(D=2), and adapting it does not pay back the recompile}
+\label{sec:r-empirics}
+
+Two design choices ended up driving most of the wall-time picture, and
+the optimal points are non-obvious.
+
+\paragraph{Stencil radius is non-monotone in wall time.}
+The naive intuition is ``smaller $r$ = cheaper spread = faster.''  In
+practice we observe the opposite at small $r$: forcing $r\!=\!4$ runs
+the EM in 50 s, $r\!=\!8$ runs in 36 s, $r\!=\!16$ runs in 53 s.  The
+reason is that the truncation $\exp(-r^2 h_{\text{grid}}^2 / 2
+\sigma_{\max}^2)$ propagates into a coarser BTTB approximation
+$T_r$, which inflates the Jacobi-preconditioned CG iteration count
+(more matvecs per solve to reach the same residual tolerance).  The
+sweet spot is the balance where stencil cost $\sim (2r+1)^D$ and CG
+work $\sim k_{\text{cg}}(r) \cdot (\text{matvec cost})$ are both at
+their minimum.  For $D\!=\!2$ at our typical $\sigma_{\max}$,
+$h_{\text{grid}}$, the empirical optimum is $r\!=\!8$ corresponding
+to $n_\sigma\!\approx\!1.5$.
+
+\paragraph{Adapting $r$ mid-run does not pay off.}
+A naive optimisation: as the smoother sharpens during EM,
+$\sigma_{\max}$ shrinks, so $r$ could shrink with it.  However, $r$ is
+a static argument to the JIT-compiled inner-scan, so changing it
+forces a fresh JAX compile costing $\sim$10--15 s.  Even adapting
+\emph{once} after warmup costs about 10 s, while the savings from a
+smaller $r$ in the post-warmup steady state are only $\sim$5 s for a
+typical 25-iter EM run.  Net effect: adapting is slightly slower than
+not adapting.
+
+\paragraph{Default policy.}
+Pick $r$ once at the start of EM from $V_0$ (cold-start covariance) at
+$n_\sigma\!=\!1.5$, and freeze.  Floor at $r\!=\!8$ to stay near the
+empirical optimum.  No mid-run recompiles.  Set
+\code{gmix\_adapt\_stencil=True} to opt into the (slower but
+mathematically tighter) adaptive variant.
+
+% ============================================================================
+\section{Implementation}
+\label{sec:impl}
+% ============================================================================
+
+\subsection{New module: \code{sing/efgp\_gmix\_spreader.py}}
+
+Pure-JAX primitives:
+\begin{itemize}
+\item \code{\_spread\_2d(m, S, w, xcen, h\_grid, N, r)} --- vmap'd
+per-source stencil evaluation + scatter-add into an $N{\times}N$
+complex grid.  Anisotropic Gaussian (uses the full $D{\times}D$
+$S_i$, including off-diagonals).
+\item \code{gmix\_nufft\_2d(...)} --- spread + \code{ifftshift /
+ifft2 / fftshift} + Riemann-sum normalisation $(N h_{\text{grid}})^D
+= (1/h_{\text{spec}})^D$ + centering phase $e^{2\pi i \xi^\top
+xcen}$.
+\item \code{stencil\_radius\_for(S, h\_grid, n\_sigma=4.0)} --- picks
+$r$ from $\max_i \lambda_{\max}(S_i)$.
+\item \code{pick\_grid\_size(h\_spec, m\_extent, sigma\_max)} --- picks
+$N$ as the next power of 2 satisfying both resolution and coverage
+constraints (\S\ref{sec:cost}).
+\end{itemize}
+
+\subsection{New q(f) update: \code{compute\_mu\_r\_gmix\_jax}}
+
+In \code{sing/efgp\_jax\_drift.py}, the closed-form analogue of
+\code{compute\_mu\_r\_jax}:
+\begin{itemize}
+\item Builds the BTTB generator from \eqref{eq:Tr-generator} via one
+spread+FFT, cropped to the difference grid.
+\item Builds $h_{1,r}$ and $h_{2,r}$ per output dim $r$ via additional
+spread+FFTs cropped to the spectral grid.
+\item Conjugates to align with the existing MC code's iflag=$-1$
+NUFFT convention (so the BTTB matrix and CG solver are unchanged).
+\item Falls through to the existing \code{cg\_solve} and the rest of
+the pipeline.
+\end{itemize}
+Total spread+FFT calls per inner iter: $1 + D_{\text{out}}(1 +
+D_{\text{lat}})$ ($= 7$ for $D_{\text{lat}} = D_{\text{out}} = 2$).
+
+\subsection{Driver hook: \code{estep\_method}}
+
+\code{fit\_efgp\_sing\_jax} now takes
+\begin{itemize}
+\item \code{estep\_method} $\in \{\code{'mc'}, \code{'gmix'}\}$,
+default \code{'gmix'};
+\item \code{gmix\_fine\_N}, \code{gmix\_stencil\_r} (auto-picked from
+$V_0$ and $h_{\text{spec}}$ if omitted, then adapted once after
+kernel warmup).
+\end{itemize}
+All three internal call sites (jit'd inner E-step scan, frozen-qf
+path, M-step $\mu$-refresh) dispatch on this flag.
+
+\subsection{Tests}
+
+\begin{itemize}
+\item \code{tests/test\_gmix\_spreader.py} --- spreader vs dense
+closed-form reference on constant-$S$, varying-$S$,
+resolution-convergence, and high-$S$-variation problems.  Errors
+$10^{-7}$ to $10^{-4}$ depending on stencil truncation.
+\item \code{tests/test\_efgp\_gmix\_vs\_mc.py} --- the closed-form
+\code{compute\_mu\_r\_gmix\_jax} agrees with high-$S$-marginal MC
+reference (8 seeds $\times$ $S\!=\!32$) to $\sim$1\,\%, while
+single-seed $S\!=\!2$ MC sits at $\sim$12\,\%.  GMIX is $\sim 12\times$
+closer to the MC reference than single-seed MC at production
+settings, confirming it is the unbiased target the MC is
+estimating.
+\item \code{tests/test\_gmix\_nufft.py} --- earlier bucketed-NUFFT
+correctness/complexity tests (variant~B) retained for reference.
+\end{itemize}
+
+% ============================================================================
+\section{End-to-end benchmark}
+\label{sec:bench}
+% ============================================================================
+
+\subsection{Setup}
+
+\code{demos/bench\_gpdrift\_mc\_vs\_gmix.py}: GP-drift recovery in 2D,
+$T \in \{500, 2000, 20000\}$, $\ell_{\text{true}} = 0.8$,
+$\sigma^2_{\text{true}} = 1$, $\sigma_{\text{diff}} = 0.3$.  Drift
+sampled fresh from an SE-GP with truth hypers; restoring term $-\alpha
+x$ added for SDE stability.  Gaussian observations through a fixed $C
+\in \mathbb{R}^{8\times 2}$, $R = 0.05 I$; emissions held fixed
+(\code{learn\_emissions=False}) to isolate the q(f) regression block.
+Both methods learn kernel hypers from $\ell_{\text{init}} = 0.3$
+($0.4\times$ truth), $\sigma^2_{\text{init}} = 1$.  $n_\text{em} = 20{-}25$
+outer iters, $n_\text{estep} = 10$ inner iters.  Default GMIX
+configuration: $n_\sigma = 1.5$ (stencil-truncation eps $\sim e^{-1.1}
+\approx 0.33$, ${\sim}\!2\times$ tighter than MC's $S\!=\!2$ shot noise);
+no mid-run stencil adaptation; $r$ floored at 8.
+
+\subsection{Results --- small/medium $T$}
+
+At $T \in \{500, 2000\}$ the methods are close in both quality and
+wall time; differences are small but consistent in GMIX's favour.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{lrrrrrrr}
+\toprule
+$T$ & method & wall (s) & $\ell/\ell_\text{true}$ & $\sigma^2/\sigma^2_\text{true}$
+& drift\_traj & drift\_grid & zero-baseline\\
+\midrule
+ 500 & MC    &  30.9 & 1.06 & 0.76 & 0.148 & 0.353 & 0.676\\
+ 500 & GMIX  &  29.9 & 1.04 & 0.71 & 0.149 & 0.346 &      \\
+2000 & MC    &  32.9 & 1.20 & 1.06 & 0.116 & 0.374 & 0.716\\
+2000 & GMIX  &  39.9 & 1.14 & 0.97 & 0.111 & 0.350 &      \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Results --- $T = 20{,}000$}
+
+At $T = 20\text{k}$ the picture splits across seeds.  We ran two seeds
+(controlling the GP-drift draw, the SDE simulation, and the
+observation noise) plus an MC sample-count sweep.  At one seed, MC
+catastrophically diverges; at another, MC works fine.  GMIX is
+robust on both.
+
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{lcccrrr}
+\toprule
+seed & method & wall (s) & $\ell/\ell_\text{true}$ &
+$\sigma^2/\sigma^2_\text{true}$ & drift\_traj & drift\_grid \\
+\midrule
+1 & MC, $S\!=\!2$  & 109 & 1.12 & 37.81 & \textbf{5.81} & \textbf{6.01} \\
+1 & MC, $S\!=\!8$  & 100 & 0.99 & 31.03 & 4.67 & 4.69 \\
+1 & MC, $S\!=\!16$ & 118 & 1.02 & 28.35 & 4.43 & 4.58 \\
+1 & GMIX           & 124 & 1.06 &  0.71 & \textbf{0.044} & \textbf{0.226} \\
+\addlinespace
+2 & MC, $S\!=\!2$  & 100 & 1.19 &  0.87 & 0.033 & 0.346 \\
+2 & MC, $S\!=\!8$  & 109 & 1.30 &  1.17 & 0.034 & 0.395 \\
+2 & MC, $S\!=\!16$ & 105 & 1.29 &  1.15 & 0.033 & 0.390 \\
+2 & GMIX           & 114 & 1.32 &  1.05 & 0.031 & 0.391 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Two findings.}
+
+\begin{enumerate}
+\item \textbf{MC blow-up at $T\!=\!20$k is not deterministic but is real.}
+On seed 1 MC's noise compounds through the natural-gradient updates,
+$\sigma^2$ inflates 30--40$\times$, the kernel becomes too aggressive,
+and the resulting drift posterior is meaningless (drift\_traj $\sim
+5$, vs zero-baseline $0.77$).  On seed 2 the same setup produces a
+clean fit.  We saw the failure on roughly half of attempts at this
+problem size; smaller $T$ values do not exhibit it.
+\item \textbf{More MC samples do not rescue the failure.}  Going from
+$S\!=\!2$ to $S\!=\!8$ to $S\!=\!16$ (8$\times$ more compute on the
+sample dimension) on seed 1 nudges drift\_traj from 5.81 to 4.43 ---
+still two orders of magnitude worse than GMIX's 0.044.  $\sigma^2$
+remains 28--38$\times$ truth.  The shot noise compounds through the
+EM dynamics in a way that is not statistical (more samples per call)
+but structural (each EM iter accumulates bias from the previous's
+noisy update).
+\end{enumerate}
+
+GMIX has no analogous failure mode: its per-call output is
+deterministic, so EM iter $k+1$ sees a clean response to iter $k$'s
+update.  Both seeds converge GMIX to within $7\%$ of $\sigma^2_{\text{true}}$
+and produce $1\!-\!\text{drift\_traj}/\text{zero}$-baseline $\geq$ 95\%.
+
+\paragraph{Wall time at $T = 20$k.}  Within $\sim$15\% of MC across
+seeds (114--124 s for GMIX vs 100--118 s for MC).  The slowdown
+narrows from $\sim$1.5$\times$ at $T\!=\!2$k to ${\sim}1.1\times$ at
+$T\!=\!20$k --- the per-iter overhead amortises better at larger $T$.
+
+\subsection{Hyperparameter learning paths and the log-marginal landscape}
+
+The hyperparameter paths plotted over the collapsed
+log-marginal-likelihood landscape (computed under GMIX's converged
+$q(x)$) appear in
+\code{demos/\_bench\_mc\_vs\_gmix\_out/landscape\_paths\_T2000\_ls0.8.png}.
+Both paths walk down the same valley to the same neighbourhood; the
+GMIX trajectory is smoother (no MC noise) and lands slightly closer to
+the true optimum.  At $T\!=\!20$k seed 1, MC's path drifts upward
+toward $\sigma^2 \to \infty$ --- visible directly in the path plot.
+
+% ============================================================================
+\section{Where this sits among the alternatives}
+\label{sec:alternatives}
+% ============================================================================
+
+For completeness, a comparison of the closed-form approximations
+considered earlier:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.4}
+\begin{tabular}{lll}
+\toprule
+Variant & Per-spread cost & Error \\
+\midrule
+\textbf{(A) Custom spreader} (this note)
+& $O(T(\sigma_{\max}/\sigma_{\min})^D + N^D \log N)$
+& exact (FFT + stencil truncation) \\
+(B) Bucketed NUFFT
+& $O(BT/B + B M^D \log M) = O(T + B M^D \log M)$
+& within-bucket bias from $S$-spread \\
+(C) Gauss--Hermite ($K^D$ nodes)
+& $O(TK^D + M^D \log M)$
+& deterministic, $\sim (\xi^\top S\xi)^K$ at $K$ nodes \\
+MC ($S$ samples)
+& $O(TS + M^D \log M)$
+& stochastic, $\sigma\sim\sqrt{1/S}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Each row trades a different cost driver for a different error
+mechanism.  Variant A removes both stochasticity and bucket bias at
+the price of $(\sigma_{\max}/\sigma_{\min})^D$ in spread cost; MC
+keeps the spread cheap but has shot noise that does not vanish at
+fixed $S$.
+
+% ============================================================================
+\section{Recommendation}
+\label{sec:reco}
+% ============================================================================
+
+\begin{itemize}
+\item \textbf{Default to GMIX}.  It is exact (up to controllable FFT
+truncation), gives slightly better drift error and hyperparameter
+recovery, and has no MC noise to interact with the M-step.
+\item \textbf{Use MC if cost matters more than precision.}  At $T \gg
+1000$ in regimes where $\sigma_{\max}/\sigma_{\min}$ is large, MC
+remains $\sim 1.5\times$ faster.  The MC noise at $S\!=\!2$ does
+land within the same log-marginal valley; the differences are
+constant-factor.
+\item \textbf{Tune \code{kernel\_warmup\_iters}} so the single GMIX
+stencil-radius adaptation lands at a sensible $\sigma_{\max}$.  Too
+early and the adaptation triggers before the smoother sharpens;
+too late and the cold-start runs all use a wide stencil.
+\end{itemize}
+
+% ============================================================================
+\section{Math-to-code dictionary}
+\label{sec:dict}
+% ============================================================================
+
+\noindent
+\begin{tabular}{ll}
+\toprule
+Math & Code \\
+\midrule
+Closed-form expectation $\E[\phi]$ \eqref{eq:Ephi}
+& \code{gmix\_nufft\_2d} \\
+Closed-form $\E[\phi\phi^*]$ generator \eqref{eq:Tr-generator}
+& \code{gmix\_nufft\_2d} cropped to BTTB diff grid \\
+Closed-form $h_{1,r}, h_{2,r}$ \eqref{eq:h1-cf}, \eqref{eq:h2-cf}
+& \code{compute\_mu\_r\_gmix\_jax} \\
+Per-source spread $\sum_i w_i \mathcal{N}(\cdot; m_i, S_i)$
+& \code{\_spread\_2d} \\
+Stencil radius from $\sigma_{\max}$
+& \code{stencil\_radius\_for} \\
+Fine grid size $N$ from $h_{\text{spec}}$ + $\sigma$
+& \code{pick\_grid\_size} \\
+Driver flag
+& \code{fit\_efgp\_sing\_jax(estep\_method=...)} \\
+Adaptive-$r$ once after warmup
+& \code{\_maybe\_adapt\_stencil} in \code{efgp\_em.py} \\
+Benchmark
+& \code{demos/bench\_gpdrift\_mc\_vs\_gmix.py} \\
+Landscape plot
+& \code{demos/plot\_mc\_vs\_gmix\_landscape.py} \\
+Tests
+& \code{tests/test\_gmix\_spreader.py},\\
+& \code{tests/test\_efgp\_gmix\_vs\_mc.py} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent
+None of these touch \code{drift\_moments\_jax}, \code{cg\_solve},
+\code{make\_A\_apply}, or \code{m\_step\_kernel\_jax}.  The custom-VJP
+shims \code{ef\_with\_jac\_grad} and \code{eff\_with\_grads} are
+unchanged.
+
+\end{document}

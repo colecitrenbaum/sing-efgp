@@ -29,26 +29,30 @@ import jax.numpy as jnp
 
 
 def update_emissions_gaussian(
-    ms: jnp.ndarray,           # (T, D)
-    Ss: jnp.ndarray,           # (T, D, D)
-    ys: jnp.ndarray,           # (T, N)
-    t_mask: jnp.ndarray = None,    # (T,) bool, True where an observation exists
+    ms: jnp.ndarray,           # (K, T, D)
+    Ss: jnp.ndarray,           # (K, T, D, D)
+    ys: jnp.ndarray,           # (K, T, N)
+    t_mask: jnp.ndarray = None,    # (K, T) bool, True where an observation exists
     update_R: bool = True,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Closed-form maximum-likelihood update of (C, d, R)."""
-    T, D = ms.shape
-    N = ys.shape[1]
+    """Closed-form ML update of (C, d, R), aggregated across K trials and T times.
+
+    Sufficient statistics are linear sums over (k, t) — multi-trial
+    aggregation is just one extra reduction axis.
+    """
+    K, T, D = ms.shape
+    N = ys.shape[-1]
 
     if t_mask is None:
-        t_mask = jnp.ones(T, dtype=bool)
-    w = t_mask.astype(ms.dtype)            # (T,)
+        t_mask = jnp.ones((K, T), dtype=bool)
+    w = t_mask.astype(ms.dtype)                                # (K, T)
 
-    # Sufficient statistics
-    sum_m = (w[:, None] * ms).sum(axis=0)                     # (D,)
-    sum_mmT_plus_S = (w[:, None, None] * (
-        ms[:, :, None] * ms[:, None, :] + Ss
-    )).sum(axis=0)                                            # (D, D)
-    T_eff = w.sum()                                            # scalar
+    # Sufficient statistics: reduce over (K, T)
+    sum_m = (w[..., None] * ms).sum(axis=(0, 1))                                 # (D,)
+    sum_mmT_plus_S = (w[..., None, None] * (
+        ms[..., :, None] * ms[..., None, :] + Ss
+    )).sum(axis=(0, 1))                                                          # (D, D)
+    T_eff = w.sum()                                                              # scalar
 
     # M (D+1, D+1)
     M = jnp.block([[sum_mmT_plus_S, sum_m[:, None]],
@@ -56,8 +60,9 @@ def update_emissions_gaussian(
     M = M + 1e-9 * jnp.eye(D + 1)
 
     # B (D+1, N): b_n stacked as columns
-    sum_ym = (w[:, None, None] * ys[:, None, :] * ms[:, :, None]).sum(axis=0)   # (D, N)
-    sum_y = (w[:, None] * ys).sum(axis=0)                                        # (N,)
+    sum_ym = (w[..., None, None] * ys[..., None, :] * ms[..., :, None]
+              ).sum(axis=(0, 1))                                                 # (D, N)
+    sum_y = (w[..., None] * ys).sum(axis=(0, 1))                                 # (N,)
     B = jnp.concatenate([sum_ym, sum_y[None, :]], axis=0)                         # (D+1, N)
 
     Cd = jnp.linalg.solve(M, B)                                  # (D+1, N)
@@ -66,13 +71,12 @@ def update_emissions_gaussian(
 
     if update_R:
         # Per-time residual variance:  E[(y - Cx - d)^2] = (y - Cm - d)^2 + C S C^T
-        Cm = ms @ C_new.T                                         # (T, N)
-        resid_sq = (ys - Cm - d_new[None, :]) ** 2               # (T, N)
-        # C S C^T  per t and per n: (T, N)
-        # CSC = einsum('nd, tde, ne -> tn', C, S, C)
-        CSC = jnp.einsum('nd, tde, ne -> tn', C_new, Ss, C_new)
-        per_t = (resid_sq + CSC) * w[:, None]
-        R_new = per_t.sum(axis=0) / jnp.maximum(T_eff, 1.0)        # (N,)
+        Cm = ms @ C_new.T                                         # (K, T, N)
+        resid_sq = (ys - Cm - d_new) ** 2                         # (K, T, N)
+        # C S C^T  per (k, t, n)
+        CSC = jnp.einsum('nd, ktde, ne -> ktn', C_new, Ss, C_new)
+        per_kt = (resid_sq + CSC) * w[..., None]                  # (K, T, N)
+        R_new = per_kt.sum(axis=(0, 1)) / jnp.maximum(T_eff, 1.0) # (N,)
         R_new = jnp.maximum(R_new, 1e-6)
     else:
         R_new = None

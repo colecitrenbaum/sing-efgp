@@ -58,9 +58,12 @@ class EFGPEMHistory:
 # ============================================================================
 # JAX-native EM loop (lax.scan'd inner E-step, no torch round-trip)
 # ============================================================================
-def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
+def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
+                                lik, sigma, sigma_drift_sq,
                                 S_marginal, n_estep_iters,
-                                qf_cg_tol, qf_max_cg_iter, qf_nufft_eps):
+                                qf_cg_tol, qf_max_cg_iter, qf_nufft_eps,
+                                estep_method='mc',
+                                gmix_fine_N=None, gmix_stencil_r=None):
     """Compile a function that runs ``n_estep_iters`` inner E-step iterations
     via ``lax.scan``, all JAX, no torch.
 
@@ -69,13 +72,15 @@ def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
     ``mtot_per_dim``.  ``mtot_per_dim`` is a ``static_argnames``: JAX
     automatically caches one compiled artifact per ``mtot_per_dim`` value.
 
-    For an EM run that explores ℓ across only a handful of grid sizes,
-    this reduces compilation cost from "every M-step" to "first time we
-    see each grid size".
+    Multi-trial: ``K`` and ``trial_mask`` are baked into the closure;
+    each new ``K`` triggers a new JIT artifact (one per K, per
+    mtot_per_dim).  The inner SING natural-grad operates per-trial via
+    ``vmap``; the q(f) update flattens sources across trials.
     """
     inputs = jnp.zeros((T, 1))
     input_effect = jnp.zeros((D, 1))
     del_t = (t_grid[1:] - t_grid[:-1])
+    trial_mask_b = jnp.broadcast_to(jnp.asarray(trial_mask, dtype=bool), (K, T))
 
     nat_to_marg_b = jax.jit(vmap(natural_to_marginal_params))
 
@@ -90,33 +95,47 @@ def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
             mtot_per_dim=mtot_per_dim, xcen=xcen,
             M=int(xis_flat.shape[0]), d=int(xis_flat.shape[1]),
         )
-        trial_mask = jnp.ones((1, T), dtype=bool)
 
         def one_iter(carry, key_iter):
             nat_p = carry
-            mp_b, _ = vmap(natural_to_marginal_params)(nat_p, trial_mask)
-            ms = mp_b['m'][0]
-            Ss = mp_b['S'][0]
-            SSs = mp_b['SS'][0]
+            mp_b, _ = vmap(natural_to_marginal_params)(nat_p, trial_mask_b)
+            ms = mp_b['m']                           # (K, T, D)
+            Ss = mp_b['S']                           # (K, T, D, D)
+            SSs = mp_b['SS']                         # (K, T-1, D, D)
 
             key_qf, key_grad = jr.split(key_iter, 2)
-            mu_r, Ef, Eff, Edfdx = jpd.qf_and_moments_jax(
-                ms, Ss, SSs, del_t, grid, key_qf,
-                sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
-                D_lat=D, D_out=D,
-                cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
-                nufft_eps=qf_nufft_eps,
-            )
-            frozen = _FrozenEFGPDrift(
+            if estep_method == 'mc':
+                mu_r, Ef, Eff, Edfdx = jpd.qf_and_moments_jax(
+                    ms, Ss, SSs, del_t, trial_mask_b, grid, key_qf,
+                    sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+                    D_lat=D, D_out=D,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps,
+                )
+            elif estep_method == 'gmix':
+                mu_r, Ef, Eff, Edfdx = jpd.qf_and_moments_gmix_jax(
+                    ms, Ss, SSs, del_t, trial_mask_b, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    fine_N=gmix_fine_N, stencil_r=gmix_stencil_r,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps,
+                )
+            else:
+                raise ValueError(f"unknown estep_method {estep_method!r}")
+            # Per-trial frozen drift: pytree with (K, T, ...) leaves; vmap
+            # below slices the leading axis so each lambda invocation sees a
+            # logical single-trial FrozenEFGPDrift.
+            frozen_K = _FrozenEFGPDrift(
                 latent_dim=D, t_grid=t_grid,
                 Ef_per_t=Ef, Eff_per_t=Eff, Edfdx_per_t=Edfdx)
-            mean_params_b, _ = vmap(natural_to_mean_params)(nat_p, trial_mask)
+            mean_params_b, _ = vmap(natural_to_mean_params)(nat_p, trial_mask_b)
             lik_g = vmap(lambda mp_, tm_, ys_: nat_grad_likelihood(
                 mp_, tm_, ys_, lik, output_params))(mean_params_b, t_mask, ys_obs)
-            tr_g = vmap(lambda k, mp_, tm_, ip_: nat_grad_transition(
-                k, frozen, None, {}, tm_, ip_, t_grid, mp_,
-                inputs, input_effect, sigma))(jr.split(key_grad, 1),
-                                              mean_params_b, trial_mask, init_params)
+            tr_g = vmap(lambda k, fr_, mp_, tm_, ip_: nat_grad_transition(
+                k, fr_, None, {}, tm_, ip_, t_grid, mp_,
+                inputs, input_effect, sigma))(jr.split(key_grad, K),
+                                              frozen_K, mean_params_b,
+                                              trial_mask_b, init_params)
             new_nat_p = {
                 'J': (1 - rho) * nat_p['J']
                      + rho * (lik_g['J'] + tr_g['J']),
@@ -134,20 +153,20 @@ def _build_jit_estep_scan_jax(*, D, T, t_grid, lik, sigma, sigma_drift_sq,
     def scan_estep_frozen_qf(natural_params, init_params, ys_obs, t_mask,
                              output_params, key, rho,
                              Ef, Eff, Edfdx):
-        frozen = _FrozenEFGPDrift(
+        frozen_K = _FrozenEFGPDrift(
             latent_dim=D, t_grid=t_grid,
             Ef_per_t=Ef, Eff_per_t=Eff, Edfdx_per_t=Edfdx)
-        trial_mask = jnp.ones((1, T), dtype=bool)
 
         def one_iter(carry, key_grad):
             nat_p = carry
-            mean_params_b, _ = vmap(natural_to_mean_params)(nat_p, trial_mask)
+            mean_params_b, _ = vmap(natural_to_mean_params)(nat_p, trial_mask_b)
             lik_g = vmap(lambda mp_, tm_, ys_: nat_grad_likelihood(
                 mp_, tm_, ys_, lik, output_params))(mean_params_b, t_mask, ys_obs)
-            tr_g = vmap(lambda k, mp_, tm_, ip_: nat_grad_transition(
-                k, frozen, None, {}, tm_, ip_, t_grid, mp_,
-                inputs, input_effect, sigma))(jr.split(key_grad, 1),
-                                              mean_params_b, trial_mask, init_params)
+            tr_g = vmap(lambda k, fr_, mp_, tm_, ip_: nat_grad_transition(
+                k, fr_, None, {}, tm_, ip_, t_grid, mp_,
+                inputs, input_effect, sigma))(jr.split(key_grad, K),
+                                              frozen_K, mean_params_b,
+                                              trial_mask_b, init_params)
             new_nat_p = {
                 'J': (1 - rho) * nat_p['J']
                      + rho * (lik_g['J'] + tr_g['J']),
@@ -234,6 +253,35 @@ def fit_efgp_sing_jax(
     qf_cg_tol: float = 1e-5,
     qf_max_cg_iter: int = 2000,
     qf_nufft_eps: float = 6e-8,
+    # E-step q(f)-update method:
+    #   'gmix' (default): closed-form Gaussian-mixture spreader (variant A
+    #     from efgp_estep_charfun.tex).  Deterministic, exact up to FFT
+    #     truncation; no S_marginal MC noise.
+    #   'mc' (legacy): pseudo-cloud Monte Carlo (S_marginal samples per t).
+    estep_method: str = 'gmix',
+    # Gaussian-mixture spreader knobs (only used when estep_method == 'gmix'):
+    #   gmix_fine_N : int — FFT grid size per dim.  Picked automatically if
+    #     None, based on max sigma seen at the initial q(x).  Recompiles if
+    #     it changes between EM iters, so a generous initial value is best.
+    #   gmix_stencil_r : int — Gaussian spread stencil half-width.  Picked
+    #     automatically from gmix_n_sigma * sigma_max / h_grid if None.
+    #   gmix_n_sigma : float — stencil radius in units of σ_max.  Truncation
+    #     error decays as exp(-n²/2): n=4 → 3e-4, n=3 → 1e-2, n=2.5 → 4e-2,
+    #     n=2 → 0.14, n=1.5 → 0.32.  Default n=1.5 matches the empirical
+    #     wall-time optimum (r ≈ 8 in 2D): smaller r → cheaper spreads,
+    #     CG iter count stays comparable to MC, and 33% truncation is
+    #     still 2× more accurate than MC's S=2 shot noise (~0.7).  Bump
+    #     to 2.0 if drift_rmse looks worse than expected; below 1.0 is
+    #     unsafe (CG amplification of stencil bias).
+    gmix_fine_N: Optional[int] = None,
+    gmix_stencil_r: Optional[int] = None,
+    gmix_n_sigma: float = 1.5,
+    # If True, recompute stencil_r ONCE at iter `kernel_warmup_iters` based
+    # on the current Σ.  This is mathematically a tighter stencil but
+    # costs one JIT recompile (~10-15 s); empirically the savings (smaller
+    # r → faster spreads in steady state) do not pay back the recompile
+    # within a typical 25-iter EM run.  Default False.
+    gmix_adapt_stencil: bool = False,
     seed: int = 0,
     true_xs: Optional[np.ndarray] = None,
     verbose: bool = True,
@@ -258,7 +306,6 @@ def fit_efgp_sing_jax(
 
     ys_obs = likelihood.ys_obs
     t_mask = likelihood.t_mask
-    assert ys_obs.shape[0] == 1, "v0 supports a single trial."
     n_trials, T, N = ys_obs.shape
     D = latent_dim
     trial_mask = jnp.ones((n_trials, T), dtype=bool)
@@ -274,14 +321,24 @@ def fit_efgp_sing_jax(
     # the initial mean, expanding further if the prior variance is larger.
     # Caller can still supply a custom template when they know a better
     # support box for the problem.
+    #
+    # Multi-trial: take the union bounding box across all trials' initial
+    # means + 4·std halos so one shared spectral grid covers every trial.
     if X_template is None:
-        diag_std0 = jnp.sqrt(jnp.diag(jnp.asarray(init_params['V0'][0])))
-        half_span = jnp.maximum(
+        V0_arr = jnp.asarray(init_params['V0'])               # (K, D, D)
+        mu0_arr = jnp.asarray(init_params['mu0'])             # (K, D)
+        diag_std0 = jnp.sqrt(jnp.diagonal(V0_arr, axis1=-2, axis2=-1))  # (K, D)
+        half_span_per = jnp.maximum(
             jnp.full_like(diag_std0, 3.0),
             4.0 * diag_std0,
-        )
+        )                                                      # (K, D)
+        # Per-trial box, then union across K
+        per_min = (mu0_arr - half_span_per).min(axis=0)        # (D,)
+        per_max = (mu0_arr + half_span_per).max(axis=0)        # (D,)
+        center = 0.5 * (per_min + per_max)
+        half_span = 0.5 * (per_max - per_min)
         X_template = (
-            jnp.asarray(init_params['mu0'][0])[None, :]
+            center[None, :]
             + jnp.linspace(-1., 1., max(T, 16))[:, None] * half_span[None, :]
         )
 
@@ -290,28 +347,34 @@ def fit_efgp_sing_jax(
     if init_natural_params is not None:
         natural_params = init_natural_params
     else:
-        # Default: diffusion-only Brownian-chain seed.
-        A_init = jnp.zeros((T - 1, D, D))
-        b_init = jnp.zeros((T, D)).at[0].set(jnp.asarray(init_params['mu0'][0]))
-        Q_init = jnp.tile((sigma ** 2) * jnp.eye(D), (T, 1, 1)).at[0].set(
-            jnp.asarray(init_params['V0'][0]))
+        # Default: diffusion-only Brownian-chain seed (per-trial via vmap).
         from sing.utils.sing_helpers import dynamics_to_natural_params
-        nat_one = dynamics_to_natural_params(
-            A_init, b_init, Q_init, trial_mask[0])
-        natural_params = jax.tree_util.tree_map(lambda x: x[None], nat_one)
+        mu0_K = jnp.asarray(init_params['mu0'])                  # (K, D)
+        V0_K = jnp.asarray(init_params['V0'])                    # (K, D, D)
+
+        def _init_one(mu0_, V0_, tm_):
+            A_init = jnp.zeros((T - 1, D, D))
+            b_init = jnp.zeros((T, D)).at[0].set(mu0_)
+            Q_init = jnp.tile((sigma ** 2) * jnp.eye(D), (T, 1, 1)).at[0].set(V0_)
+            return dynamics_to_natural_params(A_init, b_init, Q_init, tm_)
+
+        natural_params = vmap(_init_one)(mu0_K, V0_K, trial_mask)
 
     init_key, key = jr.split(jr.PRNGKey(seed), 2)
 
-    # Build the jit'd E-step ONCE.  The grid (xis, ws, h, xcen) is now a
-    # JIT INPUT, and ``mtot_per_dim`` is a static_argnames — JAX
-    # automatically caches one compiled artifact per ``mtot_per_dim``
-    # value.
-    scan_estep_inner_refresh, scan_estep_frozen_qf, _ = _build_jit_estep_scan_jax(
-        D=D, T=T, t_grid=t_grid, lik=likelihood, sigma=sigma,
+    # Defer jit'd scan construction until the grid is known (so gmix
+    # path can size fine_N from h_spec).
+    if estep_method not in ('mc', 'gmix'):
+        raise ValueError(f"estep_method must be 'mc' or 'gmix', "
+                         f"got {estep_method!r}")
+    _est_kw = dict(
+        K=n_trials, D=D, T=T, t_grid=t_grid, trial_mask=trial_mask,
+        lik=likelihood, sigma=sigma,
         sigma_drift_sq=sigma_drift_sq,
         S_marginal=S_marginal, n_estep_iters=n_estep_iters,
         qf_cg_tol=qf_cg_tol, qf_max_cg_iter=qf_max_cg_iter,
         qf_nufft_eps=qf_nufft_eps,
+        estep_method=estep_method,
     )
 
     def _make_grid(ls_, var_, eps_):
@@ -371,13 +434,105 @@ def fit_efgp_sing_jax(
             print(f"  [jax] M={grid.M}, mtot_per_dim={grid.mtot_per_dim}, "
                   f"pin_grid=True (legacy)")
 
+    # Now that the grid is built, size the gmix spreader (if used) and
+    # build the jit'd scan once.  fine_N / stencil_r baked into closure.
+    if estep_method == 'gmix':
+        from sing.efgp_gmix_spreader import (
+            stencil_radius_for as _stencil_for, pick_grid_size as _pick_N)
+        h_spec0 = float(grid.h_per_dim[0])
+        # Initial Σ_max: from prior covariance V0 (covers cold-start regime
+        # where q(x) is broad).  Multi-trial: take max eigenvalue across
+        # all trials' V0 so the stencil covers the widest prior.
+        # fine_N and stencil_r are STATIC; if the user wants to recompile
+        # after warmup with tighter values, they can re-instantiate.
+        V0_all = jnp.asarray(init_params['V0'])
+        if V0_all.ndim == 2:
+            V0_all = V0_all[None]                              # (1, D, D)
+        sigma0_max = float(jnp.sqrt(jnp.max(jnp.linalg.eigvalsh(V0_all))))
+        # Span the cloud extent we already used to build the grid:
+        X_min = np.asarray(X_template.min(axis=0))
+        X_max = np.asarray(X_template.max(axis=0))
+        m_extent = float((X_max - X_min).max())
+        if gmix_fine_N is None:
+            gmix_fine_N = _pick_N(h_spec=h_spec0, m_extent=m_extent,
+                                    sigma_max=sigma0_max)
+        if gmix_stencil_r is None:
+            h_grid = 1.0 / (gmix_fine_N * h_spec0)
+            # Use the widest prior V0 across trials to size the stencil
+            gmix_stencil_r = _stencil_for(V0_all,
+                                            float(h_grid),
+                                            n_sigma=gmix_n_sigma)
+        # Round to a coarse ladder so JIT cache only sees a handful of
+        # distinct values across the EM trajectory (each value compiles once).
+        _STENCIL_LADDER = (3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48, 64)
+        def _round_r(r_raw):
+            for x in _STENCIL_LADDER:
+                if r_raw <= x:
+                    return x
+            return _STENCIL_LADDER[-1]
+        # Empirical wall-time sweet spot: r ≈ 8 in 2D.  Smaller r reduces
+        # spread cost but coarsens the BTTB approximation, which inflates
+        # CG iteration count and *increases* total wall time despite the
+        # cheaper spread.  Larger r is dominated by spread cost.  Floor
+        # at 8 unless caller explicitly sets a smaller `gmix_stencil_r`.
+        gmix_stencil_r = max(8, _round_r(int(gmix_stencil_r)))
+        if verbose:
+            print(f"  [jax] estep_method=gmix  fine_N={gmix_fine_N}  "
+                  f"stencil_r={gmix_stencil_r}  "
+                  f"(sigma0_max≈{sigma0_max:.3f}, h_spec0≈{h_spec0:.3f})")
+        _est_kw['gmix_fine_N'] = int(gmix_fine_N)
+        _est_kw['gmix_stencil_r'] = int(gmix_stencil_r)
+
+    scan_estep_inner_refresh, scan_estep_frozen_qf, _ = \
+        _build_jit_estep_scan_jax(**_est_kw)
+
+    def _maybe_adapt_stencil(Ss_now):
+        """Recompute gmix_stencil_r from current S; rebuild scan if it changed.
+
+        Returns the (possibly-new) (refresh, frozen) scan closures.
+        """
+        nonlocal gmix_stencil_r, scan_estep_inner_refresh, scan_estep_frozen_qf
+        if estep_method != 'gmix':
+            return scan_estep_inner_refresh, scan_estep_frozen_qf
+        h_grid_now = 1.0 / (gmix_fine_N * float(grid.h_per_dim[0]))
+        sigma_max_now = float(jnp.sqrt(
+            jnp.max(jnp.linalg.eigvalsh(Ss_now))))
+        r_raw = int(np.ceil(gmix_n_sigma * sigma_max_now / h_grid_now))
+        r_new = _round_r(r_raw)
+        if r_new != gmix_stencil_r:
+            if verbose:
+                print(f"    [gmix adaptive] stencil_r {gmix_stencil_r} -> {r_new}  "
+                      f"(σ_max={sigma_max_now:.3f}, h_grid={h_grid_now:.4f})")
+            gmix_stencil_r = r_new
+            _est_kw['gmix_stencil_r'] = int(gmix_stencil_r)
+            new_refresh, new_frozen, _ = _build_jit_estep_scan_jax(**_est_kw)
+            scan_estep_inner_refresh = new_refresh
+            scan_estep_frozen_qf = new_frozen
+        return scan_estep_inner_refresh, scan_estep_frozen_qf
+
     history = EFGPEMHistory()
     log_ls = float(np.log(ls))
     log_var = float(np.log(var))
 
+    # Track whether we've already adapted the gmix stencil (to bound
+    # JIT recompiles to ~1 per fit).
+    _gmix_already_adapted = False
     for it in range(n_em_iters):
         rho_jax = jnp.asarray(float(rho_sched[it]))
         em_key, key = jr.split(key, 2)
+        # Adapt gmix stencil radius ONCE, after kernel_warmup_iters.  At
+        # that point Σ has shrunk meaningfully relative to the prior V0
+        # so a tighter stencil is correct, and a SINGLE JIT recompile
+        # (instead of one per ladder transition) keeps wall time low.
+        if (estep_method == 'gmix' and gmix_adapt_stencil
+                and not _gmix_already_adapted
+                and it == max(1, kernel_warmup_iters)):
+            mp_now_b, _ = nat_to_marg_b(natural_params, trial_mask)
+            # Adapt to the largest current marginal across (K, T)
+            S_now_max = mp_now_b['S'].reshape(-1, D, D)
+            scan_estep_inner_refresh, scan_estep_frozen_qf = \
+                _maybe_adapt_stencil(S_now_max)
+            _gmix_already_adapted = True
         if refresh_qf_every_estep_iter:
             natural_params = scan_estep_inner_refresh(
                 natural_params, init_params,
@@ -388,18 +543,27 @@ def fit_efgp_sing_jax(
                 mtot_per_dim=grid.mtot_per_dim)
         else:
             mp_prev_b, _ = nat_to_marg_b(natural_params, trial_mask)
-            ms_prev = mp_prev_b['m'][0]
-            Ss_prev = mp_prev_b['S'][0]
-            SSs_prev = mp_prev_b['SS'][0]
+            ms_prev = mp_prev_b['m']                          # (K, T, D)
+            Ss_prev = mp_prev_b['S']                          # (K, T, D, D)
+            SSs_prev = mp_prev_b['SS']                        # (K, T-1, D, D)
             qf_key, scan_key = jr.split(em_key, 2)
             del_t = t_grid[1:] - t_grid[:-1]
-            _, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_jax(
-                ms_prev, Ss_prev, SSs_prev, del_t, grid, qf_key,
-                sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
-                D_lat=D, D_out=D,
-                cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
-                nufft_eps=qf_nufft_eps,
-            )
+            if estep_method == 'mc':
+                _, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_jax(
+                    ms_prev, Ss_prev, SSs_prev, del_t, trial_mask, grid, qf_key,
+                    sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+                    D_lat=D, D_out=D,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps,
+                )
+            else:
+                _, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_gmix_jax(
+                    ms_prev, Ss_prev, SSs_prev, del_t, trial_mask, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    fine_N=int(gmix_fine_N), stencil_r=int(gmix_stencil_r),
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps,
+                )
             natural_params = scan_estep_frozen_qf(
                 natural_params, init_params,
                 ys_obs, t_mask, output_params,
@@ -408,30 +572,41 @@ def fit_efgp_sing_jax(
 
         # ---- M-step ----
         mp_b, _ = nat_to_marg_b(natural_params, trial_mask)
-        ms_t = mp_b['m'][0]
-        Ss_t = mp_b['S'][0]
-        SSs_t = mp_b['SS'][0]
+        ms_t = mp_b['m']                                      # (K, T, D)
+        Ss_t = mp_b['S']                                      # (K, T, D, D)
+        SSs_t = mp_b['SS']                                    # (K, T-1, D, D)
 
         # 1) Closed-form (C, d, R) for Gaussian emissions
         if learn_emissions and it >= emission_warmup_iters:
             C_new, d_new, R_new = update_emissions_gaussian(
-                ms_t, Ss_t, ys_obs[0], t_mask[0], update_R=update_R)
+                ms_t, Ss_t, ys_obs, t_mask, update_R=update_R)
             output_params = {**output_params, 'C': C_new, 'd': d_new}
             if R_new is not None:
                 output_params['R'] = R_new
-        init_params = vmap(update_init_params)(ms_t[None, 0], Ss_t[None, 0])
+        init_params = vmap(update_init_params)(ms_t[:, 0], Ss_t[:, 0])
 
         # 2) Collapsed kernel M-step (after warmup so q(f) isn't trivial)
         if learn_kernel and it >= kernel_warmup_iters:
             mstep_key, key = jr.split(key, 2)
             del_t = t_grid[1:] - t_grid[:-1]
-            mu_r, X_pseudo, top = jpd.compute_mu_r_jax(
-                ms_t, Ss_t, SSs_t, del_t, grid, mstep_key,
-                sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
-                D_lat=D, D_out=D,
-                cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
-                nufft_eps=qf_nufft_eps,
-            )
+            # Build flat supersources from all trials' Stein quantities
+            m_src, S_src, d_src, C_src, w_src = jpd._flatten_stein(
+                ms_t, Ss_t, SSs_t, del_t, trial_mask)
+            if estep_method == 'mc':
+                mu_r, X_pseudo, top = jpd.compute_mu_r_jax(
+                    m_src, S_src, d_src, C_src, w_src, grid, mstep_key,
+                    sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+                    D_lat=D, D_out=D,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps,
+                )
+            else:  # 'gmix'
+                mu_r, _, top = jpd.compute_mu_r_gmix_jax(
+                    m_src, S_src, d_src, C_src, w_src, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    fine_N=int(gmix_fine_N), stencil_r=int(gmix_stencil_r),
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                )
             # z_r = h_θ,r / ws  (so M-step varies hypers via ws and recovers h_r = ws ⊙ z_r)
             ws_real_c = grid.ws.real.astype(grid.ws.dtype)
             ws_safe = jnp.where(jnp.abs(ws_real_c) < 1e-30,
@@ -483,8 +658,13 @@ def fit_efgp_sing_jax(
                       f"-> {new_pin_ls:.3f}  (M {old_M} -> {grid.M})")
 
         if true_xs is not None:
+            # ``ms_t`` is (K, T, D); accept ``true_xs`` as either (T, D) (K=1
+            # back-compat) or (K, T, D).
+            true_arr = np.asarray(true_xs)
+            if true_arr.ndim == 2:
+                true_arr = true_arr[None]
             rmse_lat = float(np.sqrt(np.mean(
-                (np.asarray(ms_t) - true_xs) ** 2)))
+                (np.asarray(ms_t) - true_arr) ** 2)))
             history.latent_rmse.append(rmse_lat)
         history.lengthscale.append(ls)
         history.variance.append(var)

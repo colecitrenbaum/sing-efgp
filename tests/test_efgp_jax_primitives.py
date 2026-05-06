@@ -201,9 +201,10 @@ def test_qf_and_drift_moments_match_torch(ref):
     rel_mu = _rel(mu_r_jax, fq['mu_r_full'])
     assert rel_mu < 5e-3, f"mu_r rel err {rel_mu:.2e}"
 
-    # Drift moments
-    Ef, Eff, Edfdx = jpd.drift_moments_jax(
-        mu_r_jax, grid, ms, D_lat=d, D_out=d)
+    # Drift moments — multi-trial API: ms is (K, T, D); unwrap K=1.
+    Ef_K, Eff_K, Edfdx_K = jpd.drift_moments_jax(
+        mu_r_jax, grid, ms[None], D_lat=d, D_out=d)
+    Ef, Eff, Edfdx = Ef_K[0], Eff_K[0], Edfdx_K[0]
     rel_Ef = _rel(Ef, fq['Ef_full'])
     rel_Eff = _rel(Eff, fq['Eff_full'])
     rel_Edfdx = _rel(Edfdx, fq['Edfdx_full'])
