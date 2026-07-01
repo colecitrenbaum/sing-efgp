@@ -27,8 +27,12 @@ _SING = Path(__file__).resolve().parent.parent
 if str(_SING) not in sys.path:
     sys.path.insert(0, str(_SING))
 
-import numpy as np
 import jax
+# fp64 is REQUIRED — the SING block-tridiag + SparseGP hyper Adam step
+# diverge into NaN in fp32 at K·T ≳ a few thousand.  See CLAUDE.md.
+jax.config.update("jax_enable_x64", True)
+
+import numpy as np
 import jax.numpy as jnp
 import jax.random as jr
 
@@ -87,7 +91,7 @@ def simulate_K_trials(K_max, seed=42):
     """Generate K_max independent 2-well trajectories with diverse x0."""
     sigma_fn = lambda x, t: SIGMA * jnp.eye(D)
     rng = np.random.default_rng(seed)
-    x0_K = jnp.asarray(rng.normal(0.0, 1.0, size=(K_max, D)).astype(np.float32))
+    x0_K = jnp.asarray(rng.normal(0.0, 1.0, size=(K_max, D)).astype(np.float64))
 
     xs_K = []
     for k in range(K_max):
@@ -97,7 +101,7 @@ def simulate_K_trials(K_max, seed=42):
         xs_K.append(jnp.clip(xs_k, -3.0, 3.0))
     xs_K = jnp.stack(xs_K, axis=0)                      # (K_max, T, D)
 
-    C_true = rng.standard_normal((N_OBS, D)).astype(np.float32) * 0.5
+    C_true = rng.standard_normal((N_OBS, D)).astype(np.float64) * 0.5
     out_true = dict(C=jnp.asarray(C_true), d=jnp.zeros(N_OBS),
                     R=jnp.full((N_OBS,), 0.05))
     ys_K = jnp.stack([
@@ -459,10 +463,12 @@ def render_K_figure(K_, T, drift_scale,
             ax.quiver(SX, SY, F[..., 0], F[..., 1],
                        color='k', angles='xy', scale_units='xy',
                        scale=scale, width=0.005)
-            # Overlay one trial's path (lightly) for spatial context
+            # Overlay ALL K trial paths so coverage is visible.
             if xs_np is not None and xs_np.shape[0] >= 1:
-                ax.plot(xs_np[0, :, 0], xs_np[0, :, 1],
-                         color='C3', alpha=0.25, linewidth=0.8)
+                for k in range(xs_np.shape[0]):
+                    ax.plot(xs_np[k, :, 0], xs_np[k, :, 1],
+                             color='C3', alpha=min(0.4, 4.0 / xs_np.shape[0]),
+                             linewidth=0.5)
             ax.set_xlim(GX.min(), GX.max())
             ax.set_ylim(GY.min(), GY.max())
             ax.set_aspect('equal')

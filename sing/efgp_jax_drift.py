@@ -159,7 +159,7 @@ def _build_pseudo_cloud(
     X_flat = X_cloud.reshape(-1, D_lat)
     return X_flat
 
-
+##### 
 def compute_mu_r_jax(
     m_src: Array,                     # (N_src, D_lat)
     S_src: Array,                     # (N_src, D_lat, D_lat)
@@ -177,8 +177,9 @@ def compute_mu_r_jax(
     max_cg_iter: int = 2000,    # generous; with Jacobi precond CG usually converges in <50
     nufft_eps: float = 6e-8,
 ) -> Tuple[Array, Array, jp.ToeplitzNDJax]:
-    """Pure-JAX Stein-corrected q(f) update.  Returns (mu_r, X_flat, top).
-
+    """MONTE CARLO VERSION -- Stein-corrected q(f) update.  Returns (mu_r, X_flat, top).
+    All \E_q(x) quantities are calculated using MC samples from q(x). 
+    
     Inputs are pre-flattened across trials and transitions so this
     function is K-agnostic: ``N_src = K * (T-1)`` for K trials of length
     T.  Padded transitions enter with ``weights[i] = 0`` and contribute
@@ -400,6 +401,24 @@ def compute_mu_r_gmix_jax(
         return mu
 
     mu_r = jax.vmap(per_r)(jnp.arange(D_out))
+
+    # Frame conversion: the gmix spreader builds A and the RHS in the
+    # ABSOLUTE frame (basis exp(2πi m·ξ); see _spread_2d's +xcen phase),
+    # so this solve yields mu_r in that frame, i.e.
+    #     mu_r^abs = exp(-2πi ξ·xcen) · mu_r^rel,
+    # whereas compute_mu_r_jax (MC, via nufft1) and the evaluator
+    # drift_moments_jax (nufft2) work in the RELATIVE frame
+    # (basis exp(2πi (x-xcen)·ξ)).  Multiply by exp(+2πi ξ·xcen) so the
+    # returned mu_r is in the relative frame and is a drop-in for the MC
+    # mu_r everywhere (drift_moments_jax, the kernel M-step).  Omitting
+    # this shifts the evaluated drift field by xcen — invisible when
+    # xcen≈0 (every centered synthetic bench) but a real spatial shift on
+    # off-origin data.  The gmix GATHER (drift_moments_gmix_jax) re-applies
+    # exp(-2πi ξ·xcen) so its primitive keeps the absolute-frame contract.
+    xcen_phase = jnp.exp(
+        2j * math.pi
+        * (grid.xis_flat @ grid.xcen.astype(grid.xis_flat.dtype))).astype(cdtype)
+    mu_r = mu_r * xcen_phase[None, :]
     return mu_r, None, top
 
 
@@ -474,16 +493,20 @@ def qf_and_moments_gmix_jax(
     fine_N: int, stencil_r: int,
     cg_tol: float = 1e-5, max_cg_iter: int = 2000,
     nufft_eps: float = 6e-8,
-) -> Tuple[Array, Array, Array, Array]:
+    return_top: bool = False,
+) -> Tuple:
     """Closed-form multi-trial variant of qf_and_moments_jax.
 
     K trials of length T (padded; ``trial_mask`` zeros padded slots).
-    Returns ``(mu_r, Ef, Eff, Edfdx)`` with ``Ef: (K, T, D_out)``,
-    ``Eff: (K, T)``, ``Edfdx: (K, T, D_out, D_lat)``.
+    Returns ``(mu_r, Ef, Eff, Edfdx)`` (and additionally ``top`` if
+    ``return_top``) with ``Ef: (K, T, D_out)``, ``Eff: (K, T)``,
+    ``Edfdx: (K, T, D_out, D_lat)``. ``top`` is the BTTB Toeplitz
+    structure that defines the q(f) precision $A_r$, needed for
+    restoring the q(f)-variance term V(m) via per-eval CG.
     """
     m_src, S_src, d_src, C_src, weights = _flatten_stein(
         ms, Ss, SSs, del_t, trial_mask)
-    mu_r, _, _ = compute_mu_r_gmix_jax(
+    mu_r, _, top = compute_mu_r_gmix_jax(
         m_src, S_src, d_src, C_src, weights, grid,
         sigma_drift_sq=sigma_drift_sq, D_lat=D_lat, D_out=D_out,
         fine_N=fine_N, stencil_r=stencil_r,
@@ -491,6 +514,8 @@ def qf_and_moments_gmix_jax(
     )
     Ef, Eff, Edfdx = drift_moments_jax(
         mu_r, grid, ms, D_lat=D_lat, D_out=D_out, nufft_eps=nufft_eps)
+    if return_top:
+        return mu_r, Ef, Eff, Edfdx, top
     return mu_r, Ef, Eff, Edfdx
 
 
@@ -545,6 +570,86 @@ def drift_moments_jax(
         return Ef_k, Eff_k, Edfdx_k
 
     Ef, Eff, Edfdx = jax.vmap(per_trial)(ms_c)                    # (K, ...)
+    return Ef, Eff, Edfdx
+
+
+def drift_moments_gmix_jax(
+    mu_r: Array,                  # (D_out, M)
+    grid: jp.JaxGridState,
+    ms: Array,                    # (K, T, D_lat)
+    Ss: Array,                    # (K, T, D_lat, D_lat)
+    *,
+    D_lat: int, D_out: int,
+    gather_N: int, stencil_r: int,
+) -> Tuple[Array, Array, Array]:
+    """Gaussian-smoothed drift mean + Jacobian under q(x_i)=N(m_i, S_i).
+
+    Per-source heterogeneous-S analog of :func:`drift_moments_jax`. Each
+    source $(m_i, S_i)$ gets its own Gaussian envelope so the drift
+    moments are evaluated as the *Gaussian-averaged* drift posterior:
+
+      Ef_{r,i}    = E_{q(x_i)}[\\bar f_r(x_i)]
+                  = sum_k mu_{r,k} ws_k exp(2pi i xi_k^T m_i - 2pi^2 xi_k^T S_i xi_k)
+
+      Edfdx_{r,j,i} = E_{q(x_i)}[partial_j bar f_r(x_i)]
+                    = sum_k mu_{r,k} ws_k (2pi i xi_{k,j}) exp(...same envelope)
+
+    Implementation: 1 IFFT (size N×N) of the coefficient grid + per-source
+    Gaussian gather via ``efgp_gmix_gather``. Cost per call:
+    ``O(N_pad^D log N_pad + N_src · stencil^D)``.
+
+    Eff is the linearised value ``||Ef||^2`` (the trace term is absorbed
+    into the gradient by the legacy ``eff_with_grads`` custom_vjp via
+    ``J^T Σ^{-1} J``); reporting the full ``E[bar_f^T bar_f]`` is a
+    separate concern.
+
+    Returns (Ef, Eff, Edfdx) with shapes
+    ``(K, T, D_out)``, ``(K, T)``, ``(K, T, D_out, D_lat)``.
+    """
+    from sing.efgp_gmix_gather import gmix_inverse_nufft_2d
+    cdtype = grid.ws.dtype
+    rdtype = grid.xcen.dtype
+    ws_real_c = grid.ws.real.astype(cdtype)
+    M_per_dim = int(grid.mtot_per_dim[0])
+    h_spec = grid.h_per_dim[0]                                   # JAX scalar OK
+    K_, T_, _ = ms.shape
+    ms_flat = ms.reshape(-1, D_lat).astype(rdtype)
+    Ss_flat = Ss.reshape(-1, D_lat, D_lat).astype(rdtype)
+
+    # Mean coefficient grid (per output dim r): mu_r * ws on the spectral grid.
+    def gather_one(fk_flat):
+        fk_grid = fk_flat.reshape(M_per_dim, M_per_dim)
+        return gmix_inverse_nufft_2d(
+            ms_flat, Ss_flat, fk_grid,
+            xcen=grid.xcen, h_spec=h_spec,
+            M_per_dim=M_per_dim, N=gather_N,
+            stencil_r=stencil_r).real                            # (K*T,)
+
+    # ``mu_r`` is in the RELATIVE frame (see compute_mu_r_gmix_jax's frame
+    # conversion).  The gmix gather primitive expects ABSOLUTE-frame
+    # coefficients (it undoes a +xcen phase internally), so convert back
+    # with exp(-2πi ξ·xcen).  This keeps the gather primitive — and the EM
+    # q(x) update that depends on it — bit-for-bit unchanged.
+    xcen_phase_inv = jnp.exp(
+        -2j * math.pi
+        * (grid.xis_flat @ grid.xcen.astype(grid.xis_flat.dtype))).astype(cdtype)
+    mu_r_abs = mu_r * xcen_phase_inv[None, :]                    # (D_out, M)
+
+    fk_mean = ws_real_c[None, :] * mu_r_abs                      # (D_out, M)
+    Ef_flat = jax.vmap(gather_one)(fk_mean)                      # (D_out, K*T)
+    Ef = Ef_flat.T.reshape(K_, T_, D_out)                        # (K, T, D_out)
+
+    # Jacobian coefficient grids per latent dim j: ws*mu_r * (2πi ξ_j)
+    def jac_for_dim(j):
+        xi_j = grid.xis_flat[:, j].astype(cdtype)
+        fk_j = (2j * math.pi * xi_j)[None, :] * (ws_real_c[None, :] * mu_r_abs)
+        return jax.vmap(gather_one)(fk_j)                        # (D_out, K*T)
+    Edfdx_flat = jax.vmap(jac_for_dim)(jnp.arange(D_lat))        # (D_lat, D_out, K*T)
+    # Reshape to (K, T, D_out, D_lat)
+    Edfdx = jnp.transpose(Edfdx_flat, (2, 1, 0)).reshape(
+        K_, T_, D_out, D_lat)
+
+    Eff = (Ef * Ef).sum(axis=-1)                                 # (K, T)
     return Ef, Eff, Edfdx
 
 

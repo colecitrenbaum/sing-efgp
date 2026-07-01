@@ -1,0 +1,82 @@
+data: K=10, T=500, D=2, T_MAX=8.0, N_OBS=6
+
+=== BASELINE (Approximation A active: V dropped) ===
+  [EFGP / BASELINE] init ℓ=1.5, σ²=1.0; true ℓ=0.6, σ²=1.0
+  [jax] M=1089, mtot_per_dim=(33, 33), pin_grid=True (legacy)
+  [jax] estep_method=gmix  fine_N=256  stencil_r=12  (sigma0_max≈0.316, h_spec0≈0.087)
+[jax] EM  1/30  rho=0.050  latent_rmse=0.596  ℓ=1.500  σ²=1.000
+[jax] EM  2/30  rho=0.072  latent_rmse=0.292  ℓ=1.500  σ²=1.000
+[jax] EM  3/30  rho=0.095  latent_rmse=0.137  ℓ=1.500  σ²=1.000
+[jax] EM  4/30  rho=0.117  latent_rmse=0.076  ℓ=1.500  σ²=1.000
+[jax] EM  5/30  rho=0.140  latent_rmse=0.065  ℓ=1.500  σ²=1.000
+[jax] EM  6/30  rho=0.162  latent_rmse=0.064  ℓ=1.500  σ²=1.000
+[jax] EM  7/30  rho=0.184  latent_rmse=0.064  ℓ=1.500  σ²=1.000
+[jax] EM  8/30  rho=0.207  latent_rmse=0.064  ℓ=1.500  σ²=1.000
+[jax] EM  9/30  rho=0.229  latent_rmse=0.064  ℓ=1.441  σ²=1.041
+[jax] EM 10/30  rho=0.252  latent_rmse=0.064  ℓ=1.385  σ²=1.083
+[jax] EM 11/30  rho=0.274  latent_rmse=0.064  ℓ=1.330  σ²=1.128
+[jax] EM 12/30  rho=0.297  latent_rmse=0.064  ℓ=1.278  σ²=1.174
+[jax] EM 13/30  rho=0.319  latent_rmse=0.064  ℓ=1.228  σ²=1.221
+[jax] EM 14/30  rho=0.341  latent_rmse=0.064  ℓ=1.180  σ²=1.271
+[jax] EM 15/30  rho=0.364  latent_rmse=0.064  ℓ=1.134  σ²=1.323
+[jax] EM 16/30  rho=0.386  latent_rmse=0.064  ℓ=1.089  σ²=1.377
+[jax] EM 17/30  rho=0.409  latent_rmse=0.064  ℓ=1.047  σ²=1.433
+[jax] EM 18/30  rho=0.431  latent_rmse=0.064  ℓ=1.006  σ²=1.491
+[jax] EM 19/30  rho=0.453  latent_rmse=0.064  ℓ=0.966  σ²=1.550
+[jax] EM 20/30  rho=0.476  latent_rmse=0.064  ℓ=0.929  σ²=1.590
+[jax] EM 21/30  rho=0.498  latent_rmse=0.064  ℓ=0.892  σ²=1.527
+[jax] EM 22/30  rho=0.521  latent_rmse=0.064  ℓ=0.858  σ²=1.467
+[jax] EM 23/30  rho=0.543  latent_rmse=0.064  ℓ=0.824  σ²=1.410
+[jax] EM 24/30  rho=0.566  latent_rmse=0.064  ℓ=0.792  σ²=1.354
+[jax] EM 25/30  rho=0.588  latent_rmse=0.064  ℓ=0.761  σ²=1.301
+[jax] EM 26/30  rho=0.610  latent_rmse=0.064  ℓ=0.731  σ²=1.250
+[jax] EM 27/30  rho=0.633  latent_rmse=0.064  ℓ=0.703  σ²=1.201
+[jax] EM 28/30  rho=0.655  latent_rmse=0.064  ℓ=0.676  σ²=1.154
+[jax] EM 29/30  rho=0.678  latent_rmse=0.064  ℓ=0.653  σ²=1.108
+[jax] EM 30/30  rho=0.700  latent_rmse=0.064  ℓ=0.650  σ²=1.065
+
+=== restore_qf_variance='taylor' (V via local-quadratic Taylor) ===
+  [EFGP / restore_qf_variance='taylor'] init ℓ=1.5, σ²=1.0; true ℓ=0.6, σ²=1.0
+  [jax] M=1089, mtot_per_dim=(33, 33), pin_grid=True (legacy)
+  [jax] estep_method=gmix  fine_N=256  stencil_r=12  (sigma0_max≈0.316, h_spec0≈0.087)
+[jax] EM  1/30  rho=0.050  latent_rmse=0.600  ℓ=1.500  σ²=1.000
+[jax] EM  2/30  rho=0.072  latent_rmse=0.295  ℓ=1.500  σ²=1.000
+[jax] EM  3/30  rho=0.095  latent_rmse=0.138  ℓ=1.500  σ²=1.000
+[jax] EM  4/30  rho=0.117  latent_rmse=0.076  ℓ=1.500  σ²=1.000
+[jax] EM  5/30  rho=0.140  latent_rmse=0.065  ℓ=1.500  σ²=1.000
+[jax] EM  6/30  rho=0.162  latent_rmse=0.064  ℓ=1.500  σ²=1.000
+[jax] EM  7/30  rho=0.184  latent_rmse=0.064  ℓ=1.500  σ²=1.000
+[jax] EM  8/30  rho=0.207  latent_rmse=0.064  ℓ=1.500  σ²=1.000
+[jax] EM  9/30  rho=0.229  latent_rmse=0.064  ℓ=1.441  σ²=1.041
+[jax] EM 10/30  rho=0.252  latent_rmse=0.064  ℓ=1.385  σ²=1.083
+[jax] EM 11/30  rho=0.274  latent_rmse=0.064  ℓ=1.330  σ²=1.128
+[jax] EM 12/30  rho=0.297  latent_rmse=0.064  ℓ=1.278  σ²=1.174
+[jax] EM 13/30  rho=0.319  latent_rmse=0.064  ℓ=1.228  σ²=1.221
+[jax] EM 14/30  rho=0.341  latent_rmse=0.064  ℓ=1.180  σ²=1.271
+[jax] EM 15/30  rho=0.364  latent_rmse=0.064  ℓ=1.134  σ²=1.323
+[jax] EM 16/30  rho=0.386  latent_rmse=0.064  ℓ=1.089  σ²=1.377
+[jax] EM 17/30  rho=0.409  latent_rmse=0.064  ℓ=1.047  σ²=1.433
+[jax] EM 18/30  rho=0.431  latent_rmse=0.064  ℓ=1.006  σ²=1.491
+[jax] EM 19/30  rho=0.453  latent_rmse=0.064  ℓ=0.966  σ²=1.550
+[jax] EM 20/30  rho=0.476  latent_rmse=0.064  ℓ=0.929  σ²=1.591
+[jax] EM 21/30  rho=0.498  latent_rmse=0.064  ℓ=0.892  σ²=1.529
+[jax] EM 22/30  rho=0.521  latent_rmse=0.064  ℓ=0.858  σ²=1.468
+[jax] EM 23/30  rho=0.543  latent_rmse=0.064  ℓ=0.824  σ²=1.411
+[jax] EM 24/30  rho=0.566  latent_rmse=0.064  ℓ=0.792  σ²=1.355
+[jax] EM 25/30  rho=0.588  latent_rmse=0.064  ℓ=0.761  σ²=1.302
+[jax] EM 26/30  rho=0.610  latent_rmse=0.064  ℓ=0.731  σ²=1.251
+[jax] EM 27/30  rho=0.633  latent_rmse=0.064  ℓ=0.703  σ²=1.202
+[jax] EM 28/30  rho=0.655  latent_rmse=0.064  ℓ=0.676  σ²=1.155
+[jax] EM 29/30  rho=0.678  latent_rmse=0.064  ℓ=0.653  σ²=1.109
+[jax] EM 30/30  rho=0.700  latent_rmse=0.064  ℓ=0.649  σ²=1.066
+
+evaluating drift at true latent paths...
+
+--- summary ---
+  wall:  baseline = 63.4s   restore_V = 95.0s   (1.50x)
+  final ℓ:    baseline = 0.6499   restore_V = 0.6490   (true = 0.6)
+  final σ²:   baseline = 1.0651   restore_V = 1.0660   (true = 1.0)
+  drift RMSE: baseline = 0.2670   restore_V = 0.2672
+
+Saved plot: /Users/colecitrenbaum/Documents/GPs/sing/demos/_bench_restore_A_out/learning_curves.png
+Saved history: /Users/colecitrenbaum/Documents/GPs/sing/demos/_bench_restore_A_out/history.npz

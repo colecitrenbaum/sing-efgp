@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import math
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -34,6 +35,7 @@ from sing.utils.sing_helpers import (
     InitParams, update_init_params,
 )
 from sing.sing import nat_grad_likelihood, nat_grad_transition
+from sing.inputs import InputSignals
 
 from sing.efgp_emissions import update_emissions_gaussian
 
@@ -43,6 +45,16 @@ from functools import partial
 import sing.efgp_jax_primitives as jp
 import sing.efgp_jax_drift as jpd
 from sing.efgp_jax_drift import FrozenEFGPDrift as _FrozenEFGPDrift
+from sing.efgp_gmix_qx_moments import (
+    precompute_aux as _gmix_precompute_aux,
+)
+from sing.efgp_qx_v_hutch import (
+    FrozenEFGPDriftWithVHutch as _FrozenEFGPDriftWithVHutch,
+    precompute_omega_per_r as _precompute_omega_per_r,
+    precompute_V_and_grad_E_V_per_t as _precompute_V_and_grad_E_V_per_t,
+    precompute_V_and_grad_E_V_per_t_hetS as _precompute_V_and_grad_E_V_per_t_hetS,
+)
+from sing.efgp_gmix_spreader import stencil_radius_for as _stencil_radius_for
 
 
 @dataclass
@@ -53,6 +65,16 @@ class EFGPEMHistory:
     lengthscale: List[float] = field(default_factory=list)
     variance: List[float] = field(default_factory=list)
     mstep_loss: List[float] = field(default_factory=list)
+    # Final learned (or fixed) input-effect matrix B, shape (D, I), or None
+    # when no inputs were supplied.
+    input_effect: Optional[np.ndarray] = None
+    # The EM's ACTUAL converged q(f): the final spectral grid and the
+    # per-output Fourier coefficients ``mu_r`` computed on it.  Use these to
+    # evaluate the posterior drift mean for plotting/analysis — they ARE the
+    # drift the EM used, so plotting them needs no re-derivation on a
+    # possibly-mismatched grid.  See ``posterior_drift_mean``.
+    final_grid: Optional[object] = None
+    final_mu_r: Optional[object] = None
 
 
 # ============================================================================
@@ -63,7 +85,15 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
                                 S_marginal, n_estep_iters,
                                 qf_cg_tol, qf_max_cg_iter, qf_nufft_eps,
                                 estep_method='mc',
-                                gmix_fine_N=None, gmix_stencil_r=None):
+                                gmix_fine_N=None, gmix_stencil_r=None,
+                                qx_moments_method='gmix_batched',
+                                restore_qf_variance='none',
+                                qx_v_cg_tol: float = 1e-4,
+                                qx_v_max_cg_iter: int = 200,
+                                qx_v_n_probes: int = 4,
+                                qx_v_gather_N: int = 64,
+                                qx_v_gather_stencil_r: int = 8,
+                                inputs=None):
     """Compile a function that runs ``n_estep_iters`` inner E-step iterations
     via ``lax.scan``, all JAX, no torch.
 
@@ -76,9 +106,20 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
     each new ``K`` triggers a new JIT artifact (one per K, per
     mtot_per_dim).  The inner SING natural-grad operates per-trial via
     ``vmap``; the q(f) update flattens sources across trials.
+
+    Inputs: ``inputs`` (per-trial known input signals v(t)) is closed over
+    here as a constant ``(K, T, I)`` array — it never changes across EM
+    iters.  The input-effect matrix ``input_effect`` ``(D, I)`` is instead a
+    RUNTIME argument to the returned scan functions (it is updated each
+    M-step), so refreshing B does NOT trigger a JIT recompile.  When no
+    inputs are supplied, a zero ``(K, T, 1)`` array is used so the
+    transition term reduces exactly to the no-inputs case.
     """
-    inputs = jnp.zeros((T, 1))
-    input_effect = jnp.zeros((D, 1))
+    if inputs is None:
+        inputs = jnp.zeros((K, T, 1))
+    else:
+        inputs = jnp.asarray(inputs)
+    n_inputs = int(inputs.shape[-1])
     del_t = (t_grid[1:] - t_grid[:-1])
     trial_mask_b = jnp.broadcast_to(jnp.asarray(trial_mask, dtype=bool), (K, T))
 
@@ -86,7 +127,7 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
 
     @partial(jax.jit, static_argnames=('mtot_per_dim',))
     def scan_estep_inner_refresh(natural_params, init_params, ys_obs, t_mask,
-                                 output_params, key, rho,
+                                 output_params, key, rho, input_effect,
                                  xis_flat, ws, h_per_dim, xcen, mtot_per_dim):
         # Reconstruct the JaxGridState pytree inside the trace.  M and d
         # are derived from xis_flat shape, so they are static at trace time.
@@ -95,6 +136,40 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
             mtot_per_dim=mtot_per_dim, xcen=xcen,
             M=int(xis_flat.shape[0]), d=int(xis_flat.shape[1]),
         )
+
+        # ---- Outer-iter snapshot for V-Hutch restoration of Approximation A.
+        # Hutchinson estimate of E_{q(x_i)}[V_r(x_i)] via cross-correlation
+        # on the spectral-difference grid (eq. 7 in efgp_estep.tex §6).
+        # Production path; see docstring of fit_efgp_sing_jax.
+        # Two restoration modes:
+        #   'hutch'      = homogeneous-S baseline (S_i replaced by trajectory
+        #                  mean S_homo); precompute (V, ∇V) once per outer iter.
+        #   'hutch_hetS' = heterogeneous-S via gmix-gather primitive;
+        #                  precompute (V, ∇V) every inner iter. ~22% wall
+        #                  overhead at K=10/T=500 with n_sigma=2.
+        if (qx_moments_method in ('linearised_shim', 'gmix_batched')
+                and restore_qf_variance in ('hutch', 'hutch_hetS')
+                and estep_method == 'gmix'):
+            key_v0, key = jr.split(key, 2)
+            mp_b0, _ = vmap(natural_to_marginal_params)(natural_params, trial_mask_b)
+            ms0 = mp_b0['m']; Ss0 = mp_b0['S']; SSs0 = mp_b0['SS']
+            _, _, _, _, top0 = jpd.qf_and_moments_gmix_jax(
+                ms0, Ss0, SSs0, del_t, trial_mask_b, grid,
+                sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                fine_N=gmix_fine_N, stencil_r=gmix_stencil_r,
+                cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                nufft_eps=qf_nufft_eps, return_top=True)
+            omega_aux_outer = _precompute_omega_per_r(
+                None, grid, top0, key_v0,
+                D_out=D, P=qx_v_n_probes,
+                cg_tol=qx_v_cg_tol, max_cg_iter=qx_v_max_cg_iter)
+        elif restore_qf_variance not in ('none', 'hutch', 'hutch_hetS'):
+            raise ValueError(
+                f"unknown restore_qf_variance={restore_qf_variance!r}; "
+                f"production options: 'none' (drop V), 'hutch' (homogeneous-S),"
+                f" 'hutch_hetS' (heterogeneous-S via gmix-gather).")
+        else:
+            omega_aux_outer = None
 
         def one_iter(carry, key_iter):
             nat_p = carry
@@ -122,20 +197,87 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
                 )
             else:
                 raise ValueError(f"unknown estep_method {estep_method!r}")
-            # Per-trial frozen drift: pytree with (K, T, ...) leaves; vmap
-            # below slices the leading axis so each lambda invocation sees a
-            # logical single-trial FrozenEFGPDrift.
-            frozen_K = _FrozenEFGPDrift(
-                latent_dim=D, t_grid=t_grid,
-                Ef_per_t=Ef, Eff_per_t=Eff, Edfdx_per_t=Edfdx)
+            # For 'gmix_batched' (DEFAULT), override (Ef, Eff, Edfdx)
+            # computed at the point estimates m_t with their Gaussian-
+            # smoothed analogs under q(x_t)=N(m_t, S_t) via the gmix-
+            # gather primitive. Same custom_vjp shim downstream — only
+            # the input moments change. One batched gather call
+            # (1 IFFT + per-source stencil) replaces what would otherwise
+            # be a per-source dense matvec.
+            if qx_moments_method == 'gmix_batched':
+                Ef, Eff, Edfdx = jpd.drift_moments_gmix_jax(
+                    mu_r, grid, ms, Ss, D_lat=D, D_out=D,
+                    gather_N=qx_v_gather_N,
+                    stencil_r=qx_v_gather_stencil_r)
+            # Build the SDE shim that the SING natural-grad loop calls
+            # into. Two options:
+            #   'gmix_batched'   (DEFAULT): Gaussian-averaged Ef/Edfdx
+            #     under q(x_i)=N(m,S) via batched gmix-gather, then
+            #     linearised B' custom_vjp gradient injection. Smoothing
+            #     ~5% rel err at qx_v_gather_n_sigma=2 (production
+            #     default); negligible at n_sigma=4.
+            #   'linearised_shim' (lighter, no smoothing): pre-evaluated
+            #     drift moments at the CURRENT POINT m_i + same
+            #     custom_vjp shim. Cheaper (no gather) but loses the
+            #     Gaussian-smoothing first-order correction. Both modes
+            #     apply the linearised B' Taylor truncation to the
+            #     gradient (see efgp_estep.tex §7).
             mean_params_b, _ = vmap(natural_to_mean_params)(nat_p, trial_mask_b)
             lik_g = vmap(lambda mp_, tm_, ys_: nat_grad_likelihood(
                 mp_, tm_, ys_, lik, output_params))(mean_params_b, t_mask, ys_obs)
-            tr_g = vmap(lambda k, fr_, mp_, tm_, ip_: nat_grad_transition(
-                k, fr_, None, {}, tm_, ip_, t_grid, mp_,
-                inputs, input_effect, sigma))(jr.split(key_grad, K),
-                                              frozen_K, mean_params_b,
-                                              trial_mask_b, init_params)
+            if qx_moments_method in ('linearised_shim', 'gmix_batched'):
+                if restore_qf_variance in ('hutch', 'hutch_hetS'):
+                    # 'hutch' (homogeneous-S): ONE batched Type-2 NUFFT
+                    # + AD-driven adjoint precomputes (V, ∇V) at all
+                    # sources, sharing a folded ω·env coefficient grid.
+                    # 'hutch_hetS' (heterogeneous-S): per-source
+                    # envelope via gmix-gather (1 IFFT + per-source
+                    # Gaussian stencil read). Same custom_vjp shim.
+                    if restore_qf_variance == 'hutch':
+                        S_homo = Ss.reshape(-1, D, D).mean(axis=0)
+                        V_per_kt, gV_per_kt = (
+                            _precompute_V_and_grad_E_V_per_t(
+                                omega_aux_outer, ms, S_homo, grid,
+                                nufft_eps=qf_nufft_eps))
+                    else:
+                        # gather_N + stencil_r are static, picked at
+                        # startup based on V0 (worst-case sigma).
+                        V_per_kt, gV_per_kt = (
+                            _precompute_V_and_grad_E_V_per_t_hetS(
+                                omega_aux_outer, ms, Ss, grid,
+                                gather_N=qx_v_gather_N,
+                                stencil_r=qx_v_gather_stencil_r))
+                    def _grad_one_trial_hutch(k_key, mp_, tm_, ip_,
+                                               Ef_k, Eff_k, Edf_k,
+                                               V_k, gV_k, inp_):
+                        shim = _FrozenEFGPDriftWithVHutch(
+                            latent_dim=D, t_grid=t_grid,
+                            Ef_per_t=Ef_k, Eff_per_t=Eff_k,
+                            Edfdx_per_t=Edf_k,
+                            V_per_t=V_k, grad_V_per_t=gV_k,
+                            D_out=D)
+                        return nat_grad_transition(
+                            k_key, shim, None, {}, tm_, ip_, t_grid, mp_,
+                            inp_, input_effect, sigma)
+                    tr_g = vmap(_grad_one_trial_hutch,
+                                 in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0))(
+                        jr.split(key_grad, K), mean_params_b,
+                        trial_mask_b, init_params,
+                        Ef, Eff, Edfdx, V_per_kt, gV_per_kt, inputs)
+                else:
+                    # restore_qf_variance == 'none': drop V (Approx A baseline)
+                    frozen_K = _FrozenEFGPDrift(
+                        latent_dim=D, t_grid=t_grid,
+                        Ef_per_t=Ef, Eff_per_t=Eff, Edfdx_per_t=Edfdx)
+                    tr_g = vmap(lambda k, fr_, mp_, tm_, ip_, inp_: nat_grad_transition(
+                        k, fr_, None, {}, tm_, ip_, t_grid, mp_,
+                        inp_, input_effect, sigma))(jr.split(key_grad, K),
+                                                    frozen_K, mean_params_b,
+                                                    trial_mask_b, init_params,
+                                                    inputs)
+            else:
+                raise ValueError(f"unknown qx_moments_method "
+                                 f"{qx_moments_method!r}")
             new_nat_p = {
                 'J': (1 - rho) * nat_p['J']
                      + rho * (lik_g['J'] + tr_g['J']),
@@ -149,11 +291,18 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
         final_nat_p, _ = jax.lax.scan(one_iter, natural_params, keys)
         return final_nat_p
 
-    @jax.jit
+    @partial(jax.jit, static_argnames=('mtot_per_dim',))
     def scan_estep_frozen_qf(natural_params, init_params, ys_obs, t_mask,
-                             output_params, key, rho,
-                             Ef, Eff, Edfdx):
-        frozen_K = _FrozenEFGPDrift(
+                             output_params, key, rho, input_effect,
+                             Ef, Eff, Edfdx,
+                             mu_r_g=None, rho_summed=None, delta_flat=None,
+                             xis_flat=None, ws_grid=None,
+                             h_per_dim=None, xcen=None, *,
+                             mtot_per_dim=None):
+        # Frozen-q(f) inner scan uses the legacy custom_vjp shim with
+        # whatever (Ef, Eff, Edfdx) was precomputed upstream (point-eval
+        # for 'linearised_shim'; gmix-smoothed for 'gmix_batched').
+        shim = _FrozenEFGPDrift(
             latent_dim=D, t_grid=t_grid,
             Ef_per_t=Ef, Eff_per_t=Eff, Edfdx_per_t=Edfdx)
 
@@ -162,11 +311,11 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
             mean_params_b, _ = vmap(natural_to_mean_params)(nat_p, trial_mask_b)
             lik_g = vmap(lambda mp_, tm_, ys_: nat_grad_likelihood(
                 mp_, tm_, ys_, lik, output_params))(mean_params_b, t_mask, ys_obs)
-            tr_g = vmap(lambda k, fr_, mp_, tm_, ip_: nat_grad_transition(
-                k, fr_, None, {}, tm_, ip_, t_grid, mp_,
-                inputs, input_effect, sigma))(jr.split(key_grad, K),
-                                              frozen_K, mean_params_b,
-                                              trial_mask_b, init_params)
+            tr_g = vmap(lambda k, fr_, mp_, tm_, ip_, inp_: nat_grad_transition(
+                    k, fr_, None, {}, tm_, ip_, t_grid, mp_,
+                    inp_, input_effect, sigma))(jr.split(key_grad, K),
+                                            shim, mean_params_b,
+                                            trial_mask_b, init_params, inputs)
             new_nat_p = {
                 'J': (1 - rho) * nat_p['J']
                      + rho * (lik_g['J'] + tr_g['J']),
@@ -181,6 +330,58 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
         return final_nat_p
 
     return scan_estep_inner_refresh, scan_estep_frozen_qf, nat_to_marg_b
+
+
+def _update_input_effect_efgp(ms, Ef, inputs, trial_mask, del_t, jitter=1e-4):
+    """Closed-form least-squares update of the input-effect matrix ``B``.
+
+    Multi-trial analogue of ``InputSignals.update_input_effect``
+    (``sing/inputs.py``), but reusing the per-transition drift expectation
+    ``Ef`` that EFGP already computes instead of calling ``fn.f``.  Solves
+
+        B = (Σ_{k,t} (Δm_{k,t} − Δt_t·E[f]_{k,t}) v_{k,t}ᵀ)
+            (Σ_{k,t} Δt_t v_{k,t} v_{k,t}ᵀ)⁻¹
+
+    over all active transitions.
+
+    Shapes: ``ms`` (K, T, D), ``inputs`` (K, T, I), ``trial_mask`` (K, T),
+    ``del_t`` (T-1,).  ``Ef`` may be either (K, T-1, D) (already per
+    transition) or (K, T, D) (drift at every timestep, as returned by
+    ``qf_and_moments_*``); in the latter case the last column is dropped so
+    it aligns with the T-1 transitions.  Returns ``B`` of shape (D, I).
+    """
+    n_trans = ms.shape[1] - 1
+    Ef = Ef[:, :n_trans]                                   # (K, T-1, D)
+    trans = (trial_mask[:, :-1] & trial_mask[:, 1:]).astype(ms.dtype)  # (K, T-1)
+    ms_diff = ms[:, 1:] - ms[:, :-1]                       # (K, T-1, D)
+    resid = ms_diff - del_t[None, :, None] * Ef            # (K, T-1, D)
+    v = inputs[:, :-1]                                     # (K, T-1, I)
+    num = jnp.einsum('ktd,kti,kt->di', resid, v, trans)   # (D, I)
+    den = jnp.einsum('kti,ktj,kt,t->ij', v, v, trans, del_t)  # (I, I)
+    n_inputs = v.shape[-1]
+    B = jnp.linalg.solve(den + jitter * jnp.eye(n_inputs), num.T).T
+    return B
+
+
+def posterior_drift_mean(history, X_eval):
+    """Posterior drift mean E[f(x)] at points ``X_eval`` (M, D), evaluated
+    from the EM's ACTUAL converged q(f) (``history.final_grid`` +
+    ``history.final_mu_r``).
+
+    This is the drift the EM used — no grid re-derivation, so it is free of
+    the spurious-mean artifact that arises when q(f) is rebuilt on a
+    different spectral grid than the fit used.  Returns ``(M, D_out)``.
+    """
+    grid = history.final_grid
+    mu_r = history.final_mu_r
+    if grid is None or mu_r is None:
+        raise ValueError("history has no final q(f); fit with the current "
+                         "fit_efgp_sing_jax to populate final_grid/final_mu_r.")
+    D_out = int(mu_r.shape[0])
+    Ef, _, _ = jpd.drift_moments_jax(
+        jnp.asarray(mu_r), grid, jnp.asarray(X_eval)[None],
+        D_lat=int(grid.d), D_out=D_out)
+    return np.asarray(Ef[0])
 
 
 def fit_efgp_sing_jax(
@@ -276,6 +477,52 @@ def fit_efgp_sing_jax(
     gmix_fine_N: Optional[int] = None,
     gmix_stencil_r: Optional[int] = None,
     gmix_n_sigma: float = 1.5,
+    # q(x)-side drift moments + gradient method:
+    #   'gmix_batched' (DEFAULT): Gaussian-averaged Ef/Edfdx under
+    #     q(x_i)=N(m,S) precomputed in ONE batched gmix-gather call per
+    #     inner iter (1 IFFT + per-source stencil). Injected via the
+    #     FrozenEFGPDrift custom_vjp shim (linearised B' gradient
+    #     structure). Smoothing controlled by qx_v_gather_n_sigma
+    #     (default 2.0 → ~5% rel err in Ef/Edfdx, absorbed by ρ-damping).
+    #   'linearised_shim': drift moments evaluated at the CURRENT POINT
+    #     m_i (no Gaussian smoothing under q(x_t)) via drift_moments_jax.
+    #     Same custom_vjp gradient structure. Cheaper (no gather) but
+    #     misses the first-order Gaussian-averaging correction in the
+    #     base point. See efgp_estep.tex §7 for the comparison.
+    qx_moments_method: str = 'gmix_batched',
+    # Restore the q(f)-variance V(m) = phi(m)^* A_r^{-1} phi(m) (Approx
+    # A) in compute_neg_CE_single's Eff. Three options:
+    #   'none'       (DEFAULT): drop V (Approximation A baseline).
+    #     Justified by the structural argument in efgp_estep.tex §6 —
+    #     for SDE-recovery with diverse ICs and ergodic mixing, ∇V ≈ 0
+    #     at every interior m_i. Diagnostic at K=10/T=500 confirmed
+    #     ‖∇V‖ ~ 1e-5 · ‖legacy ∂Eff/∂m‖ per transition, washed out by
+    #     ρ-damping; the wiring works (verified) but the signal is just
+    #     intrinsically tiny on this problem class.
+    #   'hutch'      (opt-in): batched Hutchinson + NUFFT-2 estimate
+    #     of E_{q(x_i)}[V_r(x_i)] under homogeneous-S baseline (S_i
+    #     replaced by trajectory mean). ~11% wall overhead at K=10/T=500.
+    #     Use when the structural argument is suspect: anisotropic source
+    #     coverage, sources clustered in a sub-region, sharp turns near
+    #     the data-domain boundary, or cold-start before q(x) localises.
+    #   'hutch_hetS' (opt-in, heterogeneous-S): per-source S_i envelope
+    #     via the gmix-gather primitive. ~15% wall overhead. Use when
+    #     S_i varies substantially across t (early/late time + steady
+    #     state, sharp transitions).
+    # 'hutch'/'hutch_hetS' need qx_moments_method in ('linearised_shim',
+    # 'gmix_batched') + estep_method='gmix'.
+    restore_qf_variance: str = 'none',
+    qx_v_cg_tol: float = 1e-4,
+    qx_v_max_cg_iter: int = 200,
+    qx_v_n_probes: int = 4,
+    # gmix-gather precision controls for 'hutch_hetS' (heterogeneous-S
+    # V restoration). Both static (passed as JIT-static args). Picked
+    # automatically from V0 if None: gather_N = next pow2 of 2*M_per_dim;
+    # stencil_r = ceil(qx_v_gather_n_sigma * sigma0_max / h_grid_gather).
+    # n_sigma=2 ⇒ ~5% rel err (recommended for EM); n_sigma=4 ⇒ ~1e-5.
+    qx_v_gather_N: Optional[int] = None,
+    qx_v_gather_stencil_r: Optional[int] = None,
+    qx_v_gather_n_sigma: float = 2.0,
     # If True, recompute stencil_r ONCE at iter `kernel_warmup_iters` based
     # on the current Σ.  This is mathematically a tighter stencil but
     # costs one JIT recompile (~10-15 s); empirically the savings (smaller
@@ -289,6 +536,23 @@ def fit_efgp_sing_jax(
     # final-stage refinement at tighter eps_grid).  Defaults to the
     # diffusion-only Brownian-chain init.
     init_natural_params: Optional[NaturalParams] = None,
+    # Inputs / input-effect (model: dx = (f(x) + B v(t)) dt + dW).
+    #   input_signals: an InputSignals carrying v of shape (K, T, I), or
+    #     None (no inputs — the transition reduces exactly to the f-only
+    #     case, fully back-compatible).
+    #   learn_input_effect: if True, update B each M-step with the
+    #     closed-form least-squares solution
+    #         B = (Σ (Δm − Δt·E[f]) vᵀ)(Σ Δt v vᵀ)⁻¹
+    #     reusing the per-t drift expectation E[f] EFGP already computes.
+    #     If False and input_signals is given, B stays at input_effect_init
+    #     (a fixed, known input effect).
+    #   input_effect_init: optional (D, I) starting B (defaults to zeros).
+    #   input_effect_warmup_iters: delay B updates until q(x) sharpens
+    #     (mirrors emission_warmup_iters).
+    input_signals=None,
+    learn_input_effect: bool = False,
+    input_effect_init: Optional[jnp.ndarray] = None,
+    input_effect_warmup_iters: int = 8,
 ) -> Tuple[MarginalParams, NaturalParams, Dict[str, jnp.ndarray],
            InitParams, EFGPEMHistory]:
     """Fully JAX-native fit: inner E-step is ``lax.scan``'d inside ``jit``.
@@ -309,6 +573,28 @@ def fit_efgp_sing_jax(
     n_trials, T, N = ys_obs.shape
     D = latent_dim
     trial_mask = jnp.ones((n_trials, T), dtype=bool)
+
+    # ---- Inputs / input-effect setup ----
+    # The transition cross-entropy adds B·v(t) additively (see
+    # sing.utils.sing_helpers.compute_neg_CE_single); the EFGP drift shim is
+    # unaffected.  ``inputs`` (K, T, I) is closed into the E-step scan as a
+    # constant; ``input_effect`` (D, I) is threaded as a runtime arg so its
+    # M-step update never triggers a JIT recompile.
+    use_inputs = input_signals is not None
+    if use_inputs:
+        inputs_KTI = jnp.asarray(input_signals.v)
+        if inputs_KTI.ndim == 2:                       # (T, I) -> (K, T, I)
+            inputs_KTI = jnp.broadcast_to(
+                inputs_KTI[None], (n_trials,) + inputs_KTI.shape)
+        n_inputs = int(inputs_KTI.shape[-1])
+        if input_effect_init is not None:
+            input_effect = jnp.asarray(input_effect_init)
+        else:
+            input_effect = jnp.zeros((D, n_inputs))
+    else:
+        inputs_KTI = None
+        n_inputs = 1
+        input_effect = jnp.zeros((D, 1))
 
     ls = float(lengthscale)
     var = float(variance)
@@ -367,6 +653,11 @@ def fit_efgp_sing_jax(
     if estep_method not in ('mc', 'gmix'):
         raise ValueError(f"estep_method must be 'mc' or 'gmix', "
                          f"got {estep_method!r}")
+    # gmix-gather params for hutch_hetS — actual values may be patched
+    # below once the spectral grid + sigma0_max are known. Pass safe
+    # defaults here so 'none'/'hutch' modes don't see uninitialised
+    # values; the scan body only reads them when restore_qf_variance ==
+    # 'hutch_hetS', so the values are dead code in other modes.
     _est_kw = dict(
         K=n_trials, D=D, T=T, t_grid=t_grid, trial_mask=trial_mask,
         lik=likelihood, sigma=sigma,
@@ -375,6 +666,15 @@ def fit_efgp_sing_jax(
         qf_cg_tol=qf_cg_tol, qf_max_cg_iter=qf_max_cg_iter,
         qf_nufft_eps=qf_nufft_eps,
         estep_method=estep_method,
+        qx_moments_method=qx_moments_method,
+        restore_qf_variance=restore_qf_variance,
+        qx_v_cg_tol=qx_v_cg_tol,
+        qx_v_max_cg_iter=qx_v_max_cg_iter,
+        qx_v_n_probes=qx_v_n_probes,
+        qx_v_gather_N=qx_v_gather_N if qx_v_gather_N is not None else 64,
+        qx_v_gather_stencil_r=(qx_v_gather_stencil_r
+                                  if qx_v_gather_stencil_r is not None else 8),
+        inputs=inputs_KTI,
     )
 
     def _make_grid(ls_, var_, eps_):
@@ -483,6 +783,39 @@ def fit_efgp_sing_jax(
         _est_kw['gmix_fine_N'] = int(gmix_fine_N)
         _est_kw['gmix_stencil_r'] = int(gmix_stencil_r)
 
+    # Pick gmix-gather params for any path that uses the gather:
+    # 'restore_qf_variance == hutch_hetS' (V-restoration heterogeneous-S)
+    # OR 'qx_moments_method == gmix_batched' (smoothed Ef/Edfdx via gather).
+    # Both use the same primitive on the spectral grid → same params.
+    if (restore_qf_variance == 'hutch_hetS'
+            or qx_moments_method == 'gmix_batched'):
+        # For gmix_batched, the gather is on the SPECTRAL grid (M_per_dim
+        # per dim); for hutch_hetS, on the SPECTRAL-DIFFERENCE grid
+        # (2*M_per_dim per dim). Use the larger of the two.
+        m_diff = 2 * int(grid.mtot_per_dim[0])
+        # gather_N: next pow2 of m_diff (zero-pad for the IFFT).
+        gather_N_eff = (qx_v_gather_N if qx_v_gather_N is not None
+                          else max(64, 1 << (m_diff - 1).bit_length()))
+        if qx_v_gather_stencil_r is not None:
+            gather_r_eff = int(qx_v_gather_stencil_r)
+        else:
+            # h_grid for the gather = 1 / (gather_N * h_spec)
+            h_grid_gather = 1.0 / (gather_N_eff * float(grid.h_per_dim[0]))
+            gather_r_eff = int(math.ceil(
+                qx_v_gather_n_sigma * sigma0_max / h_grid_gather))
+            gather_r_eff = max(2, gather_r_eff)
+        if verbose:
+            users = []
+            if restore_qf_variance == 'hutch_hetS':
+                users.append('hutch_hetS')
+            if qx_moments_method == 'gmix_batched':
+                users.append('gmix_batched')
+            print(f"  [jax] {'+'.join(users)}  gather_N={gather_N_eff}  "
+                  f"stencil_r={gather_r_eff}  "
+                  f"(n_sigma={qx_v_gather_n_sigma}, sigma0_max≈{sigma0_max:.3f})")
+        _est_kw['qx_v_gather_N'] = int(gather_N_eff)
+        _est_kw['qx_v_gather_stencil_r'] = int(gather_r_eff)
+
     scan_estep_inner_refresh, scan_estep_frozen_qf, _ = \
         _build_jit_estep_scan_jax(**_est_kw)
 
@@ -537,7 +870,7 @@ def fit_efgp_sing_jax(
             natural_params = scan_estep_inner_refresh(
                 natural_params, init_params,
                 ys_obs, t_mask, output_params,
-                em_key, rho_jax,
+                em_key, rho_jax, input_effect,
                 grid.xis_flat, grid.ws,
                 grid.h_per_dim, grid.xcen,
                 mtot_per_dim=grid.mtot_per_dim)
@@ -549,7 +882,7 @@ def fit_efgp_sing_jax(
             qf_key, scan_key = jr.split(em_key, 2)
             del_t = t_grid[1:] - t_grid[:-1]
             if estep_method == 'mc':
-                _, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_jax(
+                mu_r_prev, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_jax(
                     ms_prev, Ss_prev, SSs_prev, del_t, trial_mask, grid, qf_key,
                     sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
                     D_lat=D, D_out=D,
@@ -557,7 +890,7 @@ def fit_efgp_sing_jax(
                     nufft_eps=qf_nufft_eps,
                 )
             else:
-                _, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_gmix_jax(
+                mu_r_prev, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_gmix_jax(
                     ms_prev, Ss_prev, SSs_prev, del_t, trial_mask, grid,
                     sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
                     fine_N=int(gmix_fine_N), stencil_r=int(gmix_stencil_r),
@@ -567,7 +900,7 @@ def fit_efgp_sing_jax(
             natural_params = scan_estep_frozen_qf(
                 natural_params, init_params,
                 ys_obs, t_mask, output_params,
-                scan_key, rho_jax,
+                scan_key, rho_jax, input_effect,
                 Ef_prev, Eff_prev, Edfdx_prev)
 
         # ---- M-step ----
@@ -584,6 +917,31 @@ def fit_efgp_sing_jax(
             if R_new is not None:
                 output_params['R'] = R_new
         init_params = vmap(update_init_params)(ms_t[:, 0], Ss_t[:, 0])
+
+        # 1b) Closed-form input-effect B update.  Reuse the per-transition
+        # drift expectation EFGP already computes (one gmix/mc moments call
+        # at the current q(x)); B then solves the linear LS system in
+        # _update_input_effect_efgp.  Gated by a warmup so q(x) has
+        # localised first (mirrors emission_warmup_iters).
+        if (use_inputs and learn_input_effect
+                and it >= input_effect_warmup_iters):
+            del_t_B = t_grid[1:] - t_grid[:-1]
+            if estep_method == 'mc':
+                in_key, key = jr.split(key, 2)
+                _, Ef_B, _, _ = jpd.qf_and_moments_jax(
+                    ms_t, Ss_t, SSs_t, del_t_B, trial_mask, grid, in_key,
+                    sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+                    D_lat=D, D_out=D, cg_tol=qf_cg_tol,
+                    max_cg_iter=qf_max_cg_iter, nufft_eps=qf_nufft_eps)
+            else:
+                _, Ef_B, _, _ = jpd.qf_and_moments_gmix_jax(
+                    ms_t, Ss_t, SSs_t, del_t_B, trial_mask, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    fine_N=int(gmix_fine_N), stencil_r=int(gmix_stencil_r),
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps)
+            input_effect = _update_input_effect_efgp(
+                ms_t, Ef_B, inputs_KTI, trial_mask, del_t_B)
 
         # 2) Collapsed kernel M-step (after warmup so q(f) isn't trivial)
         if learn_kernel and it >= kernel_warmup_iters:
@@ -677,6 +1035,31 @@ def fit_efgp_sing_jax(
             extras.append(f"σ²={var:.3f}")
             print(f"[jax] EM {it + 1:2d}/{n_em_iters}  rho={float(rho_sched[it]):.3f}  "
                   + "  ".join(extras))
+
+    if use_inputs:
+        history.input_effect = np.asarray(input_effect)
+
+    # Stash the EM's ACTUAL converged q(f): recompute mu_r once on the final
+    # grid + final q(x), using the same method/settings the inner E-step
+    # used.  This is the drift the EM converged to — plotting from it (via
+    # ``posterior_drift_mean``) needs no grid re-derivation.
+    mp_final_b, _ = nat_to_marg_b(natural_params, trial_mask)
+    del_t_final = t_grid[1:] - t_grid[:-1]
+    if estep_method == 'mc':
+        mu_r_final, _, _, _ = jpd.qf_and_moments_jax(
+            mp_final_b['m'], mp_final_b['S'], mp_final_b['SS'], del_t_final,
+            trial_mask, grid, jr.PRNGKey(seed + 12345),
+            sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+            D_lat=D, D_out=D, cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+            nufft_eps=qf_nufft_eps)
+    else:
+        mu_r_final, _, _, _ = jpd.qf_and_moments_gmix_jax(
+            mp_final_b['m'], mp_final_b['S'], mp_final_b['SS'], del_t_final,
+            trial_mask, grid, sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+            fine_N=int(gmix_fine_N), stencil_r=int(gmix_stencil_r),
+            cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter, nufft_eps=qf_nufft_eps)
+    history.final_grid = grid
+    history.final_mu_r = np.asarray(mu_r_final)
 
     marginal_params, _ = nat_to_marg_b(natural_params, trial_mask)
     return marginal_params, natural_params, output_params, init_params, history

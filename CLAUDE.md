@@ -38,6 +38,25 @@ and produce `marginal_params` of shape `(K, T, D)`.
 ```
 The system Python is missing `jax_finufft` — do not use it.
 
+## ⚠️ Use fp64 for any SING fit
+
+JAX defaults to fp32. The SING block-tridiagonal smoother + SparseGP
+M-step diverge into NaN at higher K·T in fp32 (empirically, K·T ≳ 5000 with
+mstep_lr=0.01 is enough to blow up the SparseGP hyper Adam step).
+
+**Always enable fp64 at the top of any benchmark script:**
+
+```python
+import jax
+jax.config.update("jax_enable_x64", True)   # MUST be before any jax.* call
+# ... rest of imports
+```
+
+In return, fp64 ~doubles EFGP wall and ~doubles SparseGP wall. Worth it
+— without fp64, results at K·T ≳ a few thousand are unreliable. All the
+canonical x64 demos (`bench_gpdrift_x64.py`, `bench_duffing_lsinit_x64.py`)
+do this.
+
 ## Recommended fit settings (head-to-head benchmarks)
 
 These come from the most-recent dialed-in EFGP-vs-SparseGP comparison in
@@ -223,23 +242,87 @@ count, EFGP wall ≈ what it was on K=1 × T=2000, while SparseGP got faster.
 step EFGP collapsed-NLL trajectory. `fit_efgp_sing_jax` currently discards it.
 Add it to history if you need M-step convergence diagnostics.
 
+## Production defaults — q(x) moments + V restoration
+
+Two knobs are now defaulted to the gather-based production paths:
+
+**`qx_moments_method='gmix_batched'` (DEFAULT).** Gaussian-averaged
+`(Ef, Edfdx)` under q(x_t)=N(m,S) precomputed in ONE batched
+gmix-gather call per inner iter (1 IFFT + per-source Gaussian stencil),
+then injected via the legacy `FrozenEFGPDrift` custom_vjp shim
+(linearised B′ gradient structure). Same gradients as the now-deleted
+`'gmix_live'` path, ~2× faster. Smoothing controlled by
+`qx_v_gather_n_sigma` (default 2.0 → ~5% rel err, absorbed by
+ρ-damping).
+- Alternative: `'linearised_shim'` (point-eval drift moments at m_t,
+  no Gaussian smoothing). Cheaper (no gather) but misses the
+  first-order S-correction in the base point.
+
+**`restore_qf_variance='none'` (DEFAULT).** Drop the q(f)-variance
+term `V(x) = Σ_r σ_r⁻² φ(x)* A_r⁻¹ φ(x)` (Approximation A). Justified
+by the structural argument in `efgp_estep.tex` §6: for SDE-recovery
+with diverse ICs and ergodic mixing, ∇V ≈ 0 at every interior `m_i`.
+Diagnostic at K=10/T=500 confirms the gradient injection works
+(verified numerically) but `‖∇V‖ ≈ 5e-5 · ‖legacy ∂Eff/∂m‖` per
+transition — intrinsically tiny on this problem class, washed out by
+SING's ρ-damping. The bench's identical recovery between `'none'` and
+`'hutch'` reflects this, not a wiring bug.
+
+**Opt-in for problems where the structural argument fails:**
+
+- `'hutch'`: homogeneous-S restoration. Hutchinson estimate of the
+  diagonal sums `ω(δ) = Σ_(k,l): ξ_l−ξ_k=δ (DA⁻¹D)_(kl)` (padded-FFT
+  cross-correlation) + a single batched Type-2 NUFFT against
+  `ω·env(S_homo)`. Per-source S_i replaced by trajectory-mean. ~11%
+  wall overhead at K=10/T=500.
+- `'hutch_hetS'`: per-source S_i envelope via the gmix-gather primitive
+  (`sing/efgp_gmix_gather.py`). ~15% wall overhead.
+
+Use either opt-in when the structural argument is suspect: **anisotropic
+source coverage**, sources clustered in a sub-region, **sharp turns
+near the data-domain boundary**, **cold-start before q(x) localises**,
+or **substantially varying S_i across t** (early/late + steady state).
+- `'none'`: drop V (Approximation A baseline). Empirically fine on
+  uniformly-distributed data with ergodic SDEs, but `'hutch'` is now
+  nearly free so it is preferred.
+
+For all three V modes, `∂V/∂S_i` is set to 0 — first-order Taylor
+linearisation of V at m_i, exactly analogous to the linearised B′
+approximation already used for f. Bias is `O(‖S_i‖·σ_f²/ℓ²)`, small
+for q(x) localised at scale ℓ. See `efgp_estep.tex` §6 for the
+explicit Taylor argument.
+
+V-restoration is only wired for `qx_moments_method` in
+(`'linearised_shim'`, `'gmix_batched'`) + `estep_method='gmix'`.
+
 ## Test / regression cheat sheet
 
 ```bash
 # Project venv
 PY=/Users/colecitrenbaum/myenv/bin/python
 
-# Full EFGP regression (multi-trial + K=1 + primitives + agreement)
+# Canonical full EFGP regression (multi-trial + K=1 + primitives + agreement).
+# DO NOT include the x64-forcing test files below in this sequence —
+# they globally enable jax_enable_x64 which exposes a latent fp32-only
+# assumption in test_efgp_jax_primitives.py::test_cg_solve_matches_torch.
 $PY -m pytest tests/test_efgp_em_multitrial.py \
     tests/test_efgp_jax_primitives.py \
     tests/test_efgp_jax_recovery.py \
     tests/test_efgp_gmix_vs_mc.py \
     tests/test_efgp_sparsegp_drift_agreement.py \
     tests/test_gmix_nufft.py tests/test_gmix_spreader.py
+
+# V-restoration tests (force x64; run separately):
+$PY -m pytest tests/test_gmix_gather.py tests/test_efgp_qx_v_hutch.py
 ```
 
 `test_efgp_em_multitrial.py` covers: pytree round-trip, K-replication σ²/K
 equivalence, ragged-vs-concat, K=1 smoke recovery, K-trial smoke fit.
+`test_gmix_gather.py` covers the Type-2 gmix-gather primitive (4 tests:
+DC, random-c vs explicit sum, eps convergence, autodiff grad).
+`test_efgp_qx_v_hutch.py` covers V-Hutch homog + hetS (unbiasedness vs
+dense Cholesky, hetS-vs-homog at constant S, hetS-vs-dense-truth with
+varying S, complex-ω guard, slow E2E E2E with all 3 modes).
 
 ## File map (EFGP-relevant)
 
@@ -248,6 +331,13 @@ equivalence, ragged-vs-concat, K=1 smoke recovery, K-trial smoke fit.
   `_flatten_stein`, `drift_moments_jax`, `m_step_kernel_jax`,
   `FrozenEFGPDrift`)
 - `sing/efgp_jax_primitives.py` — JAX NUFFT, BTTB Toeplitz, spectral grid
-- `sing/efgp_gmix_spreader.py` — closed-form Gaussian mixture spreader
+- `sing/efgp_gmix_spreader.py` — closed-form Gaussian mixture spreader (Type-1)
+- `sing/efgp_gmix_gather.py` — Type-2 analog of spreader (per-source
+  Gaussian gather of an inverse-FFT'd spectral coefficient grid). Used
+  by `restore_qf_variance='hutch_hetS'`.
+- `sing/efgp_qx_v_hutch.py` — V-Hutch restoration (homog + hetS):
+  `precompute_omega_per_r` (Hutchinson ω̂ via FFT xcorr),
+  `precompute_V_and_grad_E_V_per_t{,_hetS}`, `FrozenEFGPDriftWithVHutch`
+  (custom_vjp shim).
 - `sing/efgp_emissions.py` — closed-form Gaussian (C, d, R) update
   (multi-trial, aggregates over both K and T)

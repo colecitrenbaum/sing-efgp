@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024) (preloaded format=pdflatex 2024.9.22)  4 MAY 2026 15:55
+This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024) (preloaded format=pdflatex 2024.9.22)  17 JUN 2026 16:55
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -316,24 +316,24 @@ File: l3backend-pdftex.def 2024-02-20 L3 backend support: PDF output (pdfTeX)
 (./efgp_estep.aux)
 \openout1 = `efgp_estep.aux'.
 
-LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
-LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
-LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
-LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
-LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
-LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
-LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
-LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
-LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 30.
-LaTeX Font Info:    ... okay on input line 30.
+LaTeX Font Info:    Checking defaults for OML/cmm/m/it on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
+LaTeX Font Info:    Checking defaults for OMS/cmsy/m/n on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
+LaTeX Font Info:    Checking defaults for OT1/cmr/m/n on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
+LaTeX Font Info:    Checking defaults for T1/cmr/m/n on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
+LaTeX Font Info:    Checking defaults for TS1/cmr/m/n on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
+LaTeX Font Info:    Checking defaults for OMX/cmex/m/n on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
+LaTeX Font Info:    Checking defaults for U/cmr/m/n on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
+LaTeX Font Info:    Checking defaults for PD1/pdf/m/n on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
+LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 34.
+LaTeX Font Info:    ... okay on input line 34.
 
 *geometry* driver: auto-detecting
 *geometry* detected driver: pdftex
@@ -369,7 +369,7 @@ LaTeX Font Info:    ... okay on input line 30.
 * \@reversemarginfalse
 * (1in=72.27pt=25.4mm, 1cm=28.453pt)
 
-Package hyperref Info: Link coloring ON on input line 30.
+Package hyperref Info: Link coloring ON on input line 34.
 (./efgp_estep.out) (./efgp_estep.out)
 \@outlinefile=\write3
 \openout3 = `efgp_estep.out'.
@@ -389,51 +389,61 @@ Package hyperref Info: Link coloring ON on input line 30.
 \makeMPintoPDFobject=\count295
 \everyMPtoPDFconversion=\toks31
 )
-LaTeX Font Info:    Trying to load font information for U+msa on input line 32.
+LaTeX Font Info:    Trying to load font information for U+msa on input line 36.
 
  (/usr/local/texlive/2024/texmf-dist/tex/latex/amsfonts/umsa.fd
 File: umsa.fd 2013/01/14 v3.01 AMS symbols A
 )
-LaTeX Font Info:    Trying to load font information for U+msb on input line 32.
+LaTeX Font Info:    Trying to load font information for U+msb on input line 36.
 
 
 (/usr/local/texlive/2024/texmf-dist/tex/latex/amsfonts/umsb.fd
 File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 )
-(./efgp_estep.toc)
+(./efgp_estep.toc [1
+
+{/usr/local/texlive/2024/texmf-var/fonts/map/pdftex/updmap/pdftex.map}])
 \tf@toc=\write4
 \openout4 = `efgp_estep.toc'.
 
- [1
-
-{/usr/local/texlive/2024/texmf-var/fonts/map/pdftex/updmap/pdftex.map}]
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 98.
-
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 98.
+ [2{/usr/local/texlive/2024/texmf-dist/fonts/enc/dvips/cm-super/cm-super-ts1.en
+c}]
+Overfull \hbox (210.08202pt too wide) in paragraph at lines 137--153
+ [] 
+ []
 
 
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 134.
+Overfull \hbox (99.42628pt too wide) in paragraph at lines 174--197
+[] 
+ []
 
 
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 134.
-
-[2]
-
-Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 194.
+(hyperref)                removing `math shift' on input line 209.
 
 
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 194.
+(hyperref)                removing `math shift' on input line 209.
 
 [3]
-Overfull \hbox (11.8778pt too wide) in paragraph at lines 339--342
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 242.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 242.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 287.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 287.
+
+[4] [5]
+Overfull \hbox (24.7113pt too wide) in paragraph at lines 414--417
  []\OT1/cmr/bx/n/10.95 BTTB struc-ture of $\U/msb/m/n/10.95 E[]\OT1/cmr/m/n/10.
 95 [\OML/cmm/m/it/10.95 ^^^^^^[]\OT1/cmr/m/n/10.95 ]$\OT1/cmr/bx/n/10.95 .[] \O
 T1/cmr/m/n/10.95 For Fourier fea-tures, $\OML/cmm/m/it/10.95 ^^^\OT1/cmr/m/n/10
@@ -443,74 +453,342 @@ T1/cmr/m/n/10.95 For Fourier fea-tures, $\OML/cmm/m/it/10.95 ^^^\OT1/cmr/m/n/10
 n/10.95 .
  []
 
-[4] [5]
-Overfull \hbox (13.8497pt too wide) in paragraph at lines 434--440
-\OT1/cmr/m/n/10.95 miss from [] alone | see \OT1/cmtt/m/n/10 compute[]mu[]r[]ja
-x \OT1/cmr/m/n/10.95 in \OT1/cmtt/m/n/10 sing/efgp[]jax[]drift.py \OT1/cmr/m/n/
-10.95 (and the \OT1/cmtt/m/n/10.95 EFGP[]SING[]README.md
- []
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 427.
 
 
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 491.
+(hyperref)                removing `math shift' on input line 427.
 
 
 Package hyperref Warning: Token not allowed in a PDF string (Unicode):
-(hyperref)                removing `math shift' on input line 491.
+(hyperref)                removing `math shift' on input line 427.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `subscript' on input line 427.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `subscript' on input line 427.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 427.
 
 [6]
-Overfull \hbox (60.60013pt too wide) in paragraph at lines 504--510
-\OT1/cmr/m/n/10.95 value and the $(\OML/cmm/m/it/10.95 m[]; S[]\OT1/cmr/m/n/10.
-95 )$-derivatives of [] in-te-grated against $\OML/cmm/m/it/10.95 q\OT1/cmr/m/n
-/10.95 (\OML/cmm/m/it/10.95 x[]; x[]\OT1/cmr/m/n/10.95 ) = \OMS/cmsy/m/n/10.95 
-N[]\OT1/cmr/m/n/10.95 (\OML/cmm/m/it/10.95 m[]; m[]\OT1/cmr/m/n/10.95 )\OML/cmm
-/m/it/10.95 ;  \OT1/cmr/m/n/10.95 (\OML/cmm/m/it/10.95 S[]; S[]\OT1/cmr/m/n/10.
-95 ; \OML/cmm/m/it/10.95 S[]; S[]\OT1/cmr/m/n/10.95 )[]$.
+Overfull \hbox (0.14085pt too wide) in paragraph at lines 506--510
+\OT1/cmr/m/n/10.95 The fac-tor $\OMS/cmsy/m/n/10.95 ^^@\OT1/cmr/m/n/10.95 2\OML
+/cmm/m/it/10.95 ^^Yi ^^X[]$ \OT1/cmr/m/n/10.95 in $\OML/cmm/m/it/10.95 h[]$ \OT
+1/cmr/m/n/10.95 (rather than $+2\OML/cmm/m/it/10.95 ^^Yi ^^X[]$\OT1/cmr/m/n/10.
+95 ) comes from the ad-joint Ja-co-bian $\OML/cmm/m/it/10.95 J[]$\OT1/cmr/m/n/1
+0.95 : $[] =
  []
 
-[7{/usr/local/texlive/2024/texmf-dist/fonts/enc/dvips/cm-super/cm-super-ts1.enc
-}] [8] [9] (./efgp_estep.aux)
+
+Overfull \hbox (71.70998pt too wide) in paragraph at lines 530--534
+\OT1/cmr/m/n/10.95 family du-al-ity be-tween $\OML/cmm/m/it/10.95 q\OT1/cmr/m/n
+/10.95 (\OML/cmm/m/it/10.95 x\OT1/cmr/m/n/10.95 )$'s nat-u-ral pa-ram-e-ters $\
+OML/cmm/m/it/10.95 ^^Q \OT1/cmr/m/n/10.95 = (\OML/cmm/m/it/10.95 J; h; L\OT1/cm
+r/m/n/10.95 )$ and mean pa-ram-e-ters $\OML/cmm/m/it/10.95 ^^V \OT1/cmr/m/n/10.
+95 = (\U/msb/m/n/10.95 E\OT1/cmr/m/n/10.95 [\OML/cmm/m/it/10.95 x[]\OT1/cmr/m/n
+/10.95 ]\OML/cmm/m/it/10.95 ; \U/msb/m/n/10.95 E\OT1/cmr/m/n/10.95 [\OML/cmm/m/
+it/10.95 x[]x[]\OT1/cmr/m/n/10.95 ]\OML/cmm/m/it/10.95 ; \U/msb/m/n/10.95 E\OT1
+/cmr/m/n/10.95 [\OML/cmm/m/it/10.95 x[]x[]\OT1/cmr/m/n/10.95 ])$, 
+ []
+
+
+Overfull \hbox (50.34782pt too wide) detected at line 557
+[][][]\U/msb/m/n/10.95 E[] []E[]\OT1/cmr/m/n/10.95 [[] \OML/cmm/m/it/10.95 p\OT
+1/cmr/m/n/10.95 (\OML/cmm/m/it/10.95 x[] \OMS/cmsy/m/n/10.95 j \OML/cmm/m/it/10
+.95 x[]; f\OT1/cmr/m/n/10.95 )][]  =  \OMS/cmsy/m/n/10.95 ^^@ [] \OT1/cmr/m/n/1
+0.95 + \U/msb/m/n/10.95 E[]\OT1/cmr/m/n/10.95 [\OML/cmm/m/it/10.95 ^^N[]\OT1/cm
+r/m/n/10.95 ^^F[][](\OML/cmm/m/it/10.95 x[]\OT1/cmr/m/n/10.95 )] \OMS/cmsy/m/n/
+10.95 ^^@ [] \U/msb/m/n/10.95 E[] [][]\OT1/cmr/m/n/10.95 ^^F[][] + \OML/cmm/m/i
+t/10.95 V[] \OT1/cmr/m/n/10.95 + []\OML/cmm/m/it/10.95 :
+ []
+
+[7]
+Overfull \hbox (3.13008pt too wide) in paragraph at lines 573--581
+\OT1/cmtt/m/n/10 drift[]moments[]gmix[]jax \OT1/cmr/m/n/10.95 and ex-posed via 
+the \OT1/cmtt/m/n/10 FrozenEFGPDrift \OT1/cmr/m/n/10.95 pytree --- from \OT1/cm
+tt/m/n/10 compute[]neg[]CE[]single\OT1/cmr/m/n/10.95 's
+ []
+
+
+Overfull \hbox (24.59499pt too wide) detected at line 624
+[][][]\OML/cmm/m/it/10.95 @[]\U/msb/m/n/10.95 E\OT1/cmr/m/n/10.95 [[]^^F[][]]  
+[]  \U/msb/m/n/10.95 E[]\OML/cmm/m/it/10.95 J[]\OT1/cmr/m/n/10.95 ^^F[]\OML/cmm
+/m/it/10.95 J[][] \OT1/cmr/m/n/10.95 + []\U/msb/m/n/10.95 E [][][] \OML/cmm/m/i
+t/10.95 ^^[[][]H[][]  []  \U/msb/m/n/10.95 E[]\OML/cmm/m/it/10.95 J[]\OT1/cmr/m
+/n/10.95 ^^F[]\OML/cmm/m/it/10.95 J[][]  []  \U/msb/m/n/10.95 E\OT1/cmr/m/n/10.
+95 [\OML/cmm/m/it/10.95 J[]\OT1/cmr/m/n/10.95 ][]^^F[] \U/msb/m/n/10.95 E\OT1/c
+mr/m/n/10.95 [\OML/cmm/m/it/10.95 J[]\OT1/cmr/m/n/10.95 ]  \OMS/cmsy/m/n/10.95 
+^^W  \OT1/cmr/m/n/10.95 0\OML/cmm/m/it/10.95 :
+ []
+
+
+Overfull \hbox (163.71156pt too wide) in paragraph at lines 653--669
+ [] 
+ []
+
+[8]
+Overfull \hbox (5.87227pt too wide) in paragraph at lines 707--715
+\OT1/cmtt/m/n/10 drift[]moments[]gmix[]jax \OT1/cmr/m/n/10.95 (\OT1/cmtt/m/n/10
+ efgp[]jax[]drift.py:557-624\OT1/cmr/m/n/10.95 ; Type-2 ana-log of the \TS1/cmr
+/m/n/10.95 §[][]\OT1/cmr/m/n/10.95 5.1[][] spreader: one batched
+ []
+
+LaTeX Font Info:    Font shape `OT1/cmtt/bx/n' in size <10.95> not available
+(Font)              Font shape `OT1/cmtt/m/n' tried instead on input line 717.
+LaTeX Font Info:    Font shape `OT1/cmtt/bx/n' in size <10> not available
+(Font)              Font shape `OT1/cmtt/m/n' tried instead on input line 717.
+
+Overfull \hbox (17.3092pt too wide) in paragraph at lines 726--733
+[]\OT1/cmtt/m/n/10 Ef \OT1/cmr/m/n/10.95 ($= \U/msb/m/n/10.95 E[]\OT1/cmr/m/n/1
+0.95 [[]]$) through \OT1/cmtt/m/n/10 ef[]with[]jac[]grad\OT1/cmr/m/n/10.95 's \
+OT1/cmtt/m/n/10 custom[]vjp\OT1/cmr/m/n/10.95 : back-ward re-turns $\OML/cmm/m/
+it/10.95 @[]=@m \OT1/cmr/m/n/10.95 = \U/msb/m/n/10.95 E[]\OT1/cmr/m/n/10.95 [\O
+ML/cmm/m/it/10.95 J[]\OT1/cmr/m/n/10.95 ][]\OML/cmm/m/it/10.95 g$\OT1/cmr/m/n/1
+0.95 ,
+ []
+
+[9]
+Overfull \hbox (40.34341pt too wide) detected at line 784
+[][][]\U/msb/m/n/10.95 E[]\OT1/cmr/m/n/10.95 [\OML/cmm/m/it/10.95 ^^N[]\OT1/cmr
+/m/n/10.95 ^^F[][](\OML/cmm/m/it/10.95 x[]\OT1/cmr/m/n/10.95 )]  =  [] + []\OML
+/cmm/m/it/10.95 ;  d[] \OT1/cmr/m/n/10.95 := \OML/cmm/m/it/10.95 m[] \OMS/cmsy/
+m/n/10.95 ^^@ \OML/cmm/m/it/10.95 m[];  C[] \OT1/cmr/m/n/10.95 := \OML/cmm/m/it
+/10.95 S[] \OMS/cmsy/m/n/10.95 ^^@ \OML/cmm/m/it/10.95 S[]:
+ []
+
+[10]
+Overfull \hbox (14.50168pt too wide) in paragraph at lines 835--843
+ [] 
+ []
+
+
+Overfull \hbox (17.85869pt too wide) in paragraph at lines 887--896
+\OT1/cmtt/m/n/10 Ef).sum(axis=-1) \OT1/cmr/m/n/10.95 in \OT1/cmtt/m/n/10 drift[
+]moments[]gmix[]jax \OT1/cmr/m/n/10.95 line 623. The for-ward holds only the $\
+U/msb/m/n/10.95 E[]\OT1/cmr/m/n/10.95 [[]][]^^F[]\U/msb/m/n/10.95 E[]\OT1/cmr/m
+/n/10.95 [[]]$
+ []
+
+
+Overfull \hbox (80.57242pt too wide) in paragraph at lines 897--901
+[]\OT1/cmr/bx/n/10.95 Gradients. \OT1/cmtt/m/n/10 Eff \OT1/cmr/m/n/10.95 comes 
+from \OT1/cmtt/m/n/10 eff[]with[]grads(m, S, eff[]const, ef[]const, jac[]const)
+ \OT1/cmr/m/n/10.95 (\OT1/cmtt/m/n/10 efgp[]jax[]drift.py:56-75\OT1/cmr/m/n/10.
+95 );
+ []
+
+[11] [12]
+LaTeX Font Info:    Font shape `OT1/cmtt/bx/n' in size <12> not available
+(Font)              Font shape `OT1/cmtt/m/n' tried instead on input line 990.
+
+Overfull \hbox (1.21184pt too wide) in paragraph at lines 998--1000
+[]\OT1/cmtt/m/n/10 nat[]grad[]transition \OT1/cmr/m/n/10.95 (\OT1/cmtt/m/n/10 s
+ing/sing.py\OT1/cmr/m/n/10.95 ) runs \OT1/cmtt/m/n/10 vmap(grad(compute[]neg[]C
+E[]single)) \OT1/cmr/m/n/10.95 over tran-si-tions. 
+ []
+
+[13]
+Overfull \hbox (99.95572pt too wide) in paragraph at lines 1080--1125
+[] 
+ []
+
+[14]
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1152.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `subscript' on input line 1152.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `subscript' on input line 1152.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1152.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1152.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `superscript' on input line 1152.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1152.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1176.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\omega' on input line 1176.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `subscript' on input line 1176.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1176.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1194.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `subscript' on input line 1194.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1194.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1224.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1224.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1224.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1224.
+
+[15]
+Overfull \hbox (91.88884pt too wide) in paragraph at lines 1236--1245
+ []\OT1/cmtt/m/n/10 'hutch[]hetS'\OT1/cmr/bx/n/10.95 .[] \OT1/cmr/m/n/10.95 Per
+-source $\OML/cmm/m/it/10.95 S[]$ \OT1/cmr/m/n/10.95 en-ve-lope, im-ple-mented 
+via the Type-2 gmix-gather prim-i-tive (\OT1/cmtt/m/n/10 sing/efgp[]gmix[]gathe
+r.py\OT1/cmr/m/n/10.95 ).
+ []
+
+
+Overfull \hbox (47.3131pt too wide) in paragraph at lines 1253--1271
+\OT1/cmr/m/n/10.95 stants per-transition via \OT1/cmtt/m/n/10 custom[]vjp \OT1/
+cmr/m/n/10.95 with the \TS1/cmr/m/n/10.95 §[][]\OT1/cmr/m/n/10.95 6[][] gra-di-
+ent ta-ble. The V-Hutch shim \OT1/cmtt/m/n/10 FrozenEFGPDriftWithVHutch
+ []
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1288.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1288.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1288.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1288.
+
+
+Overfull \hbox (31.38943pt too wide) in paragraph at lines 1295--1299
+[]\OT1/cmr/m/n/10.95 Base-point choice: \OT1/cmtt/m/n/10 'gmix[]batched' \OT1/c
+mr/m/n/10.95 reaches the same $([]\OML/cmm/m/it/10.95 ; []; []\OT1/cmr/m/n/10.9
+5 )$ fixed point as \OT1/cmtt/m/n/10 'linearised[]shim'
+ []
+
+
+Overfull \hbox (2.13068pt too wide) in paragraph at lines 1299--1304
+[]\OT1/cmr/m/n/10.95 V-restoration over-head: \OT1/cmtt/m/n/10 'hutch' $[]\OT1/
+cmr/m/n/10.95 53\OML/cmm/m/it/10.95 :\OT1/cmr/m/n/10.95 7$s warm vs \OT1/cmtt/m
+/n/10 'none' $[]\OT1/cmr/m/n/10.95 48\OML/cmm/m/it/10.95 :\OT1/cmr/m/n/10.95 3$
+s ($[]11%$); \OT1/cmtt/m/n/10 'hutch[]hetS' $[]\OT1/cmr/m/n/10.95 64\OML/cmm/m/
+it/10.95 :\OT1/cmr/m/n/10.95 8$s
+ []
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1306.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `\nabla' on input line 1306.
+
+
+Package hyperref Warning: Token not allowed in a PDF string (Unicode):
+(hyperref)                removing `math shift' on input line 1306.
+
+[16]
+Overfull \hbox (3.13968pt too wide) in paragraph at lines 1314--1325
+\OT1/cmr/m/n/10.95 bit-identical re-cov-ery be-tween \OT1/cmtt/m/n/10 'none' \O
+T1/cmr/m/n/10.95 and \OT1/cmtt/m/n/10 'hutch' \OT1/cmr/m/n/10.95 (fi-nal $[][]1
+\OML/cmm/m/it/10.95 :\OT1/cmr/m/n/10.95 1337$, $[][]1\OML/cmm/m/it/10.95 :\OT1/
+cmr/m/n/10.95 3230$, la-tent RMSE$[]0\OML/cmm/m/it/10.95 :\OT1/cmr/m/n/10.95 06
+46$,
+ []
+
+[17] (./efgp_estep.aux)
  ***********
 LaTeX2e <2023-11-01> patch level 1
 L3 programming layer <2024-02-20>
  ***********
 Package rerunfilecheck Info: File `efgp_estep.out' has not changed.
-(rerunfilecheck)             Checksum: A5D95F4484BE87E524F66684E86A95B6;2165.
+(rerunfilecheck)             Checksum: 283576CE75D9B261500AF14E3B93304C;5805.
  ) 
 Here is how much of TeX's memory you used:
- 10507 strings out of 474116
- 157309 string characters out of 5743682
- 1948187 words of memory out of 5000000
- 32646 multiletter control sequences out of 15000+600000
- 576531 words of font info for 105 fonts, out of 8000000 for 9000
+ 10628 strings out of 474116
+ 158896 string characters out of 5743682
+ 1947187 words of memory out of 5000000
+ 32714 multiletter control sequences out of 15000+600000
+ 582446 words of font info for 126 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 75i,13n,79p,547b,448s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 75i,18n,79p,547b,515s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx10.pfb
 ></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmbx12.pfb>
-</usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb><
-/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cmextra/cmex8.pf
-b></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb
-></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi12.pfb>
-</usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb></
-usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></us
-r/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb></usr/
-local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/lo
-cal/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr12.pfb></usr/loca
-l/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr17.pfb></usr/local/
-texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr6.pfb></usr/local/tex
-live/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr8.pfb></usr/local/texliv
-e/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/local/texlive
-/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy6.pfb></usr/local/texlive/2
-024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy7.pfb></usr/local/texlive/202
-4/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy8.pfb></usr/local/texlive/2024/
-texmf-dist/fonts/type1/public/amsfonts/cm/cmti10.pfb></usr/local/texlive/2024/t
-exmf-dist/fonts/type1/public/amsfonts/cm/cmtt10.pfb></usr/local/texlive/2024/te
-xmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb></usr/local/texlive/202
-4/texmf-dist/fonts/type1/public/cm-super/sfrm1095.pfb>
-Output written on efgp_estep.pdf (9 pages, 309075 bytes).
+</usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmbxti10.pfb
+></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb>
+</usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmitt10.pfb>
+</usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb><
+/usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi12.pfb></
+usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi5.pfb></us
+r/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb></usr/
+local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></usr/lo
+cal/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb></usr/loca
+l/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb></usr/local/
+texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/local/te
+xlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr12.pfb></usr/local/texl
+ive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr17.pfb></usr/local/texliv
+e/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr6.pfb></usr/local/texlive/2
+024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr8.pfb></usr/local/texlive/2024
+/texmf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb></usr/local/texlive/2024/te
+xmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/local/texlive/2024/tex
+mf-dist/fonts/type1/public/amsfonts/cm/cmsy6.pfb></usr/local/texlive/2024/texmf
+-dist/fonts/type1/public/amsfonts/cm/cmsy8.pfb></usr/local/texlive/2024/texmf-d
+ist/fonts/type1/public/amsfonts/cm/cmsy9.pfb></usr/local/texlive/2024/texmf-dis
+t/fonts/type1/public/amsfonts/cm/cmti10.pfb></usr/local/texlive/2024/texmf-dist
+/fonts/type1/public/amsfonts/cm/cmti8.pfb></usr/local/texlive/2024/texmf-dist/f
+onts/type1/public/amsfonts/cm/cmti9.pfb></usr/local/texlive/2024/texmf-dist/fon
+ts/type1/public/amsfonts/cm/cmtt10.pfb></usr/local/texlive/2024/texmf-dist/font
+s/type1/public/amsfonts/symbols/msbm10.pfb></usr/local/texlive/2024/texmf-dist/
+fonts/type1/public/cm-super/sfrm0800.pfb></usr/local/texlive/2024/texmf-dist/fo
+nts/type1/public/cm-super/sfrm1095.pfb>
+Output written on efgp_estep.pdf (17 pages, 448121 bytes).
 PDF statistics:
- 341 PDF objects out of 1000 (max. 8388607)
- 283 compressed objects within 3 object streams
- 91 named destinations out of 1000 (max. 500000)
- 89 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 554 PDF objects out of 1000 (max. 8388607)
+ 466 compressed objects within 5 object streams
+ 128 named destinations out of 1000 (max. 500000)
+ 193 words of extra memory for PDF output out of 10000 (max. 10000000)
 

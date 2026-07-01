@@ -37,7 +37,7 @@ def _spread_2d(
     m: Array, S: Array, w: Array, *,
     xcen: Array, h_grid: float, N: int, r: int,
 ) -> Array:
-    """Tabulate g(x) = sum_i w_i N(x; m_i, S_i) on an (N, N) regular grid.
+    """Tabulate g(x) = sum_i w_i N(x; m_i, S_i) on an (N, N) regular grid w spacing h_grid (ie this grid is in x, not xis)
 
     Grid layout: cell index (a, b) is at physical position
         xcen + (a - N//2, b - N//2) * h_grid
@@ -46,15 +46,16 @@ def _spread_2d(
     rdtype = m.dtype
 
     g = (m - xcen[None, :]) / h_grid + (N // 2)             # (T, 2)
-    g_int = jnp.round(g).astype(jnp.int32)
+    g_int = jnp.round(g).astype(jnp.int32) # closest grid point corresponding to m ?
     g_frac = g - g_int.astype(rdtype)
 
     sten_r = jnp.arange(-r, r + 1, dtype=rdtype)             # (2r+1,)
-    sx, sy = jnp.meshgrid(sten_r, sten_r, indexing='ij')     # (2r+1, 2r+1)
+    sx, sy = jnp.meshgrid(sten_r, sten_r, indexing='ij')     # (2r+1)**2 each 
     sten_i = jnp.arange(-r, r + 1, dtype=jnp.int32)
 
     def per_source(m_i, S_i, w_i, frac_i, gint_i):
-        rel_x = (sx - frac_i[0]) * h_grid
+        # per source (m_i, S_i), calculate w_i N(x;m_i,S_i)
+        rel_x = (sx - frac_i[0]) * h_grid # distance of m_i to each grid point ... ie the middle position here is the closest grid point to m_i
         rel_y = (sy - frac_i[1]) * h_grid
         det = S_i[0, 0] * S_i[1, 1] - S_i[0, 1] * S_i[1, 0]
         S_inv_00 =  S_i[1, 1] / det
@@ -64,19 +65,21 @@ def _spread_2d(
              + 2 * S_inv_01 * rel_x * rel_y
              + S_inv_11 * rel_y ** 2)
         norm = 1.0 / (2.0 * math.pi * jnp.sqrt(det))
-        contrib = (w_i * norm * jnp.exp(-0.5 * Q)).astype(cdtype)
+        contrib = (w_i * norm * jnp.exp(-0.5 * Q)).astype(cdtype) 
         return contrib, gint_i
 
-    contribs, centers = jax.vmap(per_source)(m, S, w, g_frac, g_int)
+    # contribs (T,2r+1,2r+1 ) ? 
+    contribs, centers = jax.vmap(per_source)(m, S, w, g_frac, g_int) # gives contribution over every data point at every grid location 
 
-    tar_x = (centers[:, 0:1, None] + sten_i[None, :, None]) % N      # (T, 2r+1, 1)
+    tar_x = (centers[:, 0:1, None] + sten_i[None, :, None]) % N      # (T, 2r+1, 1) # x grid locations to 
     tar_y = (centers[:, 1:2, None] + sten_i[None, None, :]) % N      # (T, 1, 2r+1)
-    tar_x_b = jnp.broadcast_to(tar_x, contribs.shape).reshape(-1)
+    tar_x_b = jnp.broadcast_to(tar_x, contribs.shape).reshape(-1)    # tar_x_b is the x-location in the grid that contribs goes to .. 
     tar_y_b = jnp.broadcast_to(tar_y, contribs.shape).reshape(-1)
 
     grid = jnp.zeros((N, N), dtype=cdtype)
+    # [tar_x_b,tar_y_b] 
     grid = grid.at[tar_x_b, tar_y_b].add(contribs.reshape(-1))
-    return grid
+    return grid #(N,N)
 
 
 def gmix_nufft_2d(

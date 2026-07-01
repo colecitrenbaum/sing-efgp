@@ -1,0 +1,40 @@
+\contentsline {section}{\numberline {1}The expectations we need}{2}{section.1}%
+\contentsline {section}{\numberline {2}The one primitive: $\mathbb {E}[\text {Fourier sum}]$ is an FFT of a density}{2}{section.2}%
+\contentsline {paragraph}{Expectation commutes with the Fourier transform.}{3}{section*.2}%
+\contentsline {paragraph}{Same target as Monte Carlo, two commuting operations in the other order.}{3}{section*.3}%
+\contentsline {paragraph}{Where the characteristic function hides.}{3}{section*.4}%
+\contentsline {section}{\numberline {3}The precision $A_r$: BTTB is preserved}{4}{section.3}%
+\contentsline {paragraph}{Why it is not a NUFFT of the means.}{4}{section*.5}%
+\contentsline {section}{\numberline {4}The right-hand side $h_r$}{4}{section.4}%
+\contentsline {section}{\numberline {5}How much of this is Fourier-specific?}{5}{section.5}%
+\contentsline {paragraph}{The smearing is basis-free.}{5}{section*.6}%
+\contentsline {paragraph}{But the smearing is not the sufficient statistics.}{5}{section*.7}%
+\contentsline {paragraph}{Three roles, one basis-free.}{5}{section*.8}%
+\contentsline {paragraph}{Given the pseudo-observations, the Toeplitz structure is the headline.}{5}{section*.9}%
+\contentsline {paragraph}{The clean control: same pseudo-obs, no FFT.}{6}{section*.10}%
+\contentsline {section}{\numberline {6}Algorithm: per-source Gaussian-mixture spreader}{6}{section.6}%
+\contentsline {subsection}{\numberline {6.1}Spread the densities, FFT, done}{6}{subsection.6.1}%
+\contentsline {paragraph}{Building $g_a$ is cheap.}{6}{section*.11}%
+\contentsline {paragraph}{It is a NUFFT with the deconvolution removed.}{6}{section*.12}%
+\contentsline {paragraph}{Two errors.}{7}{section*.13}%
+\contentsline {subsection}{\numberline {6.2}Stencil truncation error}{7}{subsection.6.2}%
+\contentsline {section}{\numberline {7}Cost analysis}{7}{section.7}%
+\contentsline {subsection}{\numberline {7.1}The fundamental cost driver}{7}{subsection.7.1}%
+\contentsline {paragraph}{Comparison to standard NUFFT.}{7}{section*.14}%
+\contentsline {paragraph}{Implication.}{8}{section*.15}%
+\contentsline {subsection}{\numberline {7.2}Optimal stencil radius: $r\!\approx \!8$, fixed}{8}{subsection.7.2}%
+\contentsline {section}{\numberline {8}Implementation}{8}{section.8}%
+\contentsline {subsection}{\numberline {8.1}New module: \texttt {\small sing/efgp\_gmix\_spreader.py}}{8}{subsection.8.1}%
+\contentsline {subsection}{\numberline {8.2}New q(f) update: \texttt {\small compute\_mu\_r\_gmix\_jax}}{8}{subsection.8.2}%
+\contentsline {subsection}{\numberline {8.3}Driver hook: \texttt {\small estep\_method}}{9}{subsection.8.3}%
+\contentsline {subsection}{\numberline {8.4}Tests}{9}{subsection.8.4}%
+\contentsline {section}{\numberline {9}End-to-end benchmark}{9}{section.9}%
+\contentsline {subsection}{\numberline {9.1}Setup}{9}{subsection.9.1}%
+\contentsline {subsection}{\numberline {9.2}Results --- small/medium $T$}{9}{subsection.9.2}%
+\contentsline {subsection}{\numberline {9.3}Results --- $T = 20{,}000$}{10}{subsection.9.3}%
+\contentsline {paragraph}{Two findings.}{10}{section*.16}%
+\contentsline {paragraph}{Wall time at $T = 20$k.}{10}{section*.17}%
+\contentsline {subsection}{\numberline {9.4}Hyperparameter learning paths and the log-marginal landscape}{10}{subsection.9.4}%
+\contentsline {section}{\numberline {10}Where this sits among the alternatives}{11}{section.10}%
+\contentsline {section}{\numberline {11}Recommendation}{11}{section.11}%
+\contentsline {section}{\numberline {12}Math-to-code dictionary}{11}{section.12}%

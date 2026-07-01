@@ -2,51 +2,90 @@
 \providecommand\hyper@newdestlabel[2]{}
 \providecommand\HyField@AuxAddToFields[1]{}
 \providecommand\HyField@AuxAddToCoFields[2]{}
-\@writefile{toc}{\contentsline {section}{\numberline {1}Setup}{1}{section.1}\protected@file@percent }
-\newlabel{eq:sde}{{1}{1}{Latent SDE and observations}{equation.1.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Setup and ELBO road-map}{2}{section.1}\protected@file@percent }
+\newlabel{sec:setup}{{1}{2}{Setup and ELBO road-map}{section.1}{}}
+\newlabel{eq:sde}{{1}{2}{Latent SDE and observations}{equation.1.1}{}}
 \newlabel{eq:gp-prior}{{3}{2}{Latent SDE and observations}{equation.1.3}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {2}The transition term, stripped to its $f$-content}{2}{section.2}\protected@file@percent }
-\newlabel{sec:transition}{{2}{2}{The transition term, stripped to its $f$-content}{section.2}{}}
-\newlabel{eq:f-quadratic}{{7}{2}{The transition term, stripped to its $f$-content}{equation.2.7}{}}
-\@writefile{toc}{\contentsline {paragraph}{Independence across $r$.}{2}{section*.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {3}Layer 1: GP regression with known $x$}{2}{section.3}\protected@file@percent }
-\newlabel{sec:known-x}{{3}{2}{Layer 1: GP regression with known $x$}{section.3}{}}
-\newlabel{eq:precision}{{10}{3}{Layer 1: GP regression with known $x$}{equation.3.10}{}}
-\newlabel{eq:known-x}{{13}{3}{Layer 1: GP regression with known $x$}{equation.3.13}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {4}Layer 2: uncertain $x$, in a finite basis}{3}{section.4}\protected@file@percent }
-\newlabel{sec:uncertain-x}{{4}{3}{Layer 2: uncertain $x$, in a finite basis}{section.4}{}}
-\newlabel{eq:logqstar}{{15}{3}{Layer 2: uncertain $x$, in a finite basis}{equation.4.15}{}}
-\@writefile{toc}{\contentsline {paragraph}{Pick a basis.}{3}{section*.5}\protected@file@percent }
-\newlabel{eq:basis}{{16}{3}{Pick a basis}{equation.4.16}{}}
-\newlabel{eq:Ah}{{18}{3}{Pick a basis}{equation.4.18}{}}
-\newlabel{eq:Ah-system}{{19}{4}{Pick a basis}{equation.4.19}{}}
-\newlabel{eq:hr-stein-abstract}{{22}{4}{Stein identity for the linear term in $h_r$}{equation.4.22}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {5}Layer 3: EFGP — the Fourier-feature choice}{4}{section.5}\protected@file@percent }
-\newlabel{sec:efgp}{{5}{4}{Layer 3: EFGP — the Fourier-feature choice}{section.5}{}}
-\newlabel{eq:efgp-features}{{23}{4}{Layer 3: EFGP — the Fourier-feature choice}{equation.5.23}{}}
-\@writefile{toc}{\contentsline {paragraph}{Cheap Jacobian.}{4}{section*.7}\protected@file@percent }
-\newlabel{eq:phi-jac}{{24}{4}{Cheap Jacobian}{equation.5.24}{}}
-\@writefile{toc}{\contentsline {paragraph}{BTTB structure of $\mathbb  {E}_{q(x_i)}[\phi \phi ^{*}]$.}{5}{section*.8}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {6}Layer 4: computing the expectations}{5}{section.6}\protected@file@percent }
-\newlabel{sec:compute}{{6}{5}{Layer 4: computing the expectations}{section.6}{}}
-\newlabel{eq:hr-mc}{{33}{6}{Building $h_r$}{equation.6.33}{}}
-\@writefile{toc}{\contentsline {paragraph}{Sign of the Stein correction.}{6}{section*.12}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Cross-covariance convention.}{6}{section*.13}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}Posterior predictive moments}{6}{section.7}\protected@file@percent }
-\newlabel{sec:moments}{{7}{6}{Posterior predictive moments}{section.7}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {8}Feeding back into the $q(x)$ update}{7}{section.8}\protected@file@percent }
-\newlabel{sec:qx}{{8}{7}{Feeding back into the $q(x)$ update}{section.8}{}}
-\newlabel{eq:transition-frozen}{{39}{7}{Feeding back into the $q(x)$ update}{equation.8.39}{}}
-\@writefile{toc}{\contentsline {paragraph}{The approximation, in one line.}{7}{section*.15}\protected@file@percent }
-\newlabel{eq:linearisation}{{40}{7}{The approximation, in one line}{equation.8.40}{}}
-\@writefile{toc}{\contentsline {paragraph}{Expectations under \eqref  {eq:linearisation}.}{7}{section*.16}\protected@file@percent }
-\newlabel{eq:Eff-exact}{{43}{7}{Expectations under \eqref {eq:linearisation}}{equation.8.43}{}}
-\@writefile{toc}{\contentsline {paragraph}{Derivatives.}{7}{section*.17}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Implementation note.}{8}{section*.18}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}Algorithm summary}{8}{section.9}\protected@file@percent }
-\newlabel{sec:algorithm}{{9}{8}{Algorithm summary}{section.9}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {10}Complexity}{9}{section.10}\protected@file@percent }
-\newlabel{sec:complexity}{{10}{9}{Complexity}{section.10}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {A}Math-to-code dictionary}{9}{appendix.A}\protected@file@percent }
-\newlabel{app:dictionary}{{A}{9}{Math-to-code dictionary}{appendix.A}{}}
-\gdef \@abspage@last{9}
+\newlabel{eq:elbo}{{5}{2}{Joint, ELBO, and the three vEM updates}{equation.1.5}{}}
+\newlabel{eq:Mstep-collapsed}{{6}{3}{Joint, ELBO, and the three vEM updates}{equation.1.6}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Notation cheat-sheet}{3}{section.2}\protected@file@percent }
+\newlabel{sec:notation}{{2}{3}{Notation cheat-sheet}{section.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}The q(f) update: GP regression on latent velocities}{3}{section.3}\protected@file@percent }
+\newlabel{sec:qf-update}{{3}{3}{The q(f) update: GP regression on latent velocities}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Transition stripped to its $f$-content}{4}{subsection.3.1}\protected@file@percent }
+\newlabel{sec:transition}{{3.1}{4}{Transition stripped to its $f$-content}{subsection.3.1}{}}
+\newlabel{eq:f-quadratic}{{8}{4}{Transition stripped to its $f$-content}{equation.3.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Layer 1: GP regression with known $x$}{4}{subsection.3.2}\protected@file@percent }
+\newlabel{sec:known-x}{{3.2}{4}{Layer 1: GP regression with known $x$}{subsection.3.2}{}}
+\newlabel{eq:known-x}{{12}{4}{Layer 1: GP regression with known $x$}{equation.3.12}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Layer 2: uncertain $x$, in a finite basis}{4}{subsection.3.3}\protected@file@percent }
+\newlabel{sec:uncertain-x}{{3.3}{4}{Layer 2: uncertain $x$, in a finite basis}{subsection.3.3}{}}
+\newlabel{eq:basis}{{13}{4}{Layer 2: uncertain $x$, in a finite basis}{equation.3.13}{}}
+\newlabel{eq:logqstar}{{14}{5}{Layer 2: uncertain $x$, in a finite basis}{equation.3.14}{}}
+\newlabel{eq:Ah}{{16}{5}{Layer 2: uncertain $x$, in a finite basis}{equation.3.16}{}}
+\newlabel{eq:Ah-system}{{17}{5}{Layer 2: uncertain $x$, in a finite basis}{equation.3.17}{}}
+\@writefile{toc}{\contentsline {paragraph}{Stein collapse of the linear term in $h_r$.}{5}{section*.6}\protected@file@percent }
+\newlabel{eq:hr-stein-abstract}{{19}{5}{Stein collapse of the linear term in $h_r$}{equation.3.19}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}The EFGP basis choice}{5}{section.4}\protected@file@percent }
+\newlabel{sec:efgp}{{4}{5}{The EFGP basis choice}{section.4}{}}
+\newlabel{eq:efgp-features}{{20}{5}{The EFGP basis choice}{equation.4.20}{}}
+\@writefile{toc}{\contentsline {paragraph}{Cheap Jacobian.}{6}{section*.7}\protected@file@percent }
+\newlabel{eq:phi-jac}{{21}{6}{Cheap Jacobian}{equation.4.21}{}}
+\@writefile{toc}{\contentsline {paragraph}{BTTB structure of $\mathbb  {E}_{q(x_i)}[\phi \phi ^{*}]$.}{6}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Computing the $q(x)$-expectations that build $A_r, h_r$}{6}{section.5}\protected@file@percent }
+\newlabel{sec:compute}{{5}{6}{Computing the $q(x)$-expectations that build $A_r, h_r$}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Closed-form via the Gaussian characteristic function (default)}{6}{subsection.5.1}\protected@file@percent }
+\newlabel{sec:gmix}{{5.1}{6}{Closed-form via the Gaussian characteristic function (default)}{subsection.5.1}{}}
+\newlabel{eq:Eqx-chi}{{23}{6}{Closed-form via the Gaussian characteristic function (default)}{equation.5.23}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Monte Carlo cloud (reference)}{6}{subsection.5.2}\protected@file@percent }
+\newlabel{sec:mc}{{5.2}{6}{Monte Carlo cloud (reference)}{subsection.5.2}{}}
+\newlabel{eq:hr-mc}{{27}{7}{Monte Carlo cloud (reference)}{equation.5.27}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {6}The q(x) natural-gradient step}{7}{section.6}\protected@file@percent }
+\newlabel{sec:qx}{{6}{7}{The q(x) natural-gradient step}{section.6}{}}
+\newlabel{eq:natgrad-duality}{{28}{7}{Setup}{equation.6.28}{}}
+\newlabel{eq:transition-frozen}{{29}{7}{The transition term, and how the code assembles it}{equation.6.29}{}}
+\@writefile{toc}{\contentsline {paragraph}{Price's theorem (Bonnet's lemma).}{8}{section*.12}\protected@file@percent }
+\newlabel{eq:price}{{30}{8}{Price's theorem (Bonnet's lemma)}{equation.6.30}{}}
+\@writefile{toc}{\contentsline {paragraph}{The GN move on the load-bearing slot.}{8}{section*.13}\protected@file@percent }
+\newlabel{eq:gn-hessian}{{31}{8}{The GN move on the load-bearing slot}{equation.6.31}{}}
+\newlabel{eq:Eff-lin}{{32}{8}{The GN move on the load-bearing slot}{equation.6.32}{}}
+\@writefile{toc}{\contentsline {paragraph}{The same GN move handles every other truncation.}{8}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Gradient table (GN-truncated Price's identities).}{9}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why this is justified.}{9}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Why we can't just autodiff.}{9}{section*.17}\protected@file@percent }
+\newlabel{eq:gmix-exact-Eff}{{34}{9}{Why we can't just autodiff}{equation.6.34}{}}
+\@writefile{toc}{\contentsline {paragraph}{Production base values via gmix-gather.}{9}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Implementation: GN-as-\texttt  {\small  custom\_vjp}.}{9}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Strict-Taylor as a special case.}{10}{section*.20}\protected@file@percent }
+\newlabel{eq:linearisation}{{35}{10}{Strict-Taylor as a special case}{equation.6.35}{}}
+\newlabel{sec:moments}{{6}{10}{Item (ii): the Stein cross-term --- value exact; gradients mix exact and GN-truncated pieces}{section*.22}{}}
+\newlabel{eq:Stein-cross}{{36}{10}{Item (ii): the Stein cross-term --- value exact; gradients mix exact and GN-truncated pieces}{equation.6.36}{}}
+\@writefile{toc}{\contentsline {paragraph}{EFGP vs.\ SING.}{11}{section*.23}\protected@file@percent }
+\newlabel{sec:approximations}{{6}{11}{Item (iii): the marginal quadratic --- the GN slot}{section*.24}{}}
+\newlabel{eq:qf-cov}{{37}{12}{Item (iv): the $V$ term --- production drops; App.~\ref {app:vhutch} opt-in via Price + Hessian-drop}{equation.6.37}{}}
+\newlabel{eq:Eff-full}{{38}{12}{Item (iv): the $V$ term --- production drops; App.~\ref {app:vhutch} opt-in via Price + Hessian-drop}{equation.6.38}{}}
+\newlabel{eq:V-grads-taylor}{{40}{12}{Item (iv): the $V$ term --- production drops; App.~\ref {app:vhutch} opt-in via Price + Hessian-drop}{equation.6.40}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Algorithm summary and complexity}{13}{section.7}\protected@file@percent }
+\newlabel{sec:algorithm}{{7}{13}{Algorithm summary and complexity}{section.7}{}}
+\newlabel{sec:complexity}{{7}{14}{Complexity}{section*.28}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {A}Math-to-code dictionary}{14}{appendix.A}\protected@file@percent }
+\newlabel{app:dictionary}{{A}{14}{Math-to-code dictionary}{appendix.A}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {B}V-Hutch restoration (opt-in)}{14}{appendix.B}\protected@file@percent }
+\newlabel{app:vhutch}{{B}{14}{V-Hutch restoration (opt-in)}{appendix.B}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.1}Closed-form $\mathbb  {E}_{q(x_i)}[V]$ via BTTB-diagonal sums of $D A^{-1} D$}{15}{subsection.B.1}\protected@file@percent }
+\newlabel{eq:omega-def}{{42}{15}{Closed-form $\Eqx [V]$ via BTTB-diagonal sums of $D A^{-1} D$}{equation.B.42}{}}
+\newlabel{eq:V-hutch-closed}{{43}{15}{Closed-form $\Eqx [V]$ via BTTB-diagonal sums of $D A^{-1} D$}{equation.B.43}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.2}Hutchinson estimator of $\omega _r$}{15}{subsection.B.2}\protected@file@percent }
+\newlabel{eq:omega-hutch}{{44}{15}{Hutchinson estimator of $\omega _r$}{equation.B.44}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.3}Per-transition $S_i$-gradient via Taylor}{15}{subsection.B.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {B.4}Homogeneous-$S$ vs heterogeneous-$S$ sub-modes}{15}{subsection.B.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\texttt  {\small  'hutch'} (default).}{16}{section*.29}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{\texttt  {\small  'hutch\_hetS'}.}{16}{section*.30}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {C}Implementation and benchmarks}{16}{appendix.C}\protected@file@percent }
+\newlabel{app:impl}{{C}{16}{Implementation and benchmarks}{appendix.C}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {C.1}Custom-VJP shims: why a shim, not pure autodiff}{16}{subsection.C.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {C.2}Point-eval alternative: linearised-shim}{16}{subsection.C.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {C.3}Wall-time comparisons ($K=10$, $T=500$)}{16}{subsection.C.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {C.4}$\nabla V$ magnitude diagnostic}{17}{subsection.C.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {C.5}Op count for V-Hutch per outer iter}{17}{subsection.C.5}\protected@file@percent }
+\gdef \@abspage@last{17}

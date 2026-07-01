@@ -1,0 +1,32 @@
+
+=== K=2 T=100 (N_eff=198) ===
+  none   : wall=  19.0s  per-iter=0.860s  ℓ=1.9841  σ²=0.7559  latent_rmse=0.0801
+  hutch  : wall=  17.2s  per-iter=0.674s  ℓ=1.9841  σ²=0.7559  latent_rmse=0.0835
+  taylor : wall=  14.5s  per-iter=0.478s  ℓ=1.9840  σ²=0.7559  latent_rmse=0.0809
+
+=== K=5 T=250 (N_eff=1245) ===
+  none   : wall=  18.6s  per-iter=0.658s  ℓ=1.1331  σ²=0.7559  latent_rmse=0.0926
+  hutch  : wall=  31.1s  per-iter=1.485s  ℓ=1.1331  σ²=0.7559  latent_rmse=0.0959
+  taylor : wall=  19.4s  per-iter=0.683s  ℓ=1.1331  σ²=0.7559  latent_rmse=0.0935
+
+=== K=10 T=500 (N_eff=4990) ===
+  none   : wall=  29.5s  per-iter=1.291s  ℓ=1.1337  σ²=1.3230  latent_rmse=0.0642
+  hutch  : wall=  90.4s  per-iter=5.426s  ℓ=1.1337  σ²=1.3230  latent_rmse=0.0643
+  taylor : wall=  29.9s  per-iter=1.327s  ℓ=1.1337  σ²=1.3230  latent_rmse=0.0642
+
+--- summary ---
+  K    T    mode   wall(s)  per-iter(s)        ℓ       σ²   lat_rmse
+  2  100    none      19.0        0.860   1.9841   0.7559     0.0801
+  2  100   hutch      17.2        0.674   1.9841   0.7559     0.0835
+  2  100  taylor      14.5        0.478   1.9840   0.7559     0.0809
+  5  250    none      18.6        0.658   1.1331   0.7559     0.0926
+  5  250   hutch      31.1        1.485   1.1331   0.7559     0.0959
+  5  250  taylor      19.4        0.683   1.1331   0.7559     0.0935
+ 10  500    none      29.5        1.291   1.1337   1.3230     0.0642
+ 10  500   hutch      90.4        5.426   1.1337   1.3230     0.0643
+ 10  500  taylor      29.9        1.327   1.1337   1.3230     0.0642
+
+--- per-iter ratios (relative to 'none', JIT amortised) ---
+  K=2 T=100 (N=198): hutch/none=0.78x  taylor/none=0.56x
+  K=5 T=250 (N=1245): hutch/none=2.25x  taylor/none=1.04x
+  K=10 T=500 (N=4990): hutch/none=4.20x  taylor/none=1.03x

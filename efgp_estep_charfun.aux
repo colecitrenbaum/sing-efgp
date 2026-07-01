@@ -1,0 +1,75 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}The expectations we need}{2}{section.1}\protected@file@percent }
+\newlabel{sec:setup}{{1}{2}{The expectations we need}{section.1}{}}
+\newlabel{eq:Ah-system}{{1}{2}{The expectations we need}{equation.1.1}{}}
+\newlabel{eq:Ah}{{2}{2}{The expectations we need}{equation.1.2}{}}
+\newlabel{eq:hr-stein}{{4}{2}{The expectations we need}{equation.1.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {2}The one primitive: $\mathbb  {E}[\text  {Fourier sum}]$ is an FFT of a density}{2}{section.2}\protected@file@percent }
+\newlabel{sec:cf}{{2}{2}{The one primitive: $\E [\text {Fourier sum}]$ is an FFT of a density}{section.2}{}}
+\newlabel{eq:primitive}{{5}{2}{The one primitive: $\E [\text {Fourier sum}]$ is an FFT of a density}{equation.2.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{Expectation commutes with the Fourier transform.}{3}{section*.2}\protected@file@percent }
+\newlabel{eq:commute}{{6}{3}{Expectation commutes with the Fourier transform}{equation.2.6}{}}
+\newlabel{eq:gmix-density}{{7}{3}{Expectation commutes with the Fourier transform}{equation.2.7}{}}
+\@writefile{toc}{\contentsline {paragraph}{Same target as Monte Carlo, two commuting operations in the other order.}{3}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Where the characteristic function hides.}{3}{section*.4}\protected@file@percent }
+\newlabel{eq:Ephi}{{8}{3}{Where the characteristic function hides}{equation.2.8}{}}
+\newlabel{eq:Ephiphi}{{9}{3}{Where the characteristic function hides}{equation.2.9}{}}
+\newlabel{eq:EJphi}{{10}{3}{Where the characteristic function hides}{equation.2.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}The precision $A_r$: BTTB is preserved}{4}{section.3}\protected@file@percent }
+\newlabel{sec:Ar}{{3}{4}{The precision $A_r$: BTTB is preserved}{section.3}{}}
+\newlabel{eq:Tr-generator}{{12}{4}{The precision $A_r$: BTTB is preserved}{equation.3.12}{}}
+\@writefile{toc}{\contentsline {paragraph}{Why it is not a NUFFT of the means.}{4}{section*.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}The right-hand side $h_r$}{4}{section.4}\protected@file@percent }
+\newlabel{sec:hr}{{4}{4}{The right-hand side $h_r$}{section.4}{}}
+\newlabel{eq:h1-cf}{{13}{4}{The right-hand side $h_r$}{equation.4.13}{}}
+\newlabel{eq:h2-cf}{{14}{4}{The right-hand side $h_r$}{equation.4.14}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}How much of this is Fourier-specific?}{5}{section.5}\protected@file@percent }
+\newlabel{sec:fourier-specific}{{5}{5}{How much of this is Fourier-specific?}{section.5}{}}
+\@writefile{toc}{\contentsline {paragraph}{The smearing is basis-free.}{5}{section*.6}\protected@file@percent }
+\newlabel{eq:basis-free}{{15}{5}{The smearing is basis-free}{equation.5.15}{}}
+\@writefile{toc}{\contentsline {paragraph}{But the smearing is not the sufficient statistics.}{5}{section*.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Three roles, one basis-free.}{5}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Given the pseudo-observations, the Toeplitz structure is the headline.}{5}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{The clean control: same pseudo-obs, no FFT.}{6}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Algorithm: per-source Gaussian-mixture spreader}{6}{section.6}\protected@file@percent }
+\newlabel{sec:gmix-spreader}{{6}{6}{Algorithm: per-source Gaussian-mixture spreader}{section.6}{}}
+\newlabel{eq:gmix-target}{{16}{6}{Algorithm: per-source Gaussian-mixture spreader}{equation.6.16}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Spread the densities, FFT, done}{6}{subsection.6.1}\protected@file@percent }
+\newlabel{sec:plain-story}{{6.1}{6}{Spread the densities, FFT, done}{subsection.6.1}{}}
+\newlabel{eq:riemann}{{17}{6}{Spread the densities, FFT, done}{equation.6.17}{}}
+\@writefile{toc}{\contentsline {paragraph}{Building $g_a$ is cheap.}{6}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{It is a NUFFT with the deconvolution removed.}{6}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Two errors.}{7}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Stencil truncation error}{7}{subsection.6.2}\protected@file@percent }
+\newlabel{sec:trunc}{{6.2}{7}{Stencil truncation error}{subsection.6.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Cost analysis}{7}{section.7}\protected@file@percent }
+\newlabel{sec:cost}{{7}{7}{Cost analysis}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}The fundamental cost driver}{7}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Comparison to standard NUFFT.}{7}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Implication.}{8}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Optimal stencil radius: $r\!\approx \!8$, fixed}{8}{subsection.7.2}\protected@file@percent }
+\newlabel{sec:r-empirics}{{7.2}{8}{Optimal stencil radius: $r\!\approx \!8$, fixed}{subsection.7.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Implementation}{8}{section.8}\protected@file@percent }
+\newlabel{sec:impl}{{8}{8}{Implementation}{section.8}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}New module: \texttt  {\small  sing/efgp\_gmix\_spreader.py}}{8}{subsection.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}New q(f) update: \texttt  {\small  compute\_mu\_r\_gmix\_jax}}{8}{subsection.8.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Driver hook: \texttt  {\small  estep\_method}}{9}{subsection.8.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Tests}{9}{subsection.8.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}End-to-end benchmark}{9}{section.9}\protected@file@percent }
+\newlabel{sec:bench}{{9}{9}{End-to-end benchmark}{section.9}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}Setup}{9}{subsection.9.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}Results --- small/medium $T$}{9}{subsection.9.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.3}Results --- $T = 20{,}000$}{10}{subsection.9.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Two findings.}{10}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Wall time at $T = 20$k.}{10}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.4}Hyperparameter learning paths and the log-marginal landscape}{10}{subsection.9.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Where this sits among the alternatives}{11}{section.10}\protected@file@percent }
+\newlabel{sec:alternatives}{{10}{11}{Where this sits among the alternatives}{section.10}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {11}Recommendation}{11}{section.11}\protected@file@percent }
+\newlabel{sec:reco}{{11}{11}{Recommendation}{section.11}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {12}Math-to-code dictionary}{11}{section.12}\protected@file@percent }
+\newlabel{sec:dict}{{12}{11}{Math-to-code dictionary}{section.12}{}}
+\gdef \@abspage@last{11}
