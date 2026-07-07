@@ -55,6 +55,22 @@ def _build_tiny_problem(D=2, ls=0.7, var=0.8, sigma=0.4, seed=7):
     return grid, top
 
 
+def _build_tiny_problem_offcenter(D=2, ls=0.7, var=0.8, sigma=0.4, seed=7,
+                                   center=5.0):
+    """Same as ``_build_tiny_problem`` but shifted far off the origin so
+    ``grid.xcen != 0`` -- exercises the absolute-frame centring of the V
+    evaluators (the NUFFT paths must NOT evaluate V at ``m - xcen``)."""
+    X_template = (jnp.linspace(center - 2.5, center + 2.5, 6)[:, None]
+                  * jnp.ones((1, D)))
+    grid = jp.spectral_grid_se(ls, var, X_template, eps=5e-2)
+    src = center + jr.normal(jr.PRNGKey(seed), (32, D)) * 1.5
+    weights = jnp.ones(32) * (sigma ** -2)
+    v = jp.bttb_conv_vec_weighted(src, weights, grid.xcen, grid.h_per_dim,
+                                    grid.mtot_per_dim, eps=6e-8)
+    top = jp.make_toeplitz(v)
+    return grid, top
+
+
 def _dense_DAD_and_xi(grid, top, D):
     """Materialise A_complex as a dense MxM matrix, return DAD and the
     spectral coordinate grid xi (matching nufft2's centring)."""
@@ -148,6 +164,63 @@ def test_V_hutch_grad_matches_autodiff_through_truth():
     rel = float(jnp.max(jnp.abs(gV_hutch - gV_truth))
                 / (jnp.max(jnp.abs(gV_truth)) + 1e-12))
     assert rel < 0.10, f"grad rel err {rel:.3f} should be <10% at P=1024"
+
+
+def test_V_hutch_offcenter_absolute_frame():
+    """CENTERING REGRESSION (grid.xcen != 0 / off-origin data).
+
+    omega(delta) from ``precompute_omega_per_r`` is in the ABSOLUTE frame
+    (the gmix spreader builds A there). The einsum reference ``E_V_at``
+    evaluates the absolute sum ``sum_delta rho(delta) e^{2pi i delta.m}``
+    directly and is xcen-independent by construction, so it is the ground
+    truth here. Both fast paths -- the batched homogeneous NUFFT
+    (``precompute_E_V_per_t``) and the hetS gather
+    (``precompute_E_V_per_t_hetS``) -- must agree with it at xcen != 0.
+
+    Before the absolute-frame phase fix, the NUFFT path returned
+    V(m - xcen) (a full spatial offset), so this test failed on the
+    homogeneous path while passing on centred problems -- exactly the bug
+    class the xcen~0 tests could not see.
+    """
+    from sing.efgp_qx_v_hutch import (
+        E_V_at, precompute_E_V_per_t, precompute_E_V_per_t_hetS,
+    )
+    from sing.efgp_gmix_spreader import stencil_radius_for as stencil_for
+
+    D = 2
+    grid, top = _build_tiny_problem_offcenter(D=D, center=5.0)
+    assert float(jnp.max(jnp.abs(grid.xcen))) > 1.0, \
+        "test set-up broken: grid.xcen must be off-origin"
+    omega_aux = precompute_omega_per_r(None, grid, top, jr.PRNGKey(1),
+                                         D_out=D, P=256,
+                                         cg_tol=1e-9, max_cg_iter=500)
+
+    K, T = 2, 6
+    ms = 5.0 + jr.normal(jr.PRNGKey(3), (K, T, D)) * 1.2
+    S_homo = 0.04 * jnp.eye(D)
+
+    # Absolute-frame reference (einsum, no xcen, no NUFFT) at each source.
+    ref = jax.vmap(jax.vmap(lambda m: E_V_at(m, S_homo, omega_aux, grid)))(ms)
+    ref_scale = float(jnp.max(jnp.abs(ref))) + 1e-12
+
+    # Homogeneous NUFFT path (the one that carried the bug).
+    V_homog = precompute_E_V_per_t(omega_aux, ms, S_homo, grid, nufft_eps=1e-10)
+    rel_h = float(jnp.max(jnp.abs(V_homog - ref))) / ref_scale
+    assert rel_h < 1e-3, \
+        f"homogeneous NUFFT vs absolute einsum ref: rel err {rel_h:.2e} " \
+        f"(centering regression -- V evaluated at wrong point?)"
+
+    # hetS gather path (per-source S = S_homo -> must match the same ref).
+    Ss = jnp.broadcast_to(S_homo, (K, T, D, D))
+    M_diff = 2 * int(grid.mtot_per_dim[0])
+    gather_N = 1 << (M_diff - 1).bit_length()
+    h_grid = 1.0 / (gather_N * float(grid.h_per_dim[0]))
+    stencil_r = int(stencil_for(Ss.reshape(-1, D, D), h_grid, n_sigma=4.0))
+    V_hetS = precompute_E_V_per_t_hetS(omega_aux, ms, Ss, grid,
+                                         gather_N=gather_N, stencil_r=stencil_r)
+    rel_g = float(jnp.max(jnp.abs(V_hetS - ref))) / ref_scale
+    assert rel_g < 0.05, \
+        f"hetS gather vs absolute einsum ref: rel err {rel_g:.2e}"
 
 
 def test_V_hutch_hetS_vs_dense_truth_with_varying_S():

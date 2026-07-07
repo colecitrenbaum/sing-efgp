@@ -148,6 +148,36 @@ def precompute_omega_per_r(mu_r_unused: Array, grid: jp.JaxGridState,
     return GmixQxAux(rho_summed=omega_flat, delta_flat=delta_flat)
 
 
+def _abs_frame_fk_grid(rho_env: Array, delta: Array, xcen: Array,
+                        pad_shape, cdtype) -> Array:
+    r"""Fold the absolute-frame phase $e^{+2\pi i\,\delta\cdot x_{\rm cen}}$
+    into the folded $(\rho\cdot{\rm env})$ coefficient grid so that a
+    Type-2 NUFFT evaluated with centre ``grid.xcen`` returns the
+    ABSOLUTE-frame value $V(x)=\sum_\delta \rho(\delta)\,e^{2\pi i\,\delta\cdot x}$.
+
+    Why this is needed: $\omega(\delta)$ from :func:`precompute_omega_per_r`
+    lives in the ABSOLUTE frame -- the gmix spreader builds $A$ (hence
+    ``top`` and $\omega=\mathrm{BTTB}(D A^{-1} D)$) with basis
+    $e^{2\pi i\,m\cdot\xi}$; see the frame note at
+    ``sing/efgp_jax_drift.py:405-417``. A plain
+    ``nufft2(x, fk, grid.xcen, h)`` computes
+    $\sum_\delta fk(\delta)\,e^{2\pi i\,\delta\cdot(x-x_{\rm cen})}$, i.e.
+    it evaluates $V$ at $(x-x_{\rm cen})$ -- a real spatial offset on
+    off-origin data (invisible when $x_{\rm cen}\approx0$, which is why the
+    centred unit tests never caught it). Pre-multiplying by
+    $e^{+2\pi i\,\delta\cdot x_{\rm cen}}$ cancels the $-x_{\rm cen}$ shift
+    while KEEPING the NUFFT coordinates centred at ``xcen`` (numerically
+    safe: the nonuniform phases stay $\sim 2\pi h(x-x_{\rm cen})$ rather
+    than blowing up as $2\pi h x$). This mirrors the $-x_{\rm cen}$
+    phase-undo already present in the hetS gather
+    (:func:`sing.efgp_gmix_gather.gmix_inverse_nufft_2d`). No-op when
+    $x_{\rm cen}\approx0$.
+    """
+    phase = jnp.exp(2j * jnp.pi
+                    * (delta @ xcen.astype(delta.dtype))).astype(cdtype)
+    return (rho_env * phase).reshape(pad_shape)
+
+
 def E_V_at_all_homogeneous(m_per_source: Array, S_homo: Array,
                               omega_aux: GmixQxAux,
                               grid: jp.JaxGridState,
@@ -179,8 +209,10 @@ def E_V_at_all_homogeneous(m_per_source: Array, S_homo: Array,
     env  = jnp.exp(-2 * jnp.pi**2 * quad).astype(cdtype)
     # Reshape onto the FFT-padded grid; jp.nufft2 expects natural-
     # order block layout matching its mtot_per_dim shape parameter.
+    # Fold in the absolute-frame phase so the NUFFT (evaluated with
+    # grid.xcen for numerical centring) returns V(x), not V(x - xcen).
     pad_shape = tuple(2 * int(n) for n in grid.mtot_per_dim)
-    fk_grid = (rho * env).reshape(pad_shape)
+    fk_grid = _abs_frame_fk_grid(rho * env, delta, grid.xcen, pad_shape, cdtype)
     # Standard Type-2 NUFFT at the eval points; the difference-grid h
     # equals the spectral grid h, and lag 0 sits at the centre of the
     # padded grid (consistent with ``_delta_grid_for_autocorr``'s
@@ -239,8 +271,11 @@ def precompute_E_V_per_t(omega_aux: GmixQxAux,
     delta = omega_aux.delta_flat.astype(rdtype)
     quad  = jnp.einsum('pd,de,pe->p', delta, S_homo.astype(rdtype), delta)
     env   = jnp.exp(-2 * jnp.pi**2 * quad).astype(cdtype)
+    # Fold in the absolute-frame phase (see _abs_frame_fk_grid): keeps the
+    # NUFFT numerically centred at grid.xcen while returning V(x), not
+    # V(x - xcen). No-op on centred data.
     pad_shape = tuple(2 * int(n) for n in grid.mtot_per_dim)
-    fk_grid = (rho * env).reshape(pad_shape)
+    fk_grid = _abs_frame_fk_grid(rho * env, delta, grid.xcen, pad_shape, cdtype)
 
     # Batched NUFFT-2: vmap over K trials, single call per trial
     # evaluates at all T sources. Shared FFT inside each trial.
@@ -329,8 +364,20 @@ def precompute_E_V_per_t_hetS(omega_aux: GmixQxAux,
     M_per_dim_diff = 2 * int(grid.mtot_per_dim[0])         # difference-grid side
     h_spec = grid.h_per_dim[0]                             # JAX scalar OK
     xcen = grid.xcen
-    fk_grid = omega_aux.rho_summed.reshape(M_per_dim_diff,
-                                              M_per_dim_diff)
+    # Absolute-frame centring (off-origin data). omega(delta) is absolute
+    # (see _abs_frame_fk_grid), but gmix_inverse_nufft_2d applies xcen TWICE
+    # -- once as its internal e^{-2πi ξ·xcen} phase-undo and once as the
+    # spatial readout at (m - xcen) in _gather_2d -- so a raw call returns
+    # V(m - 2·xcen). Pre-multiplying omega by e^{+2πi δ·(2·xcen)} cancels
+    # both, giving V(m). No-op when xcen ≈ 0 (why the centred gather tests
+    # never caught it). Verified to ~1e-5 vs the E_V_at einsum reference in
+    # test_V_hutch_offcenter_absolute_frame.
+    cdtype = grid.ws.dtype
+    delta = omega_aux.delta_flat.astype(grid.xcen.dtype)
+    abs_phase = jnp.exp(
+        2j * jnp.pi * (delta @ (2.0 * grid.xcen))).astype(cdtype)
+    fk_grid = (omega_aux.rho_summed.astype(cdtype) * abs_phase).reshape(
+        M_per_dim_diff, M_per_dim_diff)
 
     K, T, D = ms.shape
     ms_flat = ms.reshape(-1, D)
