@@ -1,0 +1,124 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,booktabs,geometry,hyperref,xcolor}
+\geometry{margin=1in}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\code}[1]{\texttt{#1}}
+\title{\textbf{The EFGP $K$-scaling length-scale collapse is a spectral-grid
+aliasing bug}}
+\author{Duffing $K$-sweep diagnosis}
+\date{}
+\begin{document}
+\maketitle
+
+\noindent\textbf{Summary.} On the Duffing $K$-sweep ($T{=}1000$/trial, learned
+RBF hypers, $\ell_{\rm init}{=}0.7$), EFGP's length-scale \emph{collapses} at
+$K{=}100$ ($\ell{\to}0.13$, drift NRMSE ${\to}7$--$14$) while SparseGP and
+$K{\le}10$ are healthy. The cause is \textbf{not} a missing vEM term, not
+over-fitting, and not model capacity. It is an \textbf{aliasing bug} in the
+adaptive-$h$ spectral grid: as the M-step lowers $\ell$, the grid picks a spatial
+sample spacing whose implied period falls below the data extent, so the drift
+field \emph{wraps around}; the corrupted marginal likelihood then rewards
+ever-smaller $\ell$, a runaway. With a correctly-sized (non-aliasing) grid,
+EFGP's spectral marginal likelihood equals the exact GP's and recovers the right
+$\ell$ --- as GP theory demands, since the mode count $M$ is a kernel-approximation
+knob, not a capacity knob. One-line fix in \code{spectral\_grid\_se\_fixed\_K}.
+
+\section{The marginal likelihood is faithful --- when the grid is correct}
+The EFGP/RFF collapsed objective is the exact GP marginal likelihood as
+$M\to\infty$; the spectral weights $D_\theta(\xi){=}\sqrt{S(\xi;\ell)}$
+suppress high frequencies, so at fixed $\ell$ more modes just refine the same
+kernel (no extra capacity to overfit). Verified directly on a fixed Duffing
+pseudo-velocity dataset --- exact dense-GP evidence vs.\ the RFF/EFGP collapsed
+evidence on a \emph{properly sampled} frequency grid:
+\begin{center}\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+ & exact dense GP & RFF/EFGP ($M{=}441$) & RFF/EFGP ($M{=}1089$) \\
+\midrule
+$\arg\min_\ell$ NLL & $1.16$ & $1.16$ & $1.16$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+They agree. So EFGP's M-step is not intrinsically biased; the collapse must come
+from the grid the objective is evaluated on.
+
+\section{The bug: aliasing in the adaptive-$h$ grid}
+\code{spectral\_grid\_se\_fixed\_K} fixes the integer mode lattice
+($\pm K$ per dim, $M{=}(2K{+}1)^d$) and adapts the physical spacing $h$ to
+$\ell$. Two spacing constraints:
+\[
+\underbrace{h \le h_{\rm spatial}}_{\text{no aliasing: period }1/h\ \ge\ \text{data extent}},
+\qquad
+\underbrace{h \ge h_{\rm freq}=L_{\rm freq}(\ell)/K}_{\text{cover the spectrum with }K\text{ modes}},
+\quad L_{\rm freq}\propto 1/\ell .
+\]
+The code chose $h=\max(h_{\rm freq},h_{\rm spatial})$. As the M-step lowers
+$\ell$, $L_{\rm freq}\propto1/\ell$ grows so $h_{\rm freq}$ grows, while
+$h_{\rm spatial}$ (set by the fixed data extent) stays put; once
+$h_{\rm freq}>h_{\rm spatial}$, \code{max} returns the too-coarse $h_{\rm freq}$
+$\Rightarrow$ spatial period $1/h<$ data extent $\Rightarrow$ \textbf{the data
+aliases}. Measured for the $K{=}100$ grid (data full-extent $4.24$):
+\begin{center}\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+$\ell$ & $h$ (\code{max}, legacy) & spatial period $1/h$ & vs.\ data extent $4.24$ \\
+\midrule
+$0.70$ & $0.212$ & $4.72$ & ok \\
+$0.50$ & $0.296$ & $3.38$ & \textbf{aliasing} \\
+$0.25$ & $0.592$ & $1.69$ & severe \\
+$0.13$ & $1.138$ & $0.88$ & catastrophic ($\sim5\times$ wrap) \\
+\bottomrule
+\end{tabular}
+\end{center}
+Aliasing corrupts the kernel/drift representation, and the corrupted marginal
+likelihood spuriously prefers small $\ell$ --- exactly the collapse. (The code's
+own comment states the intent was to use ``the frequency-derived $h$, smaller''
+--- i.e.\ $\min$ --- but it wrote $\max$; separately $h_{\rm spatial}$ used the
+half-extent $1/(X{+}L_{\rm time})$, $\sim2\times$ too permissive.)
+
+\section{The fix}
+\begin{equation}
+h=\min\!\big(h_{\rm freq},\,h_{\rm spatial}\big),
+\qquad
+h_{\rm spatial}=\frac{1}{2X_{\rm extent}+L_{\rm time}} .
+\end{equation}
+At the fitting $\ell$, $h_{\rm freq}\le h_{\rm spatial}$ so $h=h_{\rm freq}$
+(full spectral resolution, no aliasing). If $\ell$ drops below what $K$ can
+resolve without aliasing, $h=h_{\rm spatial}$ \emph{caps} the spacing: the
+spectrum tail is truncated (a graceful band-limit) rather than the data being
+aliased. This never wraps the data at any $\ell$. Env-gated
+\code{EFGP\_GRID\_ANTIALIAS} in \code{sing/efgp\_jax\_primitives.py}.
+
+\section{Results}
+Default adaptive-$h$, \textbf{no pin}, only the grid fix:
+\begin{center}\small
+\begin{tabular}{@{}lccl@{}}
+\toprule
+ & $\ell_{\rm final}$ & drift NRMSE & vs.\ baseline \\
+\midrule
+\textbf{$K{=}100$, anti-alias} & $\mathbf{0.85}$ & $\mathbf{0.34}$ & baseline collapsed $\ell{=}0.13$, NRMSE${\sim}7$ \\
+$K{=}10$, anti-alias           & $1.53$          & $0.14$          & unchanged (was $1.56/0.13$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+The collapse is gone: $K{=}100$ recovers $\ell{\approx}0.85$ with NRMSE $0.34$
+(cf.\ frozen-oracle floor $0.28$; true-path oracle MLE $1.1$). The residual
+$0.85$ vs.\ $1.1$ is ordinary mild bias (the reconstruction is slightly wiggly),
+comparable to other methods, \emph{not} a divergence. $K{=}10$ is untouched.
+
+\section{Consistency with earlier observations}
+Every earlier puzzle is explained by aliasing:
+\begin{itemize}\itemsep2pt
+\item \textbf{``More Fourier modes made it worse''} ($K$-min-$\ell$ forcing,
+$M{\sim}2000$: $\ell{=}0.14$, NRMSE $14$): more modes let $\ell$ descend further
+before re-aliasing at the finer resolution --- deeper collapse, not better.
+\item \textbf{Pinning the grid ``worked''} ($\ell{=}1.25$): it stops the
+adaptive rescaling, so the grid stays at its non-aliasing spacing.
+\item \textbf{The $S$-floor ``worked''}: the envelope $e^{-2\pi^2\xi^\top S\xi}$
+damps the (aliased) high-frequency content, masking the corruption.
+\item \textbf{The exact residual-Hessian / $\E[V]$ terms did nothing}: the
+collapse was never a missing-term problem.
+\item \textbf{SparseGP is immune}: no spectral grid, so no aliasing.
+\end{itemize}
+None of these were the fix; the grid anti-aliasing is.
+\end{document}

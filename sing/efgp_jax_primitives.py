@@ -252,19 +252,25 @@ def spectral_grid_se_fixed_K(
     Lfreq = jnp.sqrt(-jnp.log(jnp.array(eps, dtype=dtype))) \
             / (math.pi * ls * math.sqrt(2.0))
 
-    # Spatial coverage: h ≤ 1/(L + Ltime) where Ltime ≈ ℓ √(-2 log eps).
+    # Spatial coverage (NO ALIASING): the NUFFT is periodic with period 1/h,
+    # so the data (half-extent X_extent about xcen, plus kernel reach Ltime)
+    # must fit in one period: 1/h ≥ 2*X_extent + Ltime  ⇒  h ≤ h_spatial_max.
+    # (The legacy bound 1/(X_extent+Ltime) is ~2x too permissive at small ℓ
+    # where Ltime→0, which is the aliasing bug that collapses ℓ at large K.)
     Ltime = ls * jnp.sqrt(-2.0 * jnp.log(jnp.array(eps, dtype=dtype)))
-    h_spatial_max = 1.0 / (X_extent + Ltime)
+    h_spatial_max = 1.0 / (2.0 * X_extent + Ltime)
 
     # Frequency coverage: h ≥ Lfreq / K
     h_freq_min = Lfreq / K
 
-    # Pick h = max(spatial-needed, freq-needed).  When K was chosen for
-    # the smallest expected ls, h_spatial_max ≥ h_freq_min and we use the
-    # frequency-derived h (smaller, safer for spatial too).  If ℓ drops
-    # below ls_min the user picked K for, jnp.maximum keeps us safe — at
-    # the cost of slightly under-resolving the spectrum at the edges.
-    h = jnp.maximum(h_freq_min, h_spatial_max).astype(dtype)
+    # h = min(freq-needed, spatial-max). At the fitting ℓ, h_freq_min ≤
+    # h_spatial_max → h = h_freq_min (full spectral resolution, no aliasing). If
+    # ℓ drops below what the fixed K can resolve without aliasing, h =
+    # h_spatial_max CAPS the spacing so the NUFFT spatial period always covers
+    # the data: the spectrum tail is truncated (a graceful band-limit) rather
+    # than the data being aliased/wrapped. Using jnp.maximum here instead is the
+    # aliasing bug that collapses ℓ→0 at large K (see efgp_kscale_divergence.tex).
+    h = jnp.minimum(h_freq_min, h_spatial_max).astype(dtype)
 
     # 1-D integer lattice → ξ_k = h * k
     k_lattice = jnp.arange(-K, K + 1, dtype=dtype)
