@@ -86,6 +86,7 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
                                 qf_cg_tol, qf_max_cg_iter, qf_nufft_eps,
                                 estep_method='mc',
                                 gmix_fine_N=None, gmix_stencil_r=None,
+                                analytic_order=1,
                                 qx_moments_method='gmix_batched',
                                 restore_qf_variance='none',
                                 qx_v_cg_tol: float = 1e-4,
@@ -149,16 +150,24 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
         #                  overhead at K=10/T=500 with n_sigma=2.
         if (qx_moments_method in ('linearised_shim', 'gmix_batched')
                 and restore_qf_variance in ('hutch', 'hutch_hetS')
-                and estep_method == 'gmix'):
+                and estep_method in ('gmix', 'analytic')):
             key_v0, key = jr.split(key, 2)
             mp_b0, _ = vmap(natural_to_marginal_params)(natural_params, trial_mask_b)
             ms0 = mp_b0['m']; Ss0 = mp_b0['S']; SSs0 = mp_b0['SS']
-            _, _, _, _, top0 = jpd.qf_and_moments_gmix_jax(
-                ms0, Ss0, SSs0, del_t, trial_mask_b, grid,
-                sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
-                fine_N=gmix_fine_N, stencil_r=gmix_stencil_r,
-                cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
-                nufft_eps=qf_nufft_eps, return_top=True)
+            if estep_method == 'analytic':
+                _, _, _, _, top0 = jpd.qf_and_moments_analytic_jax(
+                    ms0, Ss0, SSs0, del_t, trial_mask_b, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    order=analytic_order,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps, return_top=True)
+            else:
+                _, _, _, _, top0 = jpd.qf_and_moments_gmix_jax(
+                    ms0, Ss0, SSs0, del_t, trial_mask_b, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    fine_N=gmix_fine_N, stencil_r=gmix_stencil_r,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps, return_top=True)
             omega_aux_outer = _precompute_omega_per_r(
                 None, grid, top0, key_v0,
                 D_out=D, P=qx_v_n_probes,
@@ -192,6 +201,14 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
                     ms, Ss, SSs, del_t, trial_mask_b, grid,
                     sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
                     fine_N=gmix_fine_N, stencil_r=gmix_stencil_r,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps,
+                )
+            elif estep_method == 'analytic':
+                mu_r, Ef, Eff, Edfdx = jpd.qf_and_moments_analytic_jax(
+                    ms, Ss, SSs, del_t, trial_mask_b, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    order=analytic_order,
                     cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
                     nufft_eps=qf_nufft_eps,
                 )
@@ -455,11 +472,28 @@ def fit_efgp_sing_jax(
     qf_max_cg_iter: int = 2000,
     qf_nufft_eps: float = 6e-8,
     # E-step q(f)-update method:
-    #   'gmix' (default): closed-form Gaussian-mixture spreader (variant A
-    #     from efgp_estep_charfun.tex).  Deterministic, exact up to FFT
-    #     truncation; no S_marginal MC noise.
+    #   'analytic' (DEFAULT): closed-form type-1 NUFFTs with the per-source
+    #     Gaussian envelope Taylor-expanded in ΔS_i = S_i − S̄ (see
+    #     sing.efgp_jax_drift.compute_mu_r_analytic_jax + analytic_order).
+    #     ~6× faster than 'gmix' on the q(f) update (no fine spatial grid /
+    #     stencil) AND more accurate: exact for homogeneous S rather than
+    #     carrying gmix's n_sigma stencil-tail-truncation bias (~10% at the
+    #     'gmix' default n_sigma=1.5, even at het=0).  2-D only in v0.
+    #   'gmix': closed-form Gaussian-mixture spreader (variant A from
+    #     efgp_estep_charfun.tex).  Per-source-exact for heterogeneous S up
+    #     to the stencil tail truncation; kept as a fallback for pathological
+    #     heterogeneity (S spread ≳ 50×, e.g. deep cold-start) where even
+    #     analytic_order=2 is insufficient — at the cost of a large stencil.
     #   'mc' (legacy): pseudo-cloud Monte Carlo (S_marginal samples per t).
-    estep_method: str = 'gmix',
+    estep_method: str = 'analytic',
+    # analytic_order: ΔS Taylor truncation for estep_method='analytic'.
+    #   0 → homogeneous-S (drop ΔS; exact only when S_t is constant across t);
+    #   1 (DEFAULT) → first-order, accurate to a few % up to ~20× S-spread
+    #     (real converged fits are ~1.4×, so essentially exact);
+    #   2 → second-order, handles up to ~60× S-spread (~10% error).
+    # Each order adds a few type-1 NUFFTs sharing m_src (XLA batches them),
+    # so order→order wall cost is nearly flat.
+    analytic_order: int = 1,
     # Gaussian-mixture spreader knobs (only used when estep_method == 'gmix'):
     #   gmix_fine_N : int — FFT grid size per dim.  Picked automatically if
     #     None, based on max sigma seen at the initial q(x).  Recompiles if
@@ -650,9 +684,13 @@ def fit_efgp_sing_jax(
 
     # Defer jit'd scan construction until the grid is known (so gmix
     # path can size fine_N from h_spec).
-    if estep_method not in ('mc', 'gmix'):
-        raise ValueError(f"estep_method must be 'mc' or 'gmix', "
+    if estep_method not in ('mc', 'gmix', 'analytic'):
+        raise ValueError(f"estep_method must be 'mc', 'gmix' or 'analytic', "
                          f"got {estep_method!r}")
+    if estep_method == 'analytic' and D != 2:
+        raise NotImplementedError(
+            "estep_method='analytic' is 2-D only in v0; pass estep_method="
+            "'gmix' for D != 2.")
     # gmix-gather params for hutch_hetS — actual values may be patched
     # below once the spectral grid + sigma0_max are known. Pass safe
     # defaults here so 'none'/'hutch' modes don't see uninitialised
@@ -666,6 +704,7 @@ def fit_efgp_sing_jax(
         qf_cg_tol=qf_cg_tol, qf_max_cg_iter=qf_max_cg_iter,
         qf_nufft_eps=qf_nufft_eps,
         estep_method=estep_method,
+        analytic_order=analytic_order,
         qx_moments_method=qx_moments_method,
         restore_qf_variance=restore_qf_variance,
         qx_v_cg_tol=qx_v_cg_tol,
@@ -736,19 +775,22 @@ def fit_efgp_sing_jax(
 
     # Now that the grid is built, size the gmix spreader (if used) and
     # build the jit'd scan once.  fine_N / stencil_r baked into closure.
+    # Initial Σ_max: from prior covariance V0 (covers cold-start regime where
+    # q(x) is broad).  Multi-trial: take max eigenvalue across all trials' V0.
+    # Needed both to size the gmix spreader stencil AND the gmix-gather (used
+    # by qx_moments_method='gmix_batched', which is independent of
+    # estep_method), so compute it unconditionally.
+    h_spec0 = float(grid.h_per_dim[0])
+    V0_all = jnp.asarray(init_params['V0'])
+    if V0_all.ndim == 2:
+        V0_all = V0_all[None]                                 # (1, D, D)
+    sigma0_max = float(jnp.sqrt(jnp.max(jnp.linalg.eigvalsh(V0_all))))
+
     if estep_method == 'gmix':
         from sing.efgp_gmix_spreader import (
             stencil_radius_for as _stencil_for, pick_grid_size as _pick_N)
-        h_spec0 = float(grid.h_per_dim[0])
-        # Initial Σ_max: from prior covariance V0 (covers cold-start regime
-        # where q(x) is broad).  Multi-trial: take max eigenvalue across
-        # all trials' V0 so the stencil covers the widest prior.
         # fine_N and stencil_r are STATIC; if the user wants to recompile
         # after warmup with tighter values, they can re-instantiate.
-        V0_all = jnp.asarray(init_params['V0'])
-        if V0_all.ndim == 2:
-            V0_all = V0_all[None]                              # (1, D, D)
-        sigma0_max = float(jnp.sqrt(jnp.max(jnp.linalg.eigvalsh(V0_all))))
         # Span the cloud extent we already used to build the grid:
         X_min = np.asarray(X_template.min(axis=0))
         X_max = np.asarray(X_template.max(axis=0))
@@ -889,6 +931,14 @@ def fit_efgp_sing_jax(
                     cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
                     nufft_eps=qf_nufft_eps,
                 )
+            elif estep_method == 'analytic':
+                mu_r_prev, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_analytic_jax(
+                    ms_prev, Ss_prev, SSs_prev, del_t, trial_mask, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    order=analytic_order,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps,
+                )
             else:
                 mu_r_prev, Ef_prev, Eff_prev, Edfdx_prev = jpd.qf_and_moments_gmix_jax(
                     ms_prev, Ss_prev, SSs_prev, del_t, trial_mask, grid,
@@ -933,6 +983,12 @@ def fit_efgp_sing_jax(
                     sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
                     D_lat=D, D_out=D, cg_tol=qf_cg_tol,
                     max_cg_iter=qf_max_cg_iter, nufft_eps=qf_nufft_eps)
+            elif estep_method == 'analytic':
+                _, Ef_B, _, _ = jpd.qf_and_moments_analytic_jax(
+                    ms_t, Ss_t, SSs_t, del_t_B, trial_mask, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    order=analytic_order, cg_tol=qf_cg_tol,
+                    max_cg_iter=qf_max_cg_iter, nufft_eps=qf_nufft_eps)
             else:
                 _, Ef_B, _, _ = jpd.qf_and_moments_gmix_jax(
                     ms_t, Ss_t, SSs_t, del_t_B, trial_mask, grid,
@@ -955,6 +1011,14 @@ def fit_efgp_sing_jax(
                     m_src, S_src, d_src, C_src, w_src, grid, mstep_key,
                     sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
                     D_lat=D, D_out=D,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                    nufft_eps=qf_nufft_eps,
+                )
+            elif estep_method == 'analytic':
+                mu_r, _, top = jpd.compute_mu_r_analytic_jax(
+                    m_src, S_src, d_src, C_src, w_src, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    order=analytic_order,
                     cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
                     nufft_eps=qf_nufft_eps,
                 )
@@ -1051,6 +1115,12 @@ def fit_efgp_sing_jax(
             trial_mask, grid, jr.PRNGKey(seed + 12345),
             sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
             D_lat=D, D_out=D, cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+            nufft_eps=qf_nufft_eps)
+    elif estep_method == 'analytic':
+        mu_r_final, _, _, _ = jpd.qf_and_moments_analytic_jax(
+            mp_final_b['m'], mp_final_b['S'], mp_final_b['SS'], del_t_final,
+            trial_mask, grid, sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+            order=analytic_order, cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
             nufft_eps=qf_nufft_eps)
     else:
         mu_r_final, _, _, _ = jpd.qf_and_moments_gmix_jax(

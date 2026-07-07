@@ -31,6 +31,36 @@ Two GP-drift inference paths share the same SING natural-grad backbone:
 Both consume the same `Likelihood`, `init_params`, `output_params` interfaces
 and produce `marginal_params` of shape `(K, T, D)`.
 
+## ⚠️ EFGP q(f) update default: `estep_method='analytic'` (since 2026-07)
+
+`fit_efgp_sing_jax` now defaults to `estep_method='analytic'` (was `'gmix'`).
+The analytic path replaces the gmix per-source spatial-grid **spread+FFT**
+(the ~90% of the q(f)-update wall, and ~half of per-EM-iter wall at T=10K)
+with **type-1 NUFFTs + a Taylor-expanded Gaussian envelope**: writing
+`S_i = S̄ + ΔS_i`, the deviation envelope `exp(-2π² ξᵀΔS_i ξ)` is expanded to
+`analytic_order` (default 1) in `ΔS_i`, each term being one NUFFT with a
+ΔS-monomial-weighted source vector. See
+`sing/efgp_jax_drift.py::compute_mu_r_analytic_jax`.
+
+Why it's the default:
+- **~6× faster** on the q(f) update (T=10K: 171→29 ms), **~1.66× faster
+  end-to-end** at T=10K (187→113 s); no fine spatial grid, no stencil.
+- **More accurate**: exact for homogeneous S (order-independent), vs gmix's
+  n_sigma=1.5 stencil-tail-truncation bias (~10% vs MC truth *even at het=0*,
+  grid-independent — only shrinks with a bigger/costlier stencil).
+- Handles heterogeneous `S_t` gracefully via the order knob (`S` is the
+  marginal covariance of q(x_t), so it *does* vary across t):
+  `order=1` → <4% up to ~20× S-spread (real converged fits are ~1.4×);
+  `order=2` → up to ~60× (~10%). Deep cold-start (spread ≳50×) is where
+  neither cheap option is exact — but ρ≈0.05 + `kernel_warmup_iters` wash it
+  out. Order→order wall cost is nearly flat (NUFFTs share `m_src`).
+
+**2-D only in v0** (like gmix). For D≠2 it raises; pass `estep_method='gmix'`.
+`estep_method='gmix'` (and `'mc'`) remain available as fallbacks for
+pathological heterogeneity. The analytic `mu_r` is in the same relative
+(xcen-aware) frame as the MC path — a drop-in for `drift_moments_jax`, the
+gmix gather, and the kernel M-step (no xcen phase correction).
+
 ## Project venv
 
 ```
@@ -309,6 +339,7 @@ $PY -m pytest tests/test_efgp_em_multitrial.py \
     tests/test_efgp_jax_primitives.py \
     tests/test_efgp_jax_recovery.py \
     tests/test_efgp_gmix_vs_mc.py \
+    tests/test_efgp_analytic.py \
     tests/test_efgp_sparsegp_drift_agreement.py \
     tests/test_gmix_nufft.py tests/test_gmix_spreader.py
 
@@ -327,9 +358,10 @@ varying S, complex-ω guard, slow E2E E2E with all 3 modes).
 ## File map (EFGP-relevant)
 
 - `sing/efgp_em.py` — top-level fit (multi-trial driver)
-- `sing/efgp_jax_drift.py` — q(f) primitives (`compute_mu_r_*_jax`,
-  `_flatten_stein`, `drift_moments_jax`, `m_step_kernel_jax`,
-  `FrozenEFGPDrift`)
+- `sing/efgp_jax_drift.py` — q(f) primitives (`compute_mu_r_*_jax` incl.
+  `compute_mu_r_analytic_jax` (DEFAULT path) + `qf_and_moments_analytic_jax`
+  + `_env_taylor_pairs`, `_flatten_stein`, `drift_moments_jax`,
+  `m_step_kernel_jax`, `FrozenEFGPDrift`)
 - `sing/efgp_jax_primitives.py` — JAX NUFFT, BTTB Toeplitz, spectral grid
 - `sing/efgp_gmix_spreader.py` — closed-form Gaussian mixture spreader (Type-1)
 - `sing/efgp_gmix_gather.py` — Type-2 analog of spreader (per-source

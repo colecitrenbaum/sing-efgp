@@ -519,6 +519,206 @@ def qf_and_moments_gmix_jax(
     return mu_r, Ef, Eff, Edfdx
 
 
+# ---------------------------------------------------------------------------
+# Closed-form variant: Taylor-expanded per-source envelope (analytic NUFFT)
+# ---------------------------------------------------------------------------
+def _env_taylor_pairs(freqs: Array, dS: Array, order: int):
+    """Taylor series of the per-source deviation envelope ``exp(u_i)``,
+    ``u_i = -2π² fᵀ ΔS_i f``, at target frequencies ``freqs`` (F, 2).
+
+    Returns a list of ``(coeff_f, wfac)`` pairs (``coeff_f`` shape ``(F,)``,
+    ``wfac`` shape ``(N_src,)``) such that
+
+        Σ_i base_w_i e^{±2πi m_i·f} exp(u_i)
+          ≈ Σ_pairs coeff_f(f) · NUFFT1(m, base_w · wfac)(f)
+
+    i.e. every pair is one type-1 NUFFT whose per-source weight carries the
+    ΔS monomial and whose spectral coefficient carries the ξ monomial.  The
+    homogeneous envelope ``exp(-2π² fᵀ S̄ f)`` is applied by the caller.
+
+    ``order`` is the truncation order of ``exp(u_i) ≈ Σ_{k≤order} u_i^k/k!``:
+      order 0 → homogeneous-S (drop ΔS entirely);
+      order 1 → first-order in ΔS (accurate to a few % up to ~20× S-spread);
+      order 2 → second-order (handles up to ~60× S-spread).
+    2-D only (matches ``compute_mu_r_gmix_jax``).
+    """
+    fx, fy = freqs[:, 0], freqs[:, 1]
+    dS00, dS01, dS11 = dS[:, 0, 0], dS[:, 0, 1], dS[:, 1, 1]
+    pi2 = math.pi ** 2
+    pairs = [(jnp.ones_like(fx), jnp.ones_like(dS00))]           # u^0/0! = 1
+    if order >= 1:
+        # u = -2π² (fx² ΔS00 + 2 fx fy ΔS01 + fy² ΔS11)
+        pairs += [(-2 * pi2 * fx * fx, dS00),
+                  (-2 * pi2 * 2 * fx * fy, dS01),
+                  (-2 * pi2 * fy * fy, dS11)]
+    if order >= 2:
+        # u²/2 = (2π²)²/2 · (fx² ΔS00 + 2 fx fy ΔS01 + fy² ΔS11)²
+        c = (2 * pi2) ** 2 / 2.0
+        pairs += [(c * fx ** 4, dS00 * dS00),
+                  (c * 4 * fx * fx * fy * fy, dS01 * dS01),
+                  (c * fy ** 4, dS11 * dS11),
+                  (c * 4 * fx ** 3 * fy, dS00 * dS01),
+                  (c * 2 * fx * fx * fy * fy, dS00 * dS11),
+                  (c * 4 * fx * fy ** 3, dS01 * dS11)]
+    if order > 2:
+        raise NotImplementedError(
+            f"analytic_order={order} not implemented (max 2).")
+    return pairs
+
+
+def compute_mu_r_analytic_jax(
+    m_src: Array,                     # (N_src, D_lat)
+    S_src: Array,                     # (N_src, D_lat, D_lat)
+    d_src: Array,                     # (N_src, D_lat)
+    C_src: Array,                     # (N_src, D_lat, D_lat)
+    weights: Array,                   # (N_src,)
+    grid: jp.JaxGridState,
+    *,
+    sigma_drift_sq: float,
+    D_lat: int,
+    D_out: int,
+    order: int = 1,
+    cg_tol: float = 1e-5,
+    max_cg_iter: int = 2000,
+    nufft_eps: float = 6e-8,
+) -> Tuple[Array, Array, jp.ToeplitzNDJax]:
+    """Closed-form q(f) update via analytic type-1 NUFFTs + a Taylor-expanded
+    per-source Gaussian envelope.
+
+    The gmix spreader (:func:`compute_mu_r_gmix_jax`) handles the per-source
+    covariance ``S_i`` by tabulating each ``N(x; m_i, S_i)`` on a fine spatial
+    grid (a ``(2r+1)^D`` stencil per source) and FFT-ing — O(N_src·stencil^D +
+    N^D log N), and with an n_sigma-dependent tail-truncation bias.  Here we
+    instead evaluate the exact target
+
+        F(ξ) = Σ_i w_i e^{2πi m_iᵀξ} e^{-2π² ξᵀ S_i ξ}
+
+    by writing ``S_i = S̄ + ΔS_i`` and Taylor-expanding the deviation envelope
+    ``exp(-2π² ξᵀ ΔS_i ξ)`` in ``ΔS_i`` (see :func:`_env_taylor_pairs`).  Each
+    term is a type-1 NUFFT of ``m_src`` with a ΔS-monomial-weighted source
+    vector, multiplied by the homogeneous envelope ``exp(-2π² ξᵀ S̄ ξ)`` and a
+    ξ-monomial coefficient.  Cost O(order² · (N_src + M log M)) — no fine grid,
+    no stencil, and exact for homogeneous S (order irrelevant) rather than
+    tail-truncated.
+
+    Uses the same relative (xcen-aware) frame as :func:`compute_mu_r_jax`
+    (via ``jp.nufft1`` / ``jp.bttb_conv_vec_weighted``), so the returned
+    ``mu_r`` is a drop-in for the MC/gmix ``mu_r`` everywhere downstream
+    (``drift_moments_jax``, ``drift_moments_gmix_jax``, the kernel M-step); no
+    ``xcen`` phase correction is needed.
+
+    Returns ``(mu_r, None, top)`` — 2-D only in v0.
+    """
+    if D_lat != 2:
+        raise NotImplementedError(
+            "compute_mu_r_analytic_jax: only D_lat == 2 in v0.")
+    cdtype = grid.ws.dtype
+    xcen = grid.xcen
+    h = grid.h_per_dim
+    mtot = grid.mtot_per_dim
+    ws_real_c = grid.ws.real.astype(cdtype)
+    Sbar = S_src.mean(axis=0)                                   # (D, D)
+    dS = S_src - Sbar[None]                                     # (N_src, D, D)
+
+    # ---- BTTB generator on the difference grid (4K+1 per dim) ----
+    Ld = tuple(2 * (mm - 1) + 1 for mm in mtot)
+    hm = (Ld[0] - 1) // 2
+    dax = jnp.arange(-hm, hm + 1, dtype=m_src.dtype) * h[0]
+    DX, DY = jnp.meshgrid(dax, dax, indexing='ij')
+    dfreqs = jnp.stack([DX.ravel(), DY.ravel()], axis=-1)       # (Ld², 2)
+    env_diff = jnp.exp(-2 * (math.pi ** 2)
+                        * (Sbar[0, 0] * DX ** 2 + 2 * Sbar[0, 1] * DX * DY
+                           + Sbar[1, 1] * DY ** 2)).astype(cdtype)
+
+    w_T = weights / sigma_drift_sq
+    pairs_d = _env_taylor_pairs(dfreqs, dS, order)
+    Fd = jnp.zeros(Ld, dtype=cdtype)
+    for coeff_f, wfac in pairs_d:
+        Fd = Fd + coeff_f.reshape(Ld).astype(cdtype) * jp.bttb_conv_vec_weighted(
+            m_src, (w_T * wfac).astype(cdtype), xcen, h, mtot, eps=nufft_eps)
+    v_kernel = Fd * env_diff
+    top = jp.make_toeplitz(v_kernel, force_pow2=True)
+    A_apply = jp.make_A_apply(grid.ws, top, sigmasq=1.0)
+
+    # Jacobi preconditioner (identical structure to the MC / gmix paths)
+    center_idx = tuple((s - 1) // 2 for s in v_kernel.shape)
+    T_diag = v_kernel[center_idx].real.astype(jnp.float32)
+    ws_sq = (grid.ws * jnp.conj(grid.ws)).real.astype(jnp.float32)
+    M_inv_diag = (1.0 / (1.0 + ws_sq * T_diag)).astype(cdtype)
+    M_inv_apply = lambda v: M_inv_diag * v
+
+    # ---- RHS on the spectral grid ----
+    xi = grid.xis_flat
+    env_spec = jnp.exp(-2 * (math.pi ** 2)
+                        * (Sbar[0, 0] * xi[:, 0] ** 2
+                           + 2 * Sbar[0, 1] * xi[:, 0] * xi[:, 1]
+                           + Sbar[1, 1] * xi[:, 1] ** 2)).astype(cdtype)
+    pairs_s = _env_taylor_pairs(xi, dS, order)
+
+    def env_weighted_ft(base_w):
+        """Σ_i base_w_i e^{-2πi m_i·ξ} e^{-2π² ξᵀ S_i ξ}  (iflag=-1 frame)."""
+        acc = jnp.zeros(grid.M, dtype=cdtype)
+        for coeff_f, wfac in pairs_s:
+            acc = acc + coeff_f.astype(cdtype) * jp.nufft1(
+                m_src, (base_w * wfac).astype(cdtype), xcen, h,
+                out_shape=mtot, eps=nufft_eps).reshape(-1)
+        return acc * env_spec
+
+    def per_r(r):
+        # h_1,r = D ⊙ (envelope-weighted adjoint-FT of d_{·,r}/σ²)
+        h1 = ws_real_c * env_weighted_ft(d_src[:, r] / sigma_drift_sq)
+        # h_2,r = Σ_j (-2πi ξ_j) ⊙ D ⊙ (envelope-weighted adjoint-FT of C_{·,j,r}/σ²)
+        h2 = jnp.zeros(grid.M, dtype=cdtype)
+        for j in range(D_lat):
+            xi_j = xi[:, j].astype(cdtype)
+            h2 = h2 + (-2j * math.pi * xi_j) * (
+                ws_real_c * env_weighted_ft(C_src[:, j, r] / sigma_drift_sq))
+        h_r = h1 + h2
+        rhs_norm = jnp.linalg.norm(h_r).real
+        return jax.lax.cond(
+            rhs_norm < 1e-30,
+            lambda _: jnp.zeros_like(h_r),
+            lambda _: jp.cg_solve(A_apply, h_r, tol=cg_tol,
+                                   max_iter=max_cg_iter,
+                                   M_inv_apply=M_inv_apply),
+            operand=None,
+        )
+
+    mu_r = jnp.stack([per_r(r) for r in range(D_out)], axis=0)
+    return mu_r, None, top
+
+
+def qf_and_moments_analytic_jax(
+    ms: Array,           # (K, T, D)
+    Ss: Array,           # (K, T, D, D)
+    SSs: Array,          # (K, T-1, D, D)
+    del_t: Array,        # (K, T-1) or (T-1,)
+    trial_mask: Array,   # (K, T) bool
+    grid: jp.JaxGridState, *,
+    sigma_drift_sq: float, D_lat: int, D_out: int,
+    order: int = 1,
+    cg_tol: float = 1e-5, max_cg_iter: int = 2000,
+    nufft_eps: float = 6e-8,
+    return_top: bool = False,
+) -> Tuple:
+    """Analytic (Taylor-envelope NUFFT) multi-trial variant of
+    :func:`qf_and_moments_gmix_jax`.  Same signature/returns; ``order``
+    controls the ΔS Taylor truncation.  See :func:`compute_mu_r_analytic_jax`.
+    """
+    m_src, S_src, d_src, C_src, weights = _flatten_stein(
+        ms, Ss, SSs, del_t, trial_mask)
+    mu_r, _, top = compute_mu_r_analytic_jax(
+        m_src, S_src, d_src, C_src, weights, grid,
+        sigma_drift_sq=sigma_drift_sq, D_lat=D_lat, D_out=D_out, order=order,
+        cg_tol=cg_tol, max_cg_iter=max_cg_iter, nufft_eps=nufft_eps,
+    )
+    Ef, Eff, Edfdx = drift_moments_jax(
+        mu_r, grid, ms, D_lat=D_lat, D_out=D_out, nufft_eps=nufft_eps)
+    if return_top:
+        return mu_r, Ef, Eff, Edfdx, top
+    return mu_r, Ef, Eff, Edfdx
+
+
 def drift_moments_jax(
     mu_r: Array,                  # (D_out, M)
     grid: jp.JaxGridState,
