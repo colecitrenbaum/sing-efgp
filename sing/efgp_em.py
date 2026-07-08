@@ -472,20 +472,27 @@ def fit_efgp_sing_jax(
     qf_max_cg_iter: int = 2000,
     qf_nufft_eps: float = 6e-8,
     # E-step q(f)-update method:
-    #   'analytic' (DEFAULT): closed-form type-1 NUFFTs with the per-source
-    #     Gaussian envelope Taylor-expanded in ΔS_i = S_i − S̄ (see
+    #   'auto' (DEFAULT): pick by device — 'gmix' on GPU, 'analytic' on
+    #     CPU/TPU (see below and the CLAUDE.md "device-dependent default"
+    #     note).  The q(f) bottleneck is device-specific: on CPU the gmix
+    #     spread-scatter is slow and the analytic NUFFT path wins; on GPU the
+    #     scatter+cuFFT are ~free, the sequential smoother/compile dominate
+    #     the wall, and the analytic path's cuFINUFFT calls only add overhead
+    #     (and regress accuracy at large T under order 1).
+    #   'analytic': closed-form type-1 NUFFTs with the per-source Gaussian
+    #     envelope Taylor-expanded in ΔS_i = S_i − S̄ (see
     #     sing.efgp_jax_drift.compute_mu_r_analytic_jax + analytic_order).
-    #     ~6× faster than 'gmix' on the q(f) update (no fine spatial grid /
-    #     stencil) AND more accurate: exact for homogeneous S rather than
-    #     carrying gmix's n_sigma stencil-tail-truncation bias (~10% at the
-    #     'gmix' default n_sigma=1.5, even at het=0).  2-D only in v0.
+    #     ~6× faster than 'gmix' on the q(f) update ON CPU (no fine spatial
+    #     grid / stencil) AND more accurate: exact for homogeneous S rather
+    #     than carrying gmix's n_sigma stencil-tail-truncation bias (~10% at
+    #     the 'gmix' default n_sigma=1.5, even at het=0).  2-D only in v0.
     #   'gmix': closed-form Gaussian-mixture spreader (variant A from
     #     efgp_estep_charfun.tex).  Per-source-exact for heterogeneous S up
-    #     to the stencil tail truncation; kept as a fallback for pathological
-    #     heterogeneity (S spread ≳ 50×, e.g. deep cold-start) where even
-    #     analytic_order=2 is insufficient — at the cost of a large stencil.
+    #     to the stencil tail truncation.  Preferred on GPU, and the fallback
+    #     for pathological heterogeneity (S spread ≳ 50×, e.g. deep
+    #     cold-start) where even analytic_order=2 is insufficient.
     #   'mc' (legacy): pseudo-cloud Monte Carlo (S_marginal samples per t).
-    estep_method: str = 'analytic',
+    estep_method: str = 'auto',
     # analytic_order: ΔS Taylor truncation for estep_method='analytic'.
     #   0 → homogeneous-S (drop ΔS; exact only when S_t is constant across t);
     #   1 (DEFAULT) → first-order, accurate to a few % up to ~20× S-spread
@@ -684,9 +691,21 @@ def fit_efgp_sing_jax(
 
     # Defer jit'd scan construction until the grid is known (so gmix
     # path can size fine_N from h_spec).
+    # Resolve the device-dependent default.  'gmix' on GPU (scatter+cuFFT are
+    # cheap there; the analytic cuFINUFFT path only adds launch overhead and
+    # regresses large-T accuracy under order 1), 'analytic' on CPU/TPU (where
+    # the gmix spread-scatter is the wall bottleneck).  See CLAUDE.md.
+    if estep_method == 'auto':
+        estep_method = 'gmix' if jax.default_backend() == 'gpu' else 'analytic'
+        # analytic is 2-D only; fall back to gmix for D != 2.
+        if estep_method == 'analytic' and D != 2:
+            estep_method = 'gmix'
+        if verbose:
+            print(f"  [jax] estep_method='auto' -> '{estep_method}' "
+                  f"(backend={jax.default_backend()}, D={D})")
     if estep_method not in ('mc', 'gmix', 'analytic'):
-        raise ValueError(f"estep_method must be 'mc', 'gmix' or 'analytic', "
-                         f"got {estep_method!r}")
+        raise ValueError(f"estep_method must be 'auto', 'mc', 'gmix' or "
+                         f"'analytic', got {estep_method!r}")
     if estep_method == 'analytic' and D != 2:
         raise NotImplementedError(
             "estep_method='analytic' is 2-D only in v0; pass estep_method="
