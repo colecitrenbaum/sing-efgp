@@ -620,6 +620,13 @@ def compute_mu_r_analytic_jax(
     Sbar = S_src.mean(axis=0)                                   # (D, D)
     dS = S_src - Sbar[None]                                     # (N_src, D, D)
 
+    # Every Taylor term is a type-1 NUFFT of the SAME nodes ``m_src`` with a
+    # different (ΔS-monomial-weighted) source vector.  Stack all source
+    # vectors and evaluate them as ONE batched transform (``vmap`` → a single
+    # libfinufft/cuFINUFFT plan) rather than one call per term: the per-call
+    # planning/launch overhead is fixed and dominates at small N_src (and is
+    # especially punishing on GPU), so batching is a large, bit-identical win.
+
     # ---- BTTB generator on the difference grid (4K+1 per dim) ----
     Ld = tuple(2 * (mm - 1) + 1 for mm in mtot)
     hm = (Ld[0] - 1) // 2
@@ -632,11 +639,11 @@ def compute_mu_r_analytic_jax(
 
     w_T = weights / sigma_drift_sq
     pairs_d = _env_taylor_pairs(dfreqs, dS, order)
-    Fd = jnp.zeros(Ld, dtype=cdtype)
-    for coeff_f, wfac in pairs_d:
-        Fd = Fd + coeff_f.reshape(Ld).astype(cdtype) * jp.bttb_conv_vec_weighted(
-            m_src, (w_T * wfac).astype(cdtype), xcen, h, mtot, eps=nufft_eps)
-    v_kernel = Fd * env_diff
+    coef_d = jnp.stack([cf for cf, _ in pairs_d]).astype(cdtype)         # (P, Ld²)
+    str_d = jnp.stack([(w_T * wf) for _, wf in pairs_d]).astype(cdtype)  # (P, N_src)
+    Fd = (coef_d * jax.vmap(lambda v: jp.bttb_conv_vec_weighted(
+        m_src, v, xcen, h, mtot, eps=nufft_eps).reshape(-1))(str_d)).sum(axis=0)
+    v_kernel = Fd.reshape(Ld) * env_diff
     top = jp.make_toeplitz(v_kernel, force_pow2=True)
     A_apply = jp.make_A_apply(grid.ws, top, sigmasq=1.0)
 
@@ -654,25 +661,35 @@ def compute_mu_r_analytic_jax(
                            + 2 * Sbar[0, 1] * xi[:, 0] * xi[:, 1]
                            + Sbar[1, 1] * xi[:, 1] ** 2)).astype(cdtype)
     pairs_s = _env_taylor_pairs(xi, dS, order)
+    P = len(pairs_s)
+    coef_s = jnp.stack([cf for cf, _ in pairs_s]).astype(cdtype)         # (P, M)
+    wfac_s = jnp.stack([wf for _, wf in pairs_s])                        # (P, N_src)
 
-    def env_weighted_ft(base_w):
-        """Σ_i base_w_i e^{-2πi m_i·ξ} e^{-2π² ξᵀ S_i ξ}  (iflag=-1 frame)."""
-        acc = jnp.zeros(grid.M, dtype=cdtype)
-        for coeff_f, wfac in pairs_s:
-            acc = acc + coeff_f.astype(cdtype) * jp.nufft1(
-                m_src, (base_w * wfac).astype(cdtype), xcen, h,
-                out_shape=mtot, eps=nufft_eps).reshape(-1)
-        return acc * env_spec
+    # Base source weights whose envelope-weighted FT we need: d_{·,r}/σ² for
+    # each output r, then C_{·,j,r}/σ² for each (r, j).
+    bases = [d_src[:, r] / sigma_drift_sq for r in range(D_out)]
+    for r in range(D_out):
+        for j in range(D_lat):
+            bases.append(C_src[:, j, r] / sigma_drift_sq)
+    B = jnp.stack(bases)                                                 # (nB, N_src)
+    nB = B.shape[0]
+    # (nB, P, N_src) → (nB·P, N_src): one batched NUFFT for the whole RHS.
+    prods = (B[:, None, :] * wfac_s[None, :, :]).reshape(nB * P, -1).astype(cdtype)
+    FT = jax.vmap(lambda v: jp.nufft1(
+        m_src, v, xcen, h, out_shape=mtot, eps=nufft_eps).reshape(-1))(prods)
+    FT = FT.reshape(nB, P, grid.M)
+    # env_weighted_ft per base = (Σ_pairs coeff·FT) · env_spec
+    ewft = (coef_s[None] * FT).sum(axis=1) * env_spec[None]              # (nB, M)
+
+    def _idx_C(r, j):
+        return D_out + r * D_lat + j
 
     def per_r(r):
-        # h_1,r = D ⊙ (envelope-weighted adjoint-FT of d_{·,r}/σ²)
-        h1 = ws_real_c * env_weighted_ft(d_src[:, r] / sigma_drift_sq)
-        # h_2,r = Σ_j (-2πi ξ_j) ⊙ D ⊙ (envelope-weighted adjoint-FT of C_{·,j,r}/σ²)
+        h1 = ws_real_c * ewft[r]
         h2 = jnp.zeros(grid.M, dtype=cdtype)
         for j in range(D_lat):
             xi_j = xi[:, j].astype(cdtype)
-            h2 = h2 + (-2j * math.pi * xi_j) * (
-                ws_real_c * env_weighted_ft(C_src[:, j, r] / sigma_drift_sq))
+            h2 = h2 + (-2j * math.pi * xi_j) * (ws_real_c * ewft[_idx_C(r, j)])
         h_r = h1 + h2
         rhs_norm = jnp.linalg.norm(h_r).real
         return jax.lax.cond(
