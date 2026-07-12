@@ -14,8 +14,12 @@ upstream  https://github.com/lindermanlab/sing.git          ← lab repo (DO NOT
 explicitly — never `git push --all`, never `git push upstream`, never an
 unqualified `git push` if it could resolve to upstream.
 
-If the user asks you to push, default to `git push origin main` (or whatever
-the current branch is) and confirm if anything else is requested.
+**Work directly on `main`.** For this repo, commit changes straight to the
+`main` branch and push with `git push origin main` — do NOT create feature
+branches (this overrides the general "branch off the default branch first"
+habit). Keep `main` consolidated: it should hold all work. The only hard rule
+that still stands is the one above — never push to `upstream`; a PR from the
+fork is the only path to lindermanlab review.
 
 
 
