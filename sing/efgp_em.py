@@ -302,11 +302,18 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
                 'h': (1 - rho) * nat_p['h']
                      + rho * (lik_g['h'] + tr_g['h']),
             }
-            return new_nat_p, None
+            # Emit this iter's marginals (m, S, SS) so the outer loop can reuse
+            # the LAST inner iter's smoothing for the M-step / post-loop instead
+            # of calling the standalone jax.jit(vmap(natural_to_marginal_params))
+            # (`nat_to_marg_b`) — a SECOND ~30s compile of the same associative-
+            # scan value_and_grad graph.  Marginals are one inner-iter stale wrt
+            # final_nat_p (computed from the pre-update nat_p); negligible for
+            # the M-step / returned posterior near convergence.
+            return new_nat_p, (ms, Ss, SSs)
 
         keys = jr.split(key, n_estep_iters)
-        final_nat_p, _ = jax.lax.scan(one_iter, natural_params, keys)
-        return final_nat_p
+        final_nat_p, (ms_s, Ss_s, SSs_s) = jax.lax.scan(one_iter, natural_params, keys)
+        return final_nat_p, ms_s[-1], Ss_s[-1], SSs_s[-1]
 
     @partial(jax.jit, static_argnames=('mtot_per_dim',))
     def scan_estep_frozen_qf(natural_params, init_params, ys_obs, t_mask,
@@ -904,6 +911,47 @@ def fit_efgp_sing_jax(
             scan_estep_frozen_qf = new_frozen
         return scan_estep_inner_refresh, scan_estep_frozen_qf
 
+    # ---- Jitted M-step RHS (gmix path) ----
+    # The collapsed-kernel M-step needs (mu_r, top, z_r) rebuilt from the
+    # post-E-step q(x).  The outer loop used to do this EAGERLY (op-by-op,
+    # un-jit'd), costing ~0.5s/outer-iter on GPU (dispatch-bound).  Wrap it in
+    # ONE jitted call (compiled once; grid arrays passed dynamically so
+    # adaptive-h ℓ-updates don't retrace) — bit-identical math.  Returns arrays
+    # only; ``top``'s static int fields are reattached outside jit from a
+    # reference built once (grid mtot is fixed under adaptive-h).
+    _mstep_del_t = t_grid[1:] - t_grid[:-1]
+    _mtot0 = int(grid.mtot_per_dim[0])
+    _top_ref = jp.make_toeplitz(
+        jnp.zeros((2 * _mtot0 - 1,) * D, dtype=grid.ws.dtype), force_pow2=True)
+
+    @partial(jax.jit, static_argnames=('mtot_per_dim',))
+    def _mstep_qf_rhs_gmix(ms_b, Ss_b, SSs_b, xis_flat, ws_grid, h_per_dim,
+                            xcen, mtot_per_dim):
+        # NOTE: takes the ALREADY-smoothed marginals (ms/Ss/SSs) as inputs, NOT
+        # natural_params — so this jitted graph contains ONLY the q(f) build
+        # (flatten + gmix spread/FFT/CG), NOT the expensive associative-scan
+        # smoother value_and_grad (which the outer loop already ran via
+        # nat_to_marg_b).  Keeps this compile small (~q(f) graph) instead of
+        # re-compiling the ~30s smoother-grad graph a 4th time.
+        grid_l = jp.JaxGridState(
+            xis_flat=xis_flat, ws=ws_grid, h_per_dim=h_per_dim,
+            mtot_per_dim=mtot_per_dim, xcen=xcen,
+            M=int(xis_flat.shape[0]), d=int(xis_flat.shape[1]))
+        m_src, S_src, d_src, C_src, w_src = jpd._flatten_stein(
+            ms_b, Ss_b, SSs_b, _mstep_del_t, trial_mask)
+        mu_r, _, top = jpd.compute_mu_r_gmix_jax(
+            m_src, S_src, d_src, C_src, w_src, grid_l,
+            sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+            fine_N=int(gmix_fine_N), stencil_r=int(gmix_stencil_r),
+            cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter)
+        ws_real_c = grid_l.ws.real.astype(grid_l.ws.dtype)
+        ws_safe = jnp.where(jnp.abs(ws_real_c) < 1e-30,
+                             jnp.array(1e-30, dtype=ws_real_c.dtype), ws_real_c)
+        A_apply = jp.make_A_apply(grid_l.ws, top, sigmasq=1.0)
+        h_r0 = jax.vmap(A_apply)(mu_r)
+        z_r = h_r0 / ws_safe[None, :]
+        return mu_r, top.v_fft, z_r
+
     history = EFGPEMHistory()
     log_ls = float(np.log(ls))
     log_var = float(np.log(var))
@@ -911,9 +959,16 @@ def fit_efgp_sing_jax(
     # Track whether we've already adapted the gmix stencil (to bound
     # JIT recompiles to ~1 per fit).
     _gmix_already_adapted = False
+    # Opt-in per-outer-iter wall attribution (EFGP_PROFILE_ITERS=1). Adds
+    # block_until_ready barriers around the E-step and M-step so iter-0
+    # (compile) separates cleanly from steady-state execution. Off by default.
+    import os as _os, time as _time
+    _prof_iters = bool(_os.environ.get('EFGP_PROFILE_ITERS'))
     for it in range(n_em_iters):
         rho_jax = jnp.asarray(float(rho_sched[it]))
         em_key, key = jr.split(key, 2)
+        if _prof_iters:
+            _t_start = _time.perf_counter()
         # Adapt gmix stencil radius ONCE, after kernel_warmup_iters.  At
         # that point Σ has shrunk meaningfully relative to the prior V0
         # so a tighter stencil is correct, and a SINGLE JIT recompile
@@ -928,7 +983,9 @@ def fit_efgp_sing_jax(
                 _maybe_adapt_stencil(S_now_max)
             _gmix_already_adapted = True
         if refresh_qf_every_estep_iter:
-            natural_params = scan_estep_inner_refresh(
+            # Marginals (ms_t/Ss_t/SSs_t) come straight from the scan's last
+            # inner iter — no separate nat_to_marg_b compile (Lever A).
+            natural_params, ms_t, Ss_t, SSs_t = scan_estep_inner_refresh(
                 natural_params, init_params,
                 ys_obs, t_mask, output_params,
                 em_key, rho_jax, input_effect,
@@ -971,12 +1028,16 @@ def fit_efgp_sing_jax(
                 ys_obs, t_mask, output_params,
                 scan_key, rho_jax, input_effect,
                 Ef_prev, Eff_prev, Edfdx_prev)
+            # Frozen-q(f) scan does not return marginals; smooth once here
+            # (this non-default path still pays the nat_to_marg_b compile).
+            mp_b, _ = nat_to_marg_b(natural_params, trial_mask)
+            ms_t, Ss_t, SSs_t = mp_b['m'], mp_b['S'], mp_b['SS']
 
-        # ---- M-step ----
-        mp_b, _ = nat_to_marg_b(natural_params, trial_mask)
-        ms_t = mp_b['m']                                      # (K, T, D)
-        Ss_t = mp_b['S']                                      # (K, T, D, D)
-        SSs_t = mp_b['SS']                                    # (K, T-1, D, D)
+        if _prof_iters:
+            jax.block_until_ready((natural_params, ms_t, Ss_t, SSs_t))
+            _t_estep = _time.perf_counter()
+
+        # ---- M-step ----  (ms_t/Ss_t/SSs_t already set by the E-step branch)
 
         # 1) Closed-form (C, d, R) for Gaussian emissions
         if learn_emissions and it >= emission_warmup_iters:
@@ -1022,42 +1083,46 @@ def fit_efgp_sing_jax(
         if learn_kernel and it >= kernel_warmup_iters:
             mstep_key, key = jr.split(key, 2)
             del_t = t_grid[1:] - t_grid[:-1]
-            # Build flat supersources from all trials' Stein quantities
-            m_src, S_src, d_src, C_src, w_src = jpd._flatten_stein(
-                ms_t, Ss_t, SSs_t, del_t, trial_mask)
-            if estep_method == 'mc':
-                mu_r, X_pseudo, top = jpd.compute_mu_r_jax(
-                    m_src, S_src, d_src, C_src, w_src, grid, mstep_key,
-                    sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
-                    D_lat=D, D_out=D,
-                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
-                    nufft_eps=qf_nufft_eps,
-                )
-            elif estep_method == 'analytic':
-                mu_r, _, top = jpd.compute_mu_r_analytic_jax(
-                    m_src, S_src, d_src, C_src, w_src, grid,
-                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
-                    order=analytic_order,
-                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
-                    nufft_eps=qf_nufft_eps,
-                )
-            else:  # 'gmix'
-                mu_r, _, top = jpd.compute_mu_r_gmix_jax(
-                    m_src, S_src, d_src, C_src, w_src, grid,
-                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
-                    fine_N=int(gmix_fine_N), stencil_r=int(gmix_stencil_r),
-                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
-                )
-            # z_r = h_θ,r / ws  (so M-step varies hypers via ws and recovers h_r = ws ⊙ z_r)
-            ws_real_c = grid.ws.real.astype(grid.ws.dtype)
-            ws_safe = jnp.where(jnp.abs(ws_real_c) < 1e-30,
-                                 jnp.array(1e-30, dtype=ws_real_c.dtype),
-                                 ws_real_c)
-            # h_θ_0,r = A_θ_0 μ at the E-step optimum
-            from sing.efgp_jax_primitives import make_A_apply
-            A_at_theta0 = make_A_apply(grid.ws, top, sigmasq=1.0)
-            h_r0 = jax.vmap(A_at_theta0)(mu_r)
-            z_r = h_r0 / ws_safe
+            if estep_method == 'gmix':
+                # Single jitted call (compiled once) instead of the eager
+                # op-by-op q(f) rebuild; reattach ``top``'s static fields.
+                mu_r, top_vfft, z_r = _mstep_qf_rhs_gmix(
+                    ms_t, Ss_t, SSs_t, grid.xis_flat, grid.ws, grid.h_per_dim,
+                    grid.xcen, mtot_per_dim=grid.mtot_per_dim)
+                top = jp.ToeplitzNDJax(
+                    v_fft=top_vfft, ns=_top_ref.ns,
+                    fft_shape=_top_ref.fft_shape,
+                    starts=_top_ref.starts, ends=_top_ref.ends)
+            else:
+                # Build flat supersources from all trials' Stein quantities
+                m_src, S_src, d_src, C_src, w_src = jpd._flatten_stein(
+                    ms_t, Ss_t, SSs_t, del_t, trial_mask)
+                if estep_method == 'mc':
+                    mu_r, X_pseudo, top = jpd.compute_mu_r_jax(
+                        m_src, S_src, d_src, C_src, w_src, grid, mstep_key,
+                        sigma_drift_sq=sigma_drift_sq, S_marginal=S_marginal,
+                        D_lat=D, D_out=D,
+                        cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                        nufft_eps=qf_nufft_eps,
+                    )
+                else:  # 'analytic'
+                    mu_r, _, top = jpd.compute_mu_r_analytic_jax(
+                        m_src, S_src, d_src, C_src, w_src, grid,
+                        sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                        order=analytic_order,
+                        cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter,
+                        nufft_eps=qf_nufft_eps,
+                    )
+                # z_r = h_θ,r / ws  (M-step varies hypers via ws; recovers
+                # h_r = ws ⊙ z_r).  h_θ_0,r = A_θ_0 μ at the E-step optimum.
+                from sing.efgp_jax_primitives import make_A_apply
+                ws_real_c = grid.ws.real.astype(grid.ws.dtype)
+                ws_safe = jnp.where(jnp.abs(ws_real_c) < 1e-30,
+                                     jnp.array(1e-30, dtype=ws_real_c.dtype),
+                                     ws_real_c)
+                A_at_theta0 = make_A_apply(grid.ws, top, sigmasq=1.0)
+                h_r0 = jax.vmap(A_at_theta0)(mu_r)
+                z_r = h_r0 / ws_safe
             log_ls_new, log_var_new, _ = jpd.m_step_kernel_jax(
                 log_ls, log_var,
                 mu_r_fixed=mu_r, z_r=z_r, top=top,
@@ -1110,6 +1175,14 @@ def fit_efgp_sing_jax(
         history.lengthscale.append(ls)
         history.variance.append(var)
 
+        if _prof_iters:
+            jax.block_until_ready((natural_params, output_params,
+                                    jnp.asarray(log_ls), jnp.asarray(log_var)))
+            _t_end = _time.perf_counter()
+            print(f"[prof] iter {it:2d}: estep={_t_estep - _t_start:7.3f}s  "
+                  f"mstep+rest={_t_end - _t_estep:7.3f}s  "
+                  f"total={_t_end - _t_start:7.3f}s", flush=True)
+
         if verbose:
             extras = []
             if history.latent_rmse:
@@ -1126,7 +1199,11 @@ def fit_efgp_sing_jax(
     # grid + final q(x), using the same method/settings the inner E-step
     # used.  This is the drift the EM converged to — plotting from it (via
     # ``posterior_drift_mean``) needs no grid re-derivation.
-    mp_final_b, _ = nat_to_marg_b(natural_params, trial_mask)
+    # Reuse the last E-step's marginals (Lever A) rather than re-invoking the
+    # standalone nat_to_marg_b — which on the default (refresh) path would be
+    # its FIRST call and trigger the ~30s smoother-grad compile purely for this
+    # post-loop snapshot.  One inner-iter stale; negligible for the snapshot.
+    mp_final_b = {'m': ms_t, 'S': Ss_t, 'SS': SSs_t}
     del_t_final = t_grid[1:] - t_grid[:-1]
     if estep_method == 'mc':
         mu_r_final, _, _, _ = jpd.qf_and_moments_jax(
@@ -1150,5 +1227,5 @@ def fit_efgp_sing_jax(
     history.final_grid = grid
     history.final_mu_r = np.asarray(mu_r_final)
 
-    marginal_params, _ = nat_to_marg_b(natural_params, trial_mask)
+    marginal_params = {'m': ms_t, 'S': Ss_t, 'SS': SSs_t}  # last E-step (Lever A)
     return marginal_params, natural_params, output_params, init_params, history
