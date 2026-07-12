@@ -110,6 +110,10 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
         output_params=op, init_params=ip, latent_dim=base.D,
         lengthscale=ls_init, variance=var0, sigma=sigma,
         sigma_drift_sq=sigma ** 2, eps_grid=eps_grid, S_marginal=2,
+        # Canonical numerical tolerances (2026-07-11): eps_grid=1e-3 (arg
+        # default), qf_nufft_eps=1e-4, qf_cg_tol=1e-4 — relaxed from 6e-8/1e-5,
+        # "good enough" and faster; see CLAUDE.md recommended-settings.
+        qf_nufft_eps=1e-4, qf_cg_tol=1e-4,
         n_em_iters=N_EM, n_estep_iters=10, rho_sched=rho_sched,
         learn_emissions=False, update_R=False,
         learn_kernel=learn_kernel, n_mstep_iters=base.N_M_INNER,

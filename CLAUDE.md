@@ -119,6 +119,8 @@ to deviate:
 | `n_hutchinson_mstep` (EFGP) | **4** | n/a | |
 | `kernel_warmup_iters` (EFGP) | **8** | n/a | smoother needs ≥8 outer EM iters before M-step works (collapse risk below ~5) |
 | `eps_grid` (EFGP) | **1e-3** | n/a | tighter than 1e-2 |
+| `qf_nufft_eps` (EFGP) | **1e-4** | n/a | relaxed from 6e-8 (2026-07-11) — "good enough" + faster |
+| `qf_cg_tol` (EFGP) | **1e-4** | n/a | relaxed from 1e-5 (2026-07-11) — matches nufft_eps |
 | `S_marginal` (EFGP, MC mode) | **2** | n/a | gmix mode (default) doesn't need this |
 
 ### `output_scale` gotcha for SparseGP
