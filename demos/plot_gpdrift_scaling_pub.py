@@ -33,6 +33,7 @@ from matplotlib.ticker import FuncFormatter, NullFormatter  # noqa: E402
 # ---- style ---------------------------------------------------------------
 # Okabe-Ito colour-blind-safe palette. EFGP is the hero (deep blue).
 C_EFGP = '#0072B2'   # blue
+C_KEEP = '#009E73'   # bluish green -- keep-all (exact) E-step
 C_SP49 = '#E69F00'   # orange
 C_SP100 = '#D55E00'  # vermillion
 C_FAIL = '#B00020'   # muted red for the OOM marker
@@ -40,6 +41,9 @@ C_FAIL = '#B00020'   # muted red for the OOM marker
 # (method, M) -> (label, colour, marker, is_hero)
 SERIES = {
     ('efgp', 0):  ('EFGP-SING',       C_EFGP,  '*', True),
+    # Keep-all autodiff E-step (no linearisation drops). Same wall as 'efgp'
+    # to ~1%, lower drift NRMSE at every T. See KEEPALL_AUTODIFF_NOTES.md.
+    ('efgp_keepall', 0): ('EFGP-SING (keep-all)', C_KEEP, 'D', True),
     ('sp', 49):   ('SparseGP (M=49)',  C_SP49,  's', False),
     ('sp', 100):  ('SparseGP (M=100)', C_SP100, 'o', False),
 }
