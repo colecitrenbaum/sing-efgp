@@ -292,6 +292,34 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
                                                     frozen_K, mean_params_b,
                                                     trial_mask_b, init_params,
                                                     inputs)
+            elif qx_moments_method == 'gmix_full':
+                # EXPERIMENT: keep ALL Price terms (no linearisation) via a
+                # differentiable exact-moment shim; plain jax.grad.
+                import os as _os
+                from sing.exp_full_moments import FullGmixDrift as _FGD
+                from sing.efgp_gmix_qx_moments import precompute_aux as _pa
+                _aux = _pa(mu_r, grid)
+                _full = _FGD(latent_dim=D, grid=grid, mu_r=mu_r, aux=_aux)
+                tr_g = vmap(lambda k, mp_, tm_, ip_, inp_: nat_grad_transition(
+                    k, _full, None, {}, tm_, ip_, t_grid, mp_,
+                    inp_, input_effect, sigma))(
+                    jr.split(key_grad, K), mean_params_b,
+                    trial_mask_b, init_params, inputs)
+                if _os.environ.get('KEEPALL_PSD', '0') == '1':
+                    # NSD-project the transition J natural-grad contribution
+                    # so it never *increases* precision beyond the GN bound:
+                    # clamp positive eigenvalues of the symmetric part to 0.
+                    def _nsd(Jmat):
+                        Js = 0.5 * (Jmat + Jmat.T)
+                        w, V = jnp.linalg.eigh(Js)
+                        return (V * jnp.minimum(w, 0.0)) @ V.T
+                    tr_g = {**tr_g,
+                            'J': vmap(vmap(_nsd))(tr_g['J'])}
+            elif qx_moments_method == 'gmix_full_batched':
+                # autodiff keep-all, batched grad-once (exact, all terms)
+                from sing.exp_batched_estep import nat_grad_batched as _ngb
+                tr_g = _ngb(mean_params_b, mu_r, grid, t_grid, trial_mask_b,
+                            init_params, sigma, moment='exact')
             else:
                 raise ValueError(f"unknown qx_moments_method "
                                  f"{qx_moments_method!r}")
