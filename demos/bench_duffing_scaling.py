@@ -97,11 +97,19 @@ def run_cell(T, method, M, ls_init, seed, eps_grid=1e-3,
     xs_np = np.asarray(xs)
     dt = float(np.asarray(t_grid[1] - t_grid[0]))
 
-    if method == 'efgp':
-        st = run._fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init,
-                                     eps_grid=eps_grid,
-                                     estep_method=estep_method,
-                                     analytic_order=analytic_order)
+    # 'efgp'         -> production linearised/custom_vjp shim  ('gmix_batched')
+    # 'efgp_keepall' -> keep-all autodiff E-step, exact monolithic single
+    #                   jax.grad, no linearisation drops ('gmix_full_batched').
+    # Identical in every other respect, so wall/NRMSE are directly comparable
+    # to the existing efgp and sp cells. See KEEPALL_AUTODIFF_NOTES.md.
+    if method in ('efgp', 'efgp_keepall'):
+        st = run._fit_efgp_with_hist(
+            lik, op, ip, t_grid, sigma, ls_init,
+            eps_grid=eps_grid,
+            estep_method=estep_method,
+            analytic_order=analytic_order,
+            qx_moments_method=('gmix_full_batched'
+                               if method == 'efgp_keepall' else 'gmix_batched'))
         f_eval_fn = lambda g: base.efgp_em.posterior_drift_mean(st['hist'], g)
         M_out = 0
     elif method == 'sp':
@@ -123,10 +131,10 @@ def run_cell(T, method, M, ls_init, seed, eps_grid=1e-3,
         T=T, method=method, M=M_out, ls_init=ls_init, seed=seed, dt=dt,
         eps_grid=eps_grid,
         # E-step path (efgp only; 'auto' -> gmix on GPU, analytic on CPU)
-        estep_method=(st.get('estep_method', 'n/a') if method == 'efgp'
-                      else 'n/a'),
-        analytic_order=(st.get('analytic_order', 0) if method == 'efgp'
-                        else 0),
+        estep_method=st.get('estep_method', 'n/a'),
+        analytic_order=st.get('analytic_order', 0),
+        qx_moments_method=st.get('qx_moments_method', 'n/a'),
+        peak_gb=st.get('peak_gb', 0.0),
         backend=st.get('backend', jax.default_backend()),
         wall=st['wall'],
         ls_final=st['ls'], var_final=st['var'],
@@ -149,7 +157,8 @@ def run_cell(T, method, M, ls_init, seed, eps_grid=1e-3,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--T', type=int, required=True)
-    ap.add_argument('--method', choices=['efgp', 'sp'], required=True)
+    ap.add_argument('--method', choices=['efgp', 'efgp_keepall', 'sp'],
+                    required=True)
     ap.add_argument('--M', type=int, default=0)
     ap.add_argument('--ls-init', type=float, default=0.7)
     ap.add_argument('--seed', type=int, default=0)
@@ -166,10 +175,11 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{args.method}{args.M if args.method == 'sp' else ''}"
-    eps_tag = "" if (args.method != 'efgp' or args.eps_grid == 1e-3) \
+    is_efgp = args.method in ('efgp', 'efgp_keepall')
+    eps_tag = "" if (not is_efgp or args.eps_grid == 1e-3) \
         else f"_eps{args.eps_grid:g}"
     # Only tag non-'auto' E-steps so canonical filenames are unchanged.
-    estep_tag = "" if (args.method != 'efgp' or args.estep == 'auto') \
+    estep_tag = "" if (not is_efgp or args.estep == 'auto') \
         else (f"_{args.estep}" + (f"o{args.analytic_order}"
                                   if args.estep == 'analytic' else ""))
     out_path = (out_dir /

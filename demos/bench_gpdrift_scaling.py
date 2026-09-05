@@ -87,7 +87,8 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
                         x_template=None, k_min_lengthscale=None,
                         learn_kernel=True, variance=None,
                         restore_qf_variance='none',
-                        estep_method='auto', analytic_order=1):
+                        estep_method='auto', analytic_order=1,
+                        qx_moments_method='gmix_batched'):
     """Same canonical fit call as base.fit_efgp, but also returns the EM
     history so drift can be evaluated from the EM's ACTUAL converged q(f) via
     efgp_em.posterior_drift_mean (base.eval_efgp_drift recomputes mu_r through
@@ -108,7 +109,13 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
     'analytic' on CPU. Pass 'gmix'/'analytic' explicitly to pin the path so
     the two can be timed head-to-head on the SAME device (the 'auto' default
     otherwise makes the GPU wall a gmix-only number). analytic_order is the
-    dS Taylor truncation and is ignored unless estep_method == 'analytic'."""
+    dS Taylor truncation and is ignored unless estep_method == 'analytic'.
+
+    qx_moments_method: q(x)-moment path. 'gmix_batched' (default) is the
+    production linearised/custom_vjp shim; 'gmix_full_batched' is the
+    keep-all autodiff E-step (exact, monolithic single jax.grad, no
+    linearisation drops -- see KEEPALL_AUTODIFF_NOTES.md). Everything else
+    in this call is held fixed so the two are wall-comparable."""
     N_EM = base.N_EM
     var0 = base.VAR_INIT if variance is None else float(variance)
     rho_sched = jnp.linspace(0.05, 0.7, N_EM)
@@ -132,6 +139,7 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
         # resolves down to this l (l* aliasing threshold). None -> auto from ls_init.
         restore_qf_variance=restore_qf_variance,
         estep_method=estep_method, analytic_order=analytic_order,
+        qx_moments_method=qx_moments_method,
         verbose=False)
     wall = time.perf_counter() - t0
     # when learn_kernel=False hist.lengthscale/variance may be empty -> use inits
@@ -147,7 +155,22 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
                 # for plus the backend so the cell is self-describing.
                 estep_method=estep_method,
                 analytic_order=analytic_order,
+                qx_moments_method=qx_moments_method,
+                peak_gb=_peak_device_gb(),
                 backend=jax.default_backend())
+
+
+def _peak_device_gb():
+    """Peak bytes in use on the default device (GPU), else peak host RSS (GB).
+
+    The keep-all monolithic E-step holds an O(N*M) reverse-mode tape, so peak
+    memory is a first-class result at T=1e5 -- record it per cell."""
+    try:
+        st = jax.devices()[0].memory_stats()
+        return float(st.get('peak_bytes_in_use', st.get('bytes_in_use', 0))) / 2 ** 30
+    except Exception:  # noqa: BLE001  (CPU backend exposes no memory_stats)
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2 ** 20
 
 
 def data_aware_template(xs, pad=0.4, n=16):
