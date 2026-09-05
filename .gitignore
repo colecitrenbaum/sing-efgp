@@ -3,3 +3,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 demos/_efgp_demo_out/
+
+# generated benchmark outputs / logs
+demos/_*/
+demos/_*.sbatch
+logs/
+*.egg-info/

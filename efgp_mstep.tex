@@ -1,0 +1,301 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath,amssymb,booktabs,geometry,hyperref,xcolor}
+\geometry{margin=1in}
+\newcommand{\Eqx}{\mathbb{E}_{q(x_i)}}
+\newcommand{\Eqxx}{\mathbb{E}_{q(x_i,x_{i+1})}}
+\newcommand{\Eq}[2]{\mathbb{E}_{#1}\!\left[#2\right]}
+\renewcommand{\Re}{\operatorname{Re}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\given}{\mid}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\GP}{\mathcal{GP}}
+\newcommand{\Dt}{D_{\rm out}}
+\newcommand{\dropped}[1]{\textcolor{red!70!black}{#1}}
+\title{\textbf{The EFGP M-step: the collapsed objective, and exactly what is dropped}}
+\author{Companion to \texttt{efgp\_estep.tex} (same notation)}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent
+\textbf{Scope.} The E-step doc analyses the transition term of the ELBO
+\eqref{eq:elbo-recap} at fixed hypers. This note does the \emph{M-step}: hold
+$q(x)$ (hence its sufficient statistics) fixed and maximise the ELBO over the
+kernel hypers $\theta=(\ell,\sigma_f^2)$. We (1) derive the collapsed objective
+\eqref{eq:Mstep} from scratch, (2) show it is the \emph{exact} GP marginal
+likelihood of the pseudo-velocity regression --- it drops nothing $\theta$-dependent
+except a constant, and (3) locate precisely the terms EFGP \emph{does} leave
+out: they live in the E-step that \emph{builds} $q(x)$, not in this objective.
+
+\section{The ELBO and the M-step objective}
+Recall the structured posterior $q(x_{0:T})q(f)$, independent GP drifts
+$f_r\sim\GP(0,k_\theta)$, diagonal diffusion $\Sigma=\diag(\sigma_1^2,\dots)$,
+Euler transition $x_{i+1}=x_i+\Delta_i f(x_i)+\varepsilon_i$,
+$\varepsilon_i\sim\mathcal N(0,\Delta_i\Sigma)$, and $\delta_i:=x_{i+1}-x_i$. The
+ELBO is
+\begin{equation}
+\mathcal L=\Eq{q(x)}{\log p(y\given x)}
++\sum_i \Eq{q(x,f)}{\log p(x_{i+1}\given x_i,f)}
++\Eq{q(f)}{\log p(f)-\log q(f)}
++H[q(x)]+\Eq{q(x_0)}{\log p(x_0)}.
+\label{eq:elbo-recap}
+\end{equation}
+Only the transition term and the $q(f)$-KL depend on $\theta$; the emission,
+entropy and initial terms are $\theta$-free. So the M-step objective is
+\begin{equation}
+\mathcal L_{\rm M}(\theta)
+=\sum_i \Eq{q(x,f)}{\log p(x_{i+1}\given x_i,f)}
+\;+\;\Eq{q(f)}{\log p(f)-\log q(f)}\;+\;\text{(}\theta\text{-free)}.
+\label{eq:LM-raw}
+\end{equation}
+
+\paragraph{Notation} (the rest lives in \texttt{efgp\_estep.tex}; $D$ = latent dimension).
+\begin{center}\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}ll@{}}
+\toprule
+$D,\ \Dt$ & latent/input dimension; number of drift output coordinates ($\Dt{=}D$ here). \\
+$m_i,\,S_i$ & mean, covariance of $q(x_i)=\mathcal N(m_i,S_i)$; \ $S_{i,i+1}=\Cov(x_i,x_{i+1})$. \\
+$d_i:=m_{i+1}-m_i$ & mean increment; \quad $C_i:=S_{i,i+1}-S_i$ (Stein cross-cov correction). \\
+$\xi_k,\ M$ & spectral-grid frequencies ($k{=}1{:}M$) and grid size. \\
+$F_x,\ D_\theta$ & Fourier features $F_x[k]{=}e^{2\pi i x^\top\xi_k}$; \ $D_\theta{=}\diag(\sqrt{S(\xi_k;\theta)})$ (real, diagonal). \\
+$\phi_\theta(x){=}D_\theta F_x$ & drift basis; \ $f_r(x)=\phi_\theta(x)^*w_r$, whitened weights $w_r\sim\mathcal{CN}(0,I)$. \\
+$\bar f_r(x){=}\phi(x)^*\mu_r$ & posterior-mean drift; \ $J_{\bar f}$ its Jacobian, $H_{\bar f_r}$ the Hessian of coord.\ $r$. \\
+$V_r(x){=}\sigma_r^{-2}\phi(x)^*A_r^{-1}\phi(x)$ & $q(f_r)$ posterior-variance at $x$. \\
+$A_r,\,h_r,\,\mu_r{=}A_r^{-1}h_r$ & $q(f_r)$ precision, RHS, mean in the basis \eqref{eq:Ah}. \\
+$\mathcal{CN}(0,\cdot)$ & circularly-symmetric complex normal. \\
+$\Eqx,\ \Eqxx$ & expectation under $q(x_i)$, resp.\ the pair $q(x_i,x_{i+1})$. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Collapsing $q(f)$: derivation of the objective}
+Work one drift coordinate $r$ at a time (they decouple; drop $r$). From
+\texttt{efgp\_estep.tex} eq.~(f-quadratic), the only $f_r$-dependent part of the
+transition log-density at transition $i$ is
+$\sigma_r^{-2}\delta_{i,r}f_r(x_i)-\tfrac{\Delta_i}{2}\sigma_r^{-2}f_r(x_i)^2$.
+Put $f_r$ in a finite basis with a \emph{whitened} weight $w_r$ (unit prior),
+\begin{equation}
+f_r(x)=\phi_\theta(x)^*w_r,\qquad \phi_\theta(x)=D_\theta F_x,\quad F_x[k]=e^{2\pi i\,x^\top\xi_k},\qquad w_r\sim\mathcal{CN}(0,I),
+\label{eq:basis}
+\end{equation}
+where $D_\theta=\diag(\sqrt{S(\xi_k;\theta)})$ carries the RBF spectral density
+\begin{equation}
+S(\xi;\theta)=\sigma_f^2\,(2\pi\ell^2)^{D/2}\,e^{-2\pi^2\ell^2\|\xi\|^2}
+\qquad(\texttt{efgp\_jax\_drift.py:\_ws\_real\_se}).
+\label{eq:specdens}
+\end{equation}
+Taking the $q(x)$-expectation of the likelihood (the expectation touches only the
+features, never $w_r$) gives a Gaussian in $w_r$:
+\begin{equation}
+\Eq{q(x)}{\log p(\cdot\given w_r)}
+=\Re\langle h_r,w_r\rangle-\tfrac12 w_r^*(A_r-I)w_r
+\;\dropped{-\;\tfrac{1}{2}\sum_i\tfrac{1}{\Delta_i}\Eq{q(x_i,x_{i+1})}{\delta_{i,r}^2}},
+\label{eq:loglik-w}
+\end{equation}
+with (E-step doc eq.~(Ah))
+\begin{equation}
+\boxed{\;
+A_r=I+\frac{1}{\sigma_r^2}\sum_i\Delta_i\,\Eqx[\phi(x_i)\phi(x_i)^*],
+\qquad
+h_r=\frac{1}{\sigma_r^2}\sum_i \Eqxx[\phi(x_i)\,\delta_{i,r}].
+\;}
+\label{eq:Ah}
+\end{equation}
+Adding the unit prior $-\tfrac12 w_r^*w_r$ turns $A_r-I$ into $A_r$, and the KL
+term $\Eq{q(f)}{\log p-\log q}$ is what the collapse of the Gaussian integral
+produces. Marginalising $w_r$ (complex Gaussian, $\int e^{-\frac12 w^*Aw+\Re h^*w}dw
+\propto|A|^{-1}e^{\frac12 h^*A^{-1}h}$) and negating gives the per-dim loss; summing
+over the $\Dt$ coordinates,
+\begin{equation}
+\boxed{\;
+\mathcal L_{\rm M}(\theta)
+=\frac{\Dt}{2}\log|A_\theta|
+-\frac12\sum_{r}\Re\langle h_{\theta,r},\,\mu_{\theta,r}\rangle,
+\qquad \mu_{\theta,r}=A_\theta^{-1}h_{\theta,r},
+\;}
+\label{eq:Mstep}
+\end{equation}
+which is exactly what \code{m\_step\_kernel\_jax} minimises
+(\texttt{efgp\_jax\_drift.py:773--796}), using $\langle\mu,A\mu\rangle=\langle\mu,h\rangle$
+to collapse the quadratic. This is the E-step doc's eq.~(Mstep-collapsed).
+
+\paragraph{How $\theta$ enters.} On the fixed Fourier grid the features $F_x$, and
+therefore the assembled statistics
+\begin{equation}
+T:=\frac{1}{\sigma_r^2}\sum_i\Delta_i\,\Eqx[F_{x_i}F_{x_i}^*]
+\quad(\text{the }\theta\text{-free Gram, }\code{top}),
+\qquad
+z_r:=\frac{1}{\sigma_r^2}\sum_i\Eqxx[F_{x_i}\delta_{i,r}]
+\quad(\code{z\_r}),
+\label{eq:frozen}
+\end{equation}
+do \emph{not} depend on $\theta$. All $\theta$-dependence is through the prior
+weights $D_\theta$: $A_\theta=I+D_\theta\,T\,D_\theta$ and $h_{\theta,r}=D_\theta z_r$
+(\texttt{efgp\_jax\_drift.py:777,786}). So \eqref{eq:Mstep} is precisely a GP
+\emph{marginal likelihood} in which the ``data'' $(T,z_r)$ --- the frozen $q(x)$
+sufficient statistics --- are held fixed and only the kernel varies. That is the
+formal content of ``the M-step is a GP hyperparameter update on the reconstructed
+path.''
+
+\section{Reading the objective as GP marginal likelihood}
+\eqref{eq:Mstep} is the standard $-\log$ evidence of a linear-Gaussian model:
+\begin{equation}
+\underbrace{-\tfrac12\textstyle\sum_r\Re\langle h_r,A_\theta^{-1}h_r\rangle}_{\text{data fit}}
+\;+\;\underbrace{\tfrac{\Dt}{2}\log|A_\theta|}_{\text{Occam / complexity}}.
+\end{equation}
+The complexity term carries the collapsed $q(f)$ posterior variance exactly: with
+$V_r(x)=\sigma_r^{-2}\phi(x)^*A_r^{-1}\phi(x)$ the drift-posterior variance at $x$,
+\begin{equation}
+\sum_i\Delta_i\,\Eqx[V_r(x_i)]
+=\sigma_r^{-2}\sum_i\Delta_i\,\tr\!\big(A_r^{-1}\Eqx[\phi\phi^*]\big)
+=\tr\!\big(A_r^{-1}(A_r-I)\big)
+=M-\tr(A_r^{-1}),
+\label{eq:V-identity}
+\end{equation}
+the same information (a monotone function of the eigenvalues of $A_\theta$) that
+$\log|A_\theta|=\sum_k\log\lambda_k$ encodes ($\lambda_k$ the eigenvalues of $A_\theta$). \textbf{So the drift-posterior
+variance is present in the M-step objective}; it is not a dropped term here.
+
+\section{Exactly what is left out}
+Two categories. Be precise about which is which.
+
+\subsection*{(A) Dropped from the objective \eqref{eq:Mstep} --- one term, and it is harmless}
+The \dropped{red} term in \eqref{eq:loglik-w},
+\begin{equation}
+\dropped{\;\tfrac{1}{2}\sum_i \tfrac{1}{\Delta_i}\,\Eqxx[\delta_i^\top\Sigma^{-1}\delta_i]\;}
+\qquad(\text{piece (i) of \texttt{efgp\_estep.tex} eq.~(transition-frozen)}),
+\end{equation}
+is the ``$y^\top y$'' self-energy of the pseudo-velocity targets. It depends on
+$q(x)$ (the increments $\delta_i$) but \emph{not on $\theta$}, so it is an additive
+constant in the M-step and \code{m\_step\_kernel\_jax} correctly omits it. Dropping
+it does not move $\arg\max_\theta$. Nothing else $\theta$-dependent is dropped from
+\eqref{eq:Mstep}: the increment fit (via $z_r$), the Stein cross-covariance
+correction $C_i=S_{i,i+1}-S_i$ (folded into $z_r$, E-step doc eq.~(hr-stein)), the
+input uncertainty $S_i$, and the $q(f)$ variance \eqref{eq:V-identity} are all
+retained.
+
+\paragraph{Input uncertainty is retained, via the characteristic function.}
+$\theta$-frozen though $T$ is, it is \emph{not} the point Gram: each
+$\Eqx[\phi\phi^*]$ uses (E-step doc eq.~(Eqx-chi))
+\begin{equation}
+\Eqx[e^{2\pi i\,x_i^\top\xi}]=e^{2\pi i\,m_i^\top\xi}\;\underbrace{e^{-2\pi^2\,\xi^\top S_i\,\xi}}_{\text{Gaussian envelope}},
+\label{eq:chi}
+\end{equation}
+so $S_i$ enters $T$ (and $z_r$) as a frequency-domain damping. At the small $S_i$ of a
+well-identified latent ($\tr S_i\!\sim\!5\!\times\!10^{-3}$ here) the envelope
+$\approx1$ at the informative frequencies $\|\xi\|\!\sim\!1/\ell$, so the M-step is
+\emph{numerically} close to the point ($S_i\!\to\!0$) marginal likelihood --- but the
+$S_i$ term is present, not dropped.
+
+\subsection*{(B) Dropped from the E-step that builds $q(x)$ --- the real omissions}
+The M-step conditions on the $q(x)$ produced by the SING $q(x)$-update, and that
+update currently uses two approximations. They change $(T,z_r)$, hence $\mathcal
+L_{\rm M}$ \emph{indirectly}, but they are not terms of \eqref{eq:Mstep}.
+
+\medskip
+\noindent\textbf{(B1) The drift-posterior-variance feedback $\Eqx[V_r]$ --- piece (iv), ``dropped (production)''.}
+The exact transition contribution to the $q(x)$-objective is (E-step doc
+eq.~(transition-frozen))
+\begin{equation}
+\Eqxx[\log p(x_{i+1}\given x_i,f)]
+=-\tfrac{\E[\delta_i^\top\Sigma^{-1}\delta_i]}{2\Delta_i}
++\Eqxx[\delta_i^\top\Sigma^{-1}\bar f]
+-\tfrac{\Delta_i}{2}\Eqx[\underbrace{\bar f^\top\Sigma^{-1}\bar f}_{\text{(iii)}}+\dropped{\underbrace{V}_{\text{(iv)}}}].
+\end{equation}
+Production (\texttt{restore\_qf\_variance='none'}, ``Approximation A'') \dropped{drops
+piece (iv)} $-\tfrac{\Delta_i}{2}\Eqx[V(x_i)]$ and, crucially, its
+$(m_i,S_i)$-gradient, from the natural-gradient $q(x)$ update. Concretely the
+omitted gradient is, by Price's theorem,
+\begin{equation}
+\dropped{\;\partial_{m_i}\Eqx[V(x_i)]=\Eqx[\nabla V(x_i)],\qquad
+\partial_{S_i}\Eqx[V(x_i)]=\tfrac12\Eqx[\nabla^2 V(x_i)].\;}
+\end{equation}
+\emph{Meaning:} setting $\Eqx[V]\equiv0$ in the E-step makes $q(x)$ behave as if the
+drift were \emph{known} (no epistemic-drift term inflating the posterior). The path is
+then reconstructed as tightly as the emissions allow. This is the exact sense of
+``EFGP does fixed-data GP inference'': the fixed data is the drift-uncertainty-free
+posterior mean. (\texttt{restore\_qf\_variance='hutch'} restores $\Eqx[V]$ via a
+Hutchinson estimate of $\omega_r(\delta)=\sum_{\xi_\ell-\xi_k=\delta}(A_r^{-1})_{k\ell}
+D_kD_\ell$; empirically here $\|\nabla\Eqx[V]\|\approx5\times10^{-5}\|\text{legacy}\|$,
+so restoring it is inert --- \emph{this} problem is drift-well-determined.)
+
+\medskip
+\noindent\textbf{(B2) The Gauss--Newton / covariance-drop linearisation of the drift moments.}
+For piece (iii), $g=\bar f^\top\Sigma^{-1}\bar f$, Price's $\partial_{S_i}$ needs
+$\tfrac12\Eqx[\nabla^2 g]$; the Hessian splits (E-step doc eq.~(gn-hessian))
+\begin{equation}
+\nabla^2(\bar f^\top\Sigma^{-1}\bar f)=2\big(J_{\bar f}^\top\Sigma^{-1}J_{\bar f}
++\dropped{\textstyle\sum_r\sigma_r^{-2}\bar f_r H_{\bar f_r}}\big),
+\end{equation}
+and production makes two truncations, each second-order in the nonlinearity of $\bar f$:
+\begin{equation}
+\partial_{S_i}\Eqx[\bar f^\top\Sigma^{-1}\bar f]
+\;\overset{\text{GN}}{\approx}\;\Eqx[J_{\bar f}^\top\Sigma^{-1}J_{\bar f}]
+\;\overset{\text{cov-drop}}{\approx}\;\Eqx[J_{\bar f}]^\top\Sigma^{-1}\Eqx[J_{\bar f}]
+\qquad
+\Big(\dropped{\text{drops }\textstyle\sum_r\sigma_r^{-2}\bar f_r H_{\bar f_r},\ \Cov(J)}\Big).
+\end{equation}
+Equivalently $\bar f$ is replaced by its first-order Taylor
+$\widetilde f(x)=\bar f(m_i)+J_{\bar f}(m_i)(x-m_i)$ inside the $q(x_i)$-average. Bias is
+$O(\|S_i\|\,\sigma_f^2/\ell^2)$: again small for $q(x)$ localised at scale $\ell$.
+
+\section{Are the dropped terms easy or hard to compute?}
+Each dropped term, written explicitly, with its cost. \emph{Nothing is dropped for
+lack of a closed form}; the reasons are ``$\theta$-constant'', ``already present'', or
+``cheap but chosen out for stability/variance''. The single genuinely non-trivial
+object is the global inverse $A_r^{-1}$ inside the $V$-feedback \emph{gradient}.
+
+\begin{center}\footnotesize
+\renewcommand{\arraystretch}{1.5}
+\begin{tabular}{@{}p{2.35cm} p{4.75cm} p{5.35cm}@{}}
+\toprule
+term & explicit form & cost / difficulty \\
+\midrule
+(A) self-energy &
+$\tfrac12\sum_i\Delta_i^{-1}\tr\!\big(\Sigma^{-1}\Eqxx[\delta_i\delta_i^\top]\big)$,\ \
+$\Eqxx[\delta_i\delta_i^\top]{=}S_{i+1}{+}S_i{-}S_{i,i+1}{-}S_{i,i+1}^\top{+}d_id_i^\top$ &
+\textbf{trivial} ($O(TD^2)$ traces of $q(x)$ moments) --- but $\theta$-constant, so no reason to add. \\
+(B1) $q(f)$-var \emph{value} &
+$\sum_i\Delta_i\Eqx[V_i]=\Dt\big(M-\tr A_\theta^{-1}\big)$ &
+\textbf{free}: $\tr A_\theta^{-1}{=}\|L^{-1}\|_F^2$ reuses the M-step Cholesky $A_\theta{=}LL^*$; already implicit in $\log|A_\theta|$. \\
+(B1) $q(f)$-var \emph{feedback} &
+$\partial_{m_i}\Eqx[V]{=}\Eqx[\nabla V]$, $\partial_{S_i}\Eqx[V]{=}\tfrac12\Eqx[\nabla^2 V]$;
+needs $\omega_r(\delta){=}\!\!\sum_{\xi_\ell-\xi_k=\delta}\!\!(A_r^{-1})_{k\ell}D_{\theta,k}D_{\theta,\ell}$ &
+\textbf{moderate--hard}: $A_r^{-1}$ is \emph{non-local} (couples all $M$ frequencies). Estimate $\omega_r$ by Hutchinson ($P$ probes): $P{\cdot}\Dt$ CG solves $+$ per-source enveloped NUFFT. ${\sim}5$--$15\%$ wall, noisy-but-unbiased. (=\texttt{'hutch'}.) \\
+(B2) residual Hessian &
+$\tfrac12\sum_r\sigma_r^{-2}\Eqx[\bar f_r H_{\bar f_r}]$,\ \
+$H_{\bar f_r}(x){=}-(2\pi)^2\!\sum_k\mu_{r,k}D_{\theta,k}\xi_k\xi_k^\top\phi_k(x)$ &
+\textbf{moderate}: one $\xi_k\xi_k^\top$-weighted Type-2 NUFFT (drift-moment machinery). Dropped for being \emph{sign-indefinite} (breaks PSD natural-grad precision), not for cost. \\
+(B2) $\Cov_{q(x_i)}(J_{\bar f})$ &
+$\Eqx[J_{\bar f}^\top\Sigma^{-1}J_{\bar f}]-\Eqx[J_{\bar f}]^\top\Sigma^{-1}\Eqx[J_{\bar f}]$ &
+\textbf{easy--moderate}: same $\xi\xi^\top$-weighted NUFFT; $O(\|S_i\|^2)$, dropped for simplicity. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\textbf{Takeaway.} The M-step objective's own drop (A) is a $\theta$-constant. Of the
+E-step drops: the $V$-\emph{value} is free and already in $\log|A_\theta|$; the $V$-\emph{gradient}
+(B1) is the only hard piece --- hard purely because $A_r^{-1}$ couples all $M$ frequencies,
+so its per-source spatial imprint needs the FFT-cross-correlation$+$NUFFT trick rather than
+a local formula --- and the GN residual/covariance terms (B2) are cheap and were dropped for
+PSD-stability and $O(S)$-smallness, not intractability.
+
+\section{Consequence}
+\eqref{eq:Mstep} is the \emph{exact} collapsed marginal likelihood of the drift
+regression for the Fourier model --- it drops only the $\theta$-constant self-energy,
+and it \emph{keeps} the input uncertainty (\ref{eq:chi}), the Stein correction, and the
+$q(f)$ variance (\ref{eq:V-identity}). Therefore the length-scale behaviour of EFGP is
+\emph{not} explained by a missing M-step term. What EFGP omits are the two E-step
+feedback terms (B1) $\Eqx[V]$ and (B2) the residual-Hessian/covariance, i.e.\ the
+drift's epistemic uncertainty and the second-order effect of $S_i$ on the drift
+moments. Both feed the M-step only through the $q(x)$ it conditions on, and both are
+$O(S)$-or-smaller here. The net effect is that EFGP performs GP marginal-likelihood
+learning on a drift-uncertainty-free reconstruction --- exact GP hyperparameter
+inference on ``fixed data.''
+\end{document}

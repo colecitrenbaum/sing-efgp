@@ -91,14 +91,17 @@ def make_data(T, seed):
     return xs, lik, op, ip, t_grid, sigma
 
 
-def run_cell(T, method, M, ls_init, seed, eps_grid=1e-3):
+def run_cell(T, method, M, ls_init, seed, eps_grid=1e-3,
+             estep_method='auto', analytic_order=1):
     xs, lik, op, ip, t_grid, sigma = make_data(T, seed)
     xs_np = np.asarray(xs)
     dt = float(np.asarray(t_grid[1] - t_grid[0]))
 
     if method == 'efgp':
         st = run._fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init,
-                                     eps_grid=eps_grid)
+                                     eps_grid=eps_grid,
+                                     estep_method=estep_method,
+                                     analytic_order=analytic_order)
         f_eval_fn = lambda g: base.efgp_em.posterior_drift_mean(st['hist'], g)
         M_out = 0
     elif method == 'sp':
@@ -119,6 +122,12 @@ def run_cell(T, method, M, ls_init, seed, eps_grid=1e-3):
         dynamics='duffing',
         T=T, method=method, M=M_out, ls_init=ls_init, seed=seed, dt=dt,
         eps_grid=eps_grid,
+        # E-step path (efgp only; 'auto' -> gmix on GPU, analytic on CPU)
+        estep_method=(st.get('estep_method', 'n/a') if method == 'efgp'
+                      else 'n/a'),
+        analytic_order=(st.get('analytic_order', 0) if method == 'efgp'
+                        else 0),
+        backend=st.get('backend', jax.default_backend()),
         wall=st['wall'],
         ls_final=st['ls'], var_final=st['var'],
         ls_traj=st['ls_traj'], var_traj=st['var_traj'],
@@ -145,6 +154,12 @@ def main():
     ap.add_argument('--ls-init', type=float, default=0.7)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--eps-grid', type=float, default=1e-3)
+    # E-step q(f) path for --method efgp. 'auto' keeps the library's
+    # device-dependent default (gmix on GPU, analytic on CPU) and reproduces
+    # the canonical cells; pin it to time the two paths on the same device.
+    ap.add_argument('--estep', choices=['auto', 'gmix', 'analytic'],
+                    default='auto')
+    ap.add_argument('--analytic-order', type=int, default=1)
     ap.add_argument('--out-dir', default='demos/_bench_duffing_scaling_out')
     args = ap.parse_args()
 
@@ -153,20 +168,28 @@ def main():
     tag = f"{args.method}{args.M if args.method == 'sp' else ''}"
     eps_tag = "" if (args.method != 'efgp' or args.eps_grid == 1e-3) \
         else f"_eps{args.eps_grid:g}"
-    out_path = out_dir / f"cell_T{args.T}_{tag}{eps_tag}_seed{args.seed}.npz"
+    # Only tag non-'auto' E-steps so canonical filenames are unchanged.
+    estep_tag = "" if (args.method != 'efgp' or args.estep == 'auto') \
+        else (f"_{args.estep}" + (f"o{args.analytic_order}"
+                                  if args.estep == 'analytic' else ""))
+    out_path = (out_dir /
+                f"cell_T{args.T}_{tag}{eps_tag}{estep_tag}_seed{args.seed}.npz")
 
     print(f"[duffscale] T={args.T} method={args.method} M={args.M} "
-          f"ls_init={args.ls_init} seed={args.seed} eps={args.eps_grid} x64="
+          f"ls_init={args.ls_init} seed={args.seed} eps={args.eps_grid} "
+          f"estep={args.estep} aorder={args.analytic_order} x64="
           f"{jax.config.read('jax_enable_x64')} dev={jax.devices()}", flush=True)
 
     t0 = time.perf_counter()
     try:
         res = run_cell(args.T, args.method, args.M, args.ls_init, args.seed,
-                       eps_grid=args.eps_grid)
+                       eps_grid=args.eps_grid, estep_method=args.estep,
+                       analytic_order=args.analytic_order)
         print(f"[duffscale] OK wall={res['wall']:.1f}s "
               f"drift_nrmse={res['drift_nrmse']:.4f} "
               f"lat_pc={res['lat_pc']:.4f} "
-              f"l={res['ls_final']:.3f} var={res['var_final']:.3f}", flush=True)
+              f"l={res['ls_final']:.3f} var={res['var_final']:.3f} "
+              f"estep={res['estep_method']}", flush=True)
     except Exception as e:  # noqa: BLE001
         tb = traceback.format_exc()
         print(f"[duffscale] FAILED after {time.perf_counter()-t0:.1f}s:\n{tb}",
@@ -174,7 +197,10 @@ def main():
         res = dict(status='failed', err=f"{type(e).__name__}: {e}\n{tb}",
                    dynamics='duffing', T=args.T, method=args.method,
                    M=args.M if args.method == 'sp' else 0,
-                   ls_init=args.ls_init, seed=args.seed)
+                   ls_init=args.ls_init, seed=args.seed,
+                   estep_method=args.estep,
+                   analytic_order=args.analytic_order,
+                   backend=jax.default_backend())
 
     np.savez(out_path, **res)
     print(f"[duffscale] wrote {out_path}", flush=True)
