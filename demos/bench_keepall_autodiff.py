@@ -39,6 +39,16 @@ ip  = jax.tree_util.tree_map(lambda z: jnp.broadcast_to(z, (K,)+z.shape),
 tg  = jnp.linspace(0., t_max, T)
 rho = jnp.linspace(0.05, 0.8, n_em)
 
+def _peak_gb():
+    """Peak bytes in use on the default device (GPU), else peak host RSS."""
+    try:
+        st = jax.devices()[0].memory_stats()
+        return st.get('peak_bytes_in_use', st.get('bytes_in_use', 0)) / 2**30
+    except Exception:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20
+
+
 def run(method):
     t0 = time.time()
     mp, _, _, _, h = fit_efgp_sing_jax(
@@ -51,11 +61,12 @@ def run(method):
     m = np.asarray(mp['m']); fin = bool(np.all(np.isfinite(m)))
     rmse = float(np.sqrt(np.mean((m - np.asarray(xs))**2))) if fin else np.nan
     return dict(rmse=rmse, ell=float(h.lengthscale[-1]),
-                var=float(h.variance[-1]), wall=time.time()-t0, fin=fin)
+                var=float(h.variance[-1]), wall=time.time()-t0, fin=fin,
+                peak=_peak_gb())
 
 print(f"Duffing T={T} K={K} N={K*(T-1)} n_em={n_em}  backend={jax.default_backend()}")
 for method in ['gmix_batched', 'gmix_full_batched']:
     r = run(method)
     print(f"  {method:18s} rmse={r['rmse']:.4f} ell={r['ell']:.3f} "
-          f"var={r['var']:.3f} wall={r['wall']:.0f}s finite={int(r['fin'])}",
-          flush=True)
+          f"var={r['var']:.3f} wall={r['wall']:.0f}s peak={r['peak']:.2f}GB "
+          f"finite={int(r['fin'])}", flush=True)
