@@ -86,7 +86,8 @@ def make_data(T, seed):
 def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
                         x_template=None, k_min_lengthscale=None,
                         learn_kernel=True, variance=None,
-                        restore_qf_variance='none'):
+                        restore_qf_variance='none',
+                        estep_method='auto', analytic_order=1):
     """Same canonical fit call as base.fit_efgp, but also returns the EM
     history so drift can be evaluated from the EM's ACTUAL converged q(f) via
     efgp_em.posterior_drift_mean (base.eval_efgp_drift recomputes mu_r through
@@ -100,7 +101,14 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
     Pass a DATA-AWARE box (trajectory bbox) so the grid doesn't squander modes
     on the empty mu0+-3 default box -- matches how SparseGP places its inducing
     points, and is essential in the diverse-IC regime where the default box
-    balloons (see K-sweep diagnosis). None -> library default (mu0 +- halo)."""
+    balloons (see K-sweep diagnosis). None -> library default (mu0 +- halo).
+
+    estep_method: q(f)-update path, forwarded verbatim to fit_efgp_sing_jax.
+    'auto' (default, unchanged behaviour) resolves to 'gmix' on GPU and
+    'analytic' on CPU. Pass 'gmix'/'analytic' explicitly to pin the path so
+    the two can be timed head-to-head on the SAME device (the 'auto' default
+    otherwise makes the GPU wall a gmix-only number). analytic_order is the
+    dS Taylor truncation and is ignored unless estep_method == 'analytic'."""
     N_EM = base.N_EM
     var0 = base.VAR_INIT if variance is None else float(variance)
     rho_sched = jnp.linspace(0.05, 0.7, N_EM)
@@ -110,6 +118,10 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
         output_params=op, init_params=ip, latent_dim=base.D,
         lengthscale=ls_init, variance=var0, sigma=sigma,
         sigma_drift_sq=sigma ** 2, eps_grid=eps_grid, S_marginal=2,
+        # Canonical numerical tolerances (2026-07-11): eps_grid=1e-3 (arg
+        # default), qf_nufft_eps=1e-4, qf_cg_tol=1e-4 — relaxed from 6e-8/1e-5,
+        # "good enough" and faster; see CLAUDE.md recommended-settings.
+        qf_nufft_eps=1e-4, qf_cg_tol=1e-4,
         n_em_iters=N_EM, n_estep_iters=10, rho_sched=rho_sched,
         learn_emissions=False, update_R=False,
         learn_kernel=learn_kernel, n_mstep_iters=base.N_M_INNER,
@@ -119,6 +131,7 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
         K_min_lengthscale=k_min_lengthscale,   # force enough modes: grid
         # resolves down to this l (l* aliasing threshold). None -> auto from ls_init.
         restore_qf_variance=restore_qf_variance,
+        estep_method=estep_method, analytic_order=analytic_order,
         verbose=False)
     wall = time.perf_counter() - t0
     # when learn_kernel=False hist.lengthscale/variance may be empty -> use inits
@@ -129,7 +142,12 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
                 var_traj=np.array([var0] + var_hist),
                 ls=float(ls_hist[-1]),
                 var=float(var_hist[-1]),
-                wall=wall)
+                wall=wall,
+                # 'auto' resolves inside the library; record what was ASKED
+                # for plus the backend so the cell is self-describing.
+                estep_method=estep_method,
+                analytic_order=analytic_order,
+                backend=jax.default_backend())
 
 
 def data_aware_template(xs, pad=0.4, n=16):

@@ -14,8 +14,12 @@ upstream  https://github.com/lindermanlab/sing.git          ← lab repo (DO NOT
 explicitly — never `git push --all`, never `git push upstream`, never an
 unqualified `git push` if it could resolve to upstream.
 
-If the user asks you to push, default to `git push origin main` (or whatever
-the current branch is) and confirm if anything else is requested.
+**Work directly on `main`.** For this repo, commit changes straight to the
+`main` branch and push with `git push origin main` — do NOT create feature
+branches (this overrides the general "branch off the default branch first"
+habit). Keep `main` consolidated: it should hold all work. The only hard rule
+that still stands is the one above — never push to `upstream`; a PR from the
+fork is the only path to lindermanlab review.
 
 
 
@@ -115,6 +119,8 @@ to deviate:
 | `n_hutchinson_mstep` (EFGP) | **4** | n/a | |
 | `kernel_warmup_iters` (EFGP) | **8** | n/a | smoother needs ≥8 outer EM iters before M-step works (collapse risk below ~5) |
 | `eps_grid` (EFGP) | **1e-3** | n/a | tighter than 1e-2 |
+| `qf_nufft_eps` (EFGP) | **1e-4** | n/a | relaxed from 6e-8 (2026-07-11) — "good enough" + faster |
+| `qf_cg_tol` (EFGP) | **1e-4** | n/a | relaxed from 1e-5 (2026-07-11) — matches nufft_eps |
 | `S_marginal` (EFGP, MC mode) | **2** | n/a | gmix mode (default) doesn't need this |
 
 ### `output_scale` gotcha for SparseGP

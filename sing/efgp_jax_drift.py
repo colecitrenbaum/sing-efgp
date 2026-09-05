@@ -922,6 +922,60 @@ def _ws_real_se(log_ls: Array, log_var: Array, xis_flat: Array, h: Array,
     return jnp.exp(log_ws)
 
 
+# --- Module-level jitted M-step primitives (compiled ONCE, reused every EM
+# iter).  The previous inline ``grad_fn = jax.jit(total_loss)`` closed over a
+# fresh function object per call, so JAX re-traced + re-compiled the whole
+# collapsed-NLL gradient on EVERY M-step (~0.5-0.7s of pure compile per call,
+# vs ~1.5ms of actual math).  Hoisting to module scope + passing the cloud
+# tensors as explicit arguments (static dims only) makes the compile cache hit
+# across all outer iters.  Bit-identical math to the old closure.
+
+@partial(jax.jit, static_argnums=(1,))
+def _build_Tmat_from_vfft(v_fft: Array, ns: Tuple[int, ...]) -> Array:
+    """Dense BTTB ``T_mat`` (M, M) from the cached conv-vector FFT ``v_fft``.
+
+    O(M²) direct index into the recovered conv vector — same construction the
+    inline M-step used, but jitted once per ``ns`` (grid shape).
+    """
+    cdtype = v_fft.dtype
+    _v_pad = jnp.fft.ifftn(v_fft).astype(cdtype)
+    _ns_v = tuple(2 * n - 1 for n in ns)
+    _v_conv = _v_pad[tuple(slice(0, L) for L in _ns_v)]
+    _d = len(ns)
+    _mi = jnp.indices(ns).reshape(_d, -1)                 # (d, M)
+    _offset = jnp.array([n - 1 for n in ns], dtype=jnp.int32)
+    _diff = (_mi[:, :, None] - _mi[:, None, :] + _offset[:, None, None])
+    return _v_conv[tuple(_diff[k] for k in range(_d))]     # (M, M)
+
+
+def _mstep_total_loss(log_ls, log_var, T_mat, z_r, xis_flat, h_scalar,
+                      D_lat, D_out):
+    """Collapsed kernel NLL ``-½ Σ_r Re⟨h_r, μ_r⟩ + ½ D_out log|A|`` with
+    ``A = I + diag(ws) T_mat diag(ws)`` and ``μ = A⁻¹ h``, via one Cholesky."""
+    import jax.scipy.linalg as jla
+    ws_real = _ws_real_se(log_ls, log_var, xis_flat, h_scalar, D_lat)
+    cdtype = T_mat.dtype
+    ws_c = ws_real.astype(cdtype)
+    M = T_mat.shape[0]
+    eye_c = jnp.eye(M, dtype=cdtype)
+    A = eye_c + ws_c[:, None] * T_mat * ws_c[None, :]
+    L = jnp.linalg.cholesky(A)
+    logdet = 2.0 * jnp.sum(jnp.log(jnp.diag(L).real))
+    h = ws_c[None, :] * z_r
+    def solve_one(b):
+        y = jla.solve_triangular(L, b, lower=True)
+        return jla.solve_triangular(L.conj().T, y, lower=False)
+    mu = jax.vmap(solve_one)(h)
+    det_loss = -0.5 * jnp.sum(jnp.real(jnp.sum(jnp.conj(h) * mu, axis=-1)))
+    return det_loss + 0.5 * D_out * logdet
+
+
+# value_and_grad wrt (log_ls, log_var); D_lat/D_out static.  Compiled once.
+_MSTEP_VALUE_AND_GRAD = jax.jit(
+    jax.value_and_grad(_mstep_total_loss, argnums=(0, 1)),
+    static_argnums=(6, 7))
+
+
 def m_step_kernel_jax(
     log_ls0: float, log_var0: float,
     *,
@@ -966,53 +1020,15 @@ def m_step_kernel_jax(
     Returns (log_ls_new, log_var_new, loss_history).
     """
     import optax
-    import jax.scipy.linalg as jla
     h_scalar = h_per_dim[0]                    # isotropic h in v0
-    M = int(xis_flat.shape[0])
-    cdtype = top.v_fft.dtype
 
-    # Precompute dense T_mat once (top is fixed across the M-step) by
-    # direct indexing into the BTTB conv vector — O(M²), avoiding the
-    # M Toeplitz applies (O(M² log M)) the closure-form path would do.
-    # Recover the conv vector v of shape (2m_i - 1) per dim from the
-    # FFT-cached form via one O(M log M) inverse FFT + crop.
-    eye_c = jnp.eye(M, dtype=cdtype)
-    _v_pad = jnp.fft.ifftn(top.v_fft).astype(cdtype)
-    _ns_v = tuple(2 * n - 1 for n in top.ns)
-    _v_conv = _v_pad[tuple(slice(0, L) for L in _ns_v)]
-    _d = len(top.ns)
-    _mi = jnp.indices(top.ns).reshape(_d, -1)        # (d, M)
-    _offset = jnp.array([n - 1 for n in top.ns], dtype=jnp.int32)
-    _diff = (_mi[:, :, None] - _mi[:, None, :]
-             + _offset[:, None, None])               # (d, M, M)
-    T_mat = _v_conv[tuple(_diff[k] for k in range(_d))]   # (M, M)
-
-    def total_loss(log_ls, log_var):
-        ws_real = _ws_real_se(log_ls, log_var, xis_flat, h_scalar, D_lat)
-        ws_c = ws_real.astype(cdtype)
-        # A = I + diag(ws) · T_mat · diag(ws) via row+col scaling (O(M²))
-        A = eye_c + ws_c[:, None] * T_mat * ws_c[None, :]
-        # Single Cholesky factorization gives both log|A| and the solver.
-        # A is hermitian PSD by construction (T_mat is BTTB from positive
-        # weights → hermitian PSD; diagonal scaling preserves this).
-        L = jnp.linalg.cholesky(A)
-        # log|A| = 2 Σ log(L_ii) — diagonals are real positive in the
-        # Cholesky convention.
-        logdet = 2.0 * jnp.sum(jnp.log(jnp.diag(L).real))
-        # μ = A⁻¹ h via forward + back triangular solve.
-        h = ws_c[None, :] * z_r
-        def solve_one(b):
-            y = jla.solve_triangular(L, b, lower=True)
-            return jla.solve_triangular(L.conj().T, y, lower=False)
-        mu = jax.vmap(solve_one)(h)
-        # Deterministic loss = -(Re⟨h, μ⟩ - ½ Re⟨μ, Aμ⟩) summed over r.
-        # Since Aμ = h, ⟨μ, Aμ⟩ = ⟨μ, h⟩, so this collapses to
-        # -½ Σ_r Re⟨h_r, μ_r⟩.
-        det_loss = -0.5 * jnp.sum(
-            jnp.real(jnp.sum(jnp.conj(h) * mu, axis=-1)))
-        return det_loss + 0.5 * D_out * logdet
-
-    grad_fn = jax.jit(jax.value_and_grad(total_loss, argnums=(0, 1)))
+    # Dense T_mat built once per call via the module-level jitted helper
+    # (compiled once per grid shape ``top.ns``), then the collapsed-NLL
+    # value_and_grad is the module-level ``_MSTEP_VALUE_AND_GRAD`` — compiled
+    # once and reused across every M-step of every EM iter, instead of the old
+    # per-call ``jax.jit(total_loss)`` that re-compiled the whole gradient
+    # (~0.5-0.7s) each invocation.  Math is bit-identical to the old closure.
+    T_mat = _build_Tmat_from_vfft(top.v_fft, top.ns)
 
     opt = optax.adam(lr)
     params = (jnp.asarray(log_ls0, dtype=jnp.float32),
@@ -1021,7 +1037,8 @@ def m_step_kernel_jax(
 
     loss_history = []
     for step in range(n_inner):
-        loss, (g_ls, g_var) = grad_fn(params[0], params[1])
+        loss, (g_ls, g_var) = _MSTEP_VALUE_AND_GRAD(
+            params[0], params[1], T_mat, z_r, xis_flat, h_scalar, D_lat, D_out)
         updates, opt_state = opt.update((g_ls, g_var), opt_state, params)
         params = optax.apply_updates(params, updates)
         loss_history.append(float(loss))
