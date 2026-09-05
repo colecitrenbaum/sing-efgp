@@ -103,3 +103,27 @@ but verify:
 - **Shim thread (alt):** a custom_vjp that *injects* the exact gradients
   as batched gather NUFFTs (O(M log M + N), lowest memory) — more code,
   best asymptotics at large M. Not implemented on this branch.
+
+## Gather vs direct sums (compute + memory) — `demos/bench_gather_vs_direct.py`
+The committed moments are **direct** char-function sums, O(N*M). Routing
+them through the batched **gather** (`drift_moments_gmix_jax`, a NUFFT,
+O(M log M + N)) is the scaling lever. CPU measurements (N=10k, moments +
+autodiff grad):
+
+| M   | direct | gather | speedup | grad rel diff |
+|-----|--------|--------|---------|---------------|
+| 121 |  42 ms |  82 ms |  0.5x   | 1e-3          |
+| 361 | 249 ms |  61 ms |  4.1x   | 2e-8          |
+| 729 | 603 ms |  50 ms | 12.1x   | 7e-4          |
+
+- Small M (~121): gather does **not** help (neutral/slower) and adds a
+  stencil approximation (~0.1%). Keep direct — exact and fast.
+- Large M (≳300): gather is **4–12x faster** and its peak memory is
+  **flat in M** (~0.5 GB here) while direct grows O(N*M). Crossover ≈ M 200–350.
+- Gather is approximate (Gaussian stencil, `gather_N`/`stencil_r`); accuracy
+  improves on finer grids (rel diff ~1e-8 at M=361).
+
+**Rule of thumb:** direct for current M (~121); switch moments to the
+gather when M grows or memory is tight. On GPU, verify the crossover M and
+that gather memory stays flat (nvidia-smi / jax memory profiler) — that's
+the main thing to check on the cluster bench.
