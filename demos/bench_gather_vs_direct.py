@@ -12,6 +12,7 @@ gather memory stays flat in M while direct grows O(N*M).
 """
 import sys, time, resource
 import jax; jax.config.update("jax_enable_x64", True)   # MUST precede jax use
+
 import jax.numpy as jnp, jax.random as jr, numpy as np
 import sing.efgp_jax_primitives as jp
 import sing.efgp_jax_drift as jpd

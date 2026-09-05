@@ -315,11 +315,20 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
                         return (V * jnp.minimum(w, 0.0)) @ V.T
                     tr_g = {**tr_g,
                             'J': vmap(vmap(_nsd))(tr_g['J'])}
-            elif qx_moments_method == 'gmix_full_batched':
-                # autodiff keep-all, batched grad-once (exact, all terms)
+            elif qx_moments_method in ('gmix_full_batched',
+                                       'gmix_full_batched_gather'):
+                # autodiff keep-all, batched grad-once (exact, all terms).
+                # '..._gather' swaps the O(N*M) direct spectral sums for the
+                # gmix Gaussian gather (O(M log M + N), M-flat memory) as the
+                # Ef/Edf quadrature; the retained TERMS are identical, so the
+                # only difference is the ~0.1% stencil truncation error.
                 from sing.exp_batched_estep import nat_grad_batched as _ngb
                 tr_g = _ngb(mean_params_b, mu_r, grid, t_grid, trial_mask_b,
-                            init_params, sigma, moment='exact')
+                            init_params, sigma, moment='exact',
+                            gather=(qx_moments_method
+                                    == 'gmix_full_batched_gather'),
+                            gather_N=qx_v_gather_N,
+                            stencil_r=qx_v_gather_stencil_r)
             else:
                 raise ValueError(f"unknown qx_moments_method "
                                  f"{qx_moments_method!r}")

@@ -92,24 +92,35 @@ def make_data(T, seed):
 
 
 def run_cell(T, method, M, ls_init, seed, eps_grid=1e-3,
-             estep_method='auto', analytic_order=1):
+             estep_method='auto', analytic_order=1,
+             gather_N=None, gather_stencil_r=None):
     xs, lik, op, ip, t_grid, sigma = make_data(T, seed)
     xs_np = np.asarray(xs)
     dt = float(np.asarray(t_grid[1] - t_grid[0]))
 
-    # 'efgp'         -> production linearised/custom_vjp shim  ('gmix_batched')
-    # 'efgp_keepall' -> keep-all autodiff E-step, exact monolithic single
-    #                   jax.grad, no linearisation drops ('gmix_full_batched').
+    # 'efgp'                -> production linearised/custom_vjp shim
+    #                          ('gmix_batched')
+    # 'efgp_keepall'        -> keep-all autodiff E-step, exact monolithic
+    #                          single jax.grad, no linearisation drops, Ef/Edf
+    #                          by direct O(N*M) spectral sums
+    #                          ('gmix_full_batched').
+    # 'efgp_keepall_gather' -> same keep-all terms, but Ef/Edf by the gmix
+    #                          Gaussian gather (O(M log M + N), M-flat memory,
+    #                          ~0.1% stencil error) ('..._gather').
     # Identical in every other respect, so wall/NRMSE are directly comparable
     # to the existing efgp and sp cells. See KEEPALL_AUTODIFF_NOTES.md.
-    if method in ('efgp', 'efgp_keepall'):
+    _QX = {'efgp': 'gmix_batched',
+           'efgp_keepall': 'gmix_full_batched',
+           'efgp_keepall_gather': 'gmix_full_batched_gather'}
+    if method in _QX:
         st = run._fit_efgp_with_hist(
             lik, op, ip, t_grid, sigma, ls_init,
             eps_grid=eps_grid,
             estep_method=estep_method,
             analytic_order=analytic_order,
-            qx_moments_method=('gmix_full_batched'
-                               if method == 'efgp_keepall' else 'gmix_batched'))
+            qx_moments_method=_QX[method],
+            qx_v_gather_N=gather_N,
+            qx_v_gather_stencil_r=gather_stencil_r)
         f_eval_fn = lambda g: base.efgp_em.posterior_drift_mean(st['hist'], g)
         M_out = 0
     elif method == 'sp':
@@ -157,7 +168,9 @@ def run_cell(T, method, M, ls_init, seed, eps_grid=1e-3,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--T', type=int, required=True)
-    ap.add_argument('--method', choices=['efgp', 'efgp_keepall', 'sp'],
+    ap.add_argument('--method',
+                    choices=['efgp', 'efgp_keepall', 'efgp_keepall_gather',
+                             'sp'],
                     required=True)
     ap.add_argument('--M', type=int, default=0)
     ap.add_argument('--ls-init', type=float, default=0.7)
@@ -169,21 +182,32 @@ def main():
     ap.add_argument('--estep', choices=['auto', 'gmix', 'analytic'],
                     default='auto')
     ap.add_argument('--analytic-order', type=int, default=1)
+    # Gather resolution, for --method efgp_keepall_gather. Production defaults
+    # (64 / 8) are tuned for the SHIM, which only needs the moment value + the
+    # m-gradient and absorbs ~5% error via rho-damping. Keep-all feeds the
+    # gather's gradients straight into J, so it needs a finer spatial grid:
+    # the gather's accuracy floor is set by sigma/h_grid with
+    # h_grid = 1/(gather_N*h_spec), and it collapses once sigma < h_grid.
+    ap.add_argument('--gather-N', type=int, default=None)
+    ap.add_argument('--gather-stencil-r', type=int, default=None)
     ap.add_argument('--out-dir', default='demos/_bench_duffing_scaling_out')
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = f"{args.method}{args.M if args.method == 'sp' else ''}"
-    is_efgp = args.method in ('efgp', 'efgp_keepall')
+    is_efgp = args.method.startswith('efgp')
     eps_tag = "" if (not is_efgp or args.eps_grid == 1e-3) \
         else f"_eps{args.eps_grid:g}"
     # Only tag non-'auto' E-steps so canonical filenames are unchanged.
     estep_tag = "" if (not is_efgp or args.estep == 'auto') \
         else (f"_{args.estep}" + (f"o{args.analytic_order}"
                                   if args.estep == 'analytic' else ""))
+    g_tag = "" if args.gather_N is None and args.gather_stencil_r is None \
+        else f"_gN{args.gather_N or 0}r{args.gather_stencil_r or 0}"
     out_path = (out_dir /
-                f"cell_T{args.T}_{tag}{eps_tag}{estep_tag}_seed{args.seed}.npz")
+                f"cell_T{args.T}_{tag}{eps_tag}{estep_tag}{g_tag}"
+                f"_seed{args.seed}.npz")
 
     print(f"[duffscale] T={args.T} method={args.method} M={args.M} "
           f"ls_init={args.ls_init} seed={args.seed} eps={args.eps_grid} "
@@ -194,7 +218,9 @@ def main():
     try:
         res = run_cell(args.T, args.method, args.M, args.ls_init, args.seed,
                        eps_grid=args.eps_grid, estep_method=args.estep,
-                       analytic_order=args.analytic_order)
+                       analytic_order=args.analytic_order,
+                       gather_N=args.gather_N,
+                       gather_stencil_r=args.gather_stencil_r)
         print(f"[duffscale] OK wall={res['wall']:.1f}s "
               f"drift_nrmse={res['drift_nrmse']:.4f} "
               f"lat_pc={res['lat_pc']:.4f} "

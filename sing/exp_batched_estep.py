@@ -10,7 +10,22 @@ from sing.exp_full_moments import Ef_diff, Edfdx_diff
 from sing.efgp_gmix_qx_moments import gmix_E_full_Eff, precompute_aux
 
 def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
-                     moment='exact'):
+                     moment='exact', gather=False,
+                     gather_N=64, stencil_r=6):
+    """Summed transition ELBO with batched keep-all moments.
+
+    ``gather``: how E[f] and E[df/dx] are evaluated.
+      False (default) -- direct char-function spectral sums (``Ef_diff`` /
+        ``Edfdx_diff``), O(N*M) dense einsums, exact to machine precision.
+      True -- the gmix Gaussian gather (1 IFFT + per-source stencil,
+        O(M log M + N)), i.e. ``drift_moments_gmix_jax``. Cheaper at large M
+        with M-flat memory, at the cost of the stencil truncation error
+        (~0.1% at stencil_r=6). Note the gather's own ``Eff`` return is the
+        LINEARISED ||E[f]||^2, so it is discarded here -- the exact full
+        ``E[f^T f]`` still comes from ``gmix_E_full_Eff``, keeping this a
+        genuine keep-all path (only the Ef/Edf *quadrature* changes, not
+        which terms are retained).
+    """
     xcen = grid.xcen; aux = precompute_aux(mu_r, grid)
     dt = t_grid[1:] - t_grid[:-1]                       # (T-1,)
     def _tr(A): return jnp.trace(A, axis1=-2, axis2=-1)
@@ -19,8 +34,14 @@ def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
         m, S, SS = marg['m'], marg['S'], marg['SS']
         K, T, D = m.shape
         mf = m.reshape(-1, D); Sf = S.reshape(-1, D, D)
-        Ef  = jax.vmap(lambda a,b: Ef_diff(a,b,mu_r,grid))(mf,Sf).reshape(K,T,D)
-        Edf = jax.vmap(lambda a,b: Edfdx_diff(a,b,mu_r,grid))(mf,Sf).reshape(K,T,D,D)
+        if gather:
+            from sing.efgp_jax_drift import drift_moments_gmix_jax
+            Ef, _Eff_lin, Edf = drift_moments_gmix_jax(
+                mu_r, grid, m, S, D_lat=D, D_out=D,
+                gather_N=gather_N, stencil_r=stencil_r)
+        else:
+            Ef  = jax.vmap(lambda a,b: Ef_diff(a,b,mu_r,grid))(mf,Sf).reshape(K,T,D)
+            Edf = jax.vmap(lambda a,b: Edfdx_diff(a,b,mu_r,grid))(mf,Sf).reshape(K,T,D,D)
         if moment == 'exact':
             Eff = jax.vmap(lambda a,b: gmix_E_full_Eff(a-xcen,b,mu_r,grid,aux))(mf,Sf).reshape(K,T)
         else:  # 'sq' = ||E[f]||^2 (linearised value)
@@ -45,8 +66,11 @@ def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
     return total
 
 def nat_grad_batched(mean_params_b, mu_r, grid, t_grid, trial_mask,
-                     init_params, sigma, moment='exact'):
-    total = make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma, moment)
+                     init_params, sigma, moment='exact', gather=False,
+                     gather_N=64, stencil_r=6):
+    total = make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
+                             moment, gather=gather,
+                             gather_N=gather_N, stencil_r=stencil_r)
     g = jax.grad(total)(mean_params_b)
     symm = lambda A: 0.5*(A + jnp.swapaxes(A,-1,-2))
     return {'J': symm(g['ExxT']), 'h': g['Ex'], 'L': g['ExxnT']}

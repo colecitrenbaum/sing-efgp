@@ -88,7 +88,8 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
                         learn_kernel=True, variance=None,
                         restore_qf_variance='none',
                         estep_method='auto', analytic_order=1,
-                        qx_moments_method='gmix_batched'):
+                        qx_moments_method='gmix_batched',
+                        qx_v_gather_N=None, qx_v_gather_stencil_r=None):
     """Same canonical fit call as base.fit_efgp, but also returns the EM
     history so drift can be evaluated from the EM's ACTUAL converged q(f) via
     efgp_em.posterior_drift_mean (base.eval_efgp_drift recomputes mu_r through
@@ -140,6 +141,8 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
         restore_qf_variance=restore_qf_variance,
         estep_method=estep_method, analytic_order=analytic_order,
         qx_moments_method=qx_moments_method,
+        qx_v_gather_N=qx_v_gather_N,
+        qx_v_gather_stencil_r=qx_v_gather_stencil_r,
         verbose=False)
     wall = time.perf_counter() - t0
     # when learn_kernel=False hist.lengthscale/variance may be empty -> use inits
@@ -156,6 +159,8 @@ def _fit_efgp_with_hist(lik, op, ip, t_grid, sigma, ls_init, eps_grid=1e-3,
                 estep_method=estep_method,
                 analytic_order=analytic_order,
                 qx_moments_method=qx_moments_method,
+                gather_N=qx_v_gather_N or 0,
+                gather_stencil_r=qx_v_gather_stencil_r or 0,
                 peak_gb=_peak_device_gb(),
                 backend=jax.default_backend())
 
