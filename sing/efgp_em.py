@@ -329,6 +329,26 @@ def _build_jit_estep_scan_jax(*, K, D, T, t_grid, trial_mask,
                                     == 'gmix_full_batched_gather'),
                             gather_N=qx_v_gather_N,
                             stencil_r=qx_v_gather_stencil_r)
+            elif qx_moments_method == 'gmix_full_batched_V':
+                # keep-all + Matheron/pathwise V restoration (folds E_q[V] into
+                # the quadratic via rho+omega from S posterior weight samples)
+                import os as _os
+                from sing.exp_batched_estep import nat_grad_batched as _ngb
+                from sing.exp_pathwise_v import sample_dw as _sdw, rho_plus_omega_aux as _rpa
+                _Sv = int(_os.environ.get('KEEPALL_VSAMPLES', '4'))
+                m_src,S_src,d_src,C_src,w_src = jpd._flatten_stein(
+                    ms, Ss, SSs, del_t, trial_mask_b)
+                _,_,top_V = jpd.compute_mu_r_gmix_jax(
+                    m_src, S_src, d_src, C_src, w_src, grid,
+                    sigma_drift_sq=sigma_drift_sq, D_lat=D, D_out=D,
+                    fine_N=gmix_fine_N, stencil_r=gmix_stencil_r,
+                    cg_tol=qf_cg_tol, max_cg_iter=qf_max_cg_iter)
+                _dw = _sdw(mu_r, grid, top_V, m_src, S_src,
+                           w_src / sigma_drift_sq, key_qf, _Sv,
+                           cg_tol=qf_cg_tol, max_iter=qf_max_cg_iter)
+                _aux = _rpa(mu_r, _dw, grid)
+                tr_g = _ngb(mean_params_b, mu_r, grid, t_grid, trial_mask_b,
+                            init_params, sigma, moment='exact', quad_aux=_aux)
             else:
                 raise ValueError(f"unknown qx_moments_method "
                                  f"{qx_moments_method!r}")

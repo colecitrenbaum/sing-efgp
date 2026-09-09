@@ -127,3 +127,38 @@ autodiff grad):
 gather when M grows or memory is tight. On GPU, verify the crossover M and
 that gather memory stays flat (nvidia-smi / jax memory profiler) — that's
 the main thing to check on the cluster bench.
+
+## Matheron / pathwise V restoration (`gmix_full_batched_V`)
+The keep-all autodiff path keeps every *mean-drift* term but still drops the
+drift-posterior variance $V=\phi^*A^{-1}\phi$ (Approximation A). It can be
+folded back in exactly, within the same CF+autodiff machinery, by replacing
+the quadratic's coefficient $\rho=\mathrm{autocorr}(D\mu)$ with $\rho+\omega$,
+where $\omega=$ diag-sums of $DA^{-1}D$. We estimate $\rho+\omega$ by the
+**Matheron/pathwise** rule (same object as the paper's Pathwise/Stochastic
+Variance Estimator; $\omega$ here = the paper's $c[\vec r]$):
+
+  draw $S$ posterior weight samples $w^{(s)}\!\sim\!\mathcal{CN}(\mu,A^{-1})$
+  (prior sample: $x_i\!\sim\!\mathcal N(m_i,S_i)$, spread white noise via
+  `nufft1`, then one mean-type CG solve $A^{-1}b$); then
+  $\rho+\omega=\tfrac1S\sum_s \mathrm{autocorr}(D w^{(s)})$.
+
+Because $E[\mathrm{autocorr}(Dw)]=\mathrm{autocorr}(D\mu)+\text{diag}(DA^{-1}D)$,
+this is unbiased and needs no separate $\rho$/$\omega$ computation. Files:
+`sing/exp_pathwise_v.py` (`sample_dw`, `rho_plus_omega_aux`); wired as
+`qx_moments_method='gmix_full_batched_V'`, sample count via env
+`KEEPALL_VSAMPLES` (default 4).
+
+**Validation (`demos/bench_pathwise_V.py`, CPU fp64):**
+- Sampler: $\mathrm{Cov}(\delta w)$ vs dense $A^{-1}$ rel err 0.06.
+- $\rho+\omega\to$ dense-exact GT at the MC rate ($1/\sqrt S$): 0.60/0.27/0.16/0.11 at S=1/4/16/64.
+- **Natural gradient $\to$ dense-GT gradient**: rel err **0.004 at S=1**, 0.003 at S=4 — tiny, because V is an $O(\Delta t)$ fraction of the precision. So a handful of samples suffices.
+
+**Recovery (comparable, not materially slower):**
+- Small nonlinear (K=3,T=150, sparse/noisy): rmse 0.172 (drop) / 0.176 (keep-all) / 0.182 (+V, S=4); ell/var identical; +V ~1s over no-V.
+- T=10k Duffing (15 EM iters): keep-all rmse 0.0566 (42s) vs +V(S=4) rmse 0.0566 (34s) — identical recovery, V adds no material cost (the $S$ mean-type solves are dwarfed by the shared block-tridiag smoother).
+
+**GPU note:** the pathwise solves reuse the mean-solve operator (same
+$\nu_{\rm mean}$, $\sigma^2$-robust), and each is a batched CG + `nufft1`
+spread — GPU-friendly, memory $O(M+N)$ per sample. Watch: with the
+direct-sum keep-all moments the E-step is still $O(NM)$; V adds $S$ solves,
+not $O(NM)$, so it stays a small fraction.

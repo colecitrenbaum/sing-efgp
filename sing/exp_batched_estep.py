@@ -11,7 +11,7 @@ from sing.efgp_gmix_qx_moments import gmix_E_full_Eff, precompute_aux
 
 def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
                      moment='exact', gather=False,
-                     gather_N=64, stencil_r=6):
+                     gather_N=64, stencil_r=6, quad_aux=None):
     """Summed transition ELBO with batched keep-all moments.
 
     ``gather``: how E[f] and E[df/dx] are evaluated.
@@ -25,8 +25,12 @@ def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
         ``E[f^T f]`` still comes from ``gmix_E_full_Eff``, keeping this a
         genuine keep-all path (only the Ef/Edf *quadrature* changes, not
         which terms are retained).
+
+    ``quad_aux``: optional GmixQxAux for the quadratic. If None, use
+        precompute_aux(mu_r) (= rho, i.e. E[fbar^T fbar]); pass rho+omega
+        (from exp_pathwise_v) to fold in the drift-variance V (Matheron).
     """
-    xcen = grid.xcen; aux = precompute_aux(mu_r, grid)
+    xcen = grid.xcen; aux = precompute_aux(mu_r, grid) if quad_aux is None else quad_aux
     dt = t_grid[1:] - t_grid[:-1]                       # (T-1,)
     def _tr(A): return jnp.trace(A, axis1=-2, axis2=-1)
     def total(mean_params_b):                            # dict of (K,T,..)
@@ -67,10 +71,10 @@ def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
 
 def nat_grad_batched(mean_params_b, mu_r, grid, t_grid, trial_mask,
                      init_params, sigma, moment='exact', gather=False,
-                     gather_N=64, stencil_r=6):
+                     gather_N=64, stencil_r=6, quad_aux=None):
     total = make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
-                             moment, gather=gather,
-                             gather_N=gather_N, stencil_r=stencil_r)
+                             moment, gather=gather, gather_N=gather_N,
+                             stencil_r=stencil_r, quad_aux=quad_aux)
     g = jax.grad(total)(mean_params_b)
     symm = lambda A: 0.5*(A + jnp.swapaxes(A,-1,-2))
     return {'J': symm(g['ExxT']), 'h': g['Ex'], 'L': g['ExxnT']}
