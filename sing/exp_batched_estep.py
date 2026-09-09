@@ -11,7 +11,8 @@ from sing.efgp_gmix_qx_moments import gmix_E_full_Eff, precompute_aux
 
 def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
                      moment='exact', gather=False,
-                     gather_N=64, stencil_r=6, quad_aux=None):
+                     gather_N=64, stencil_r=6, quad_aux=None,
+                     inputs=None, input_effect=None):
     """Summed transition ELBO with batched keep-all moments.
 
     ``gather``: how E[f] and E[df/dx] are evaluated.
@@ -59,6 +60,10 @@ def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
         trm += dt[None,:]**2 * Eff_i
         trm += -2*dt[None,:]*_tr(outer(Ef_i,mtn) + jnp.einsum('...ij,...kj->...ik',Edf_i,SSt))
         trm += 2*dt[None,:]*_tr(outer(Ef_i,mt)  + jnp.einsum('...ij,...jk->...ik',Edf_i,St))
+        if input_effect is not None and inputs is not None:
+            Bu = jnp.einsum('di,kti->ktd', input_effect, inputs[:, :-1])  # (K,T-1,D)
+            trm += dt[None,:]**2 * (Bu**2).sum(-1)
+            trm += -2*dt[None,:] * (Bu*(mtn - mt - dt[None,:,None]*Ef_i)).sum(-1)
         const = -0.5*D*jnp.log(2*jnp.pi*dt[None,:]*sigma**2)
         negCE = const + trm*(-1.0/(2*dt[None,:]*sigma**2))
         tmask = trial_mask[:,:-1] & trial_mask[:,1:]
@@ -71,10 +76,12 @@ def make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
 
 def nat_grad_batched(mean_params_b, mu_r, grid, t_grid, trial_mask,
                      init_params, sigma, moment='exact', gather=False,
-                     gather_N=64, stencil_r=6, quad_aux=None):
+                     gather_N=64, stencil_r=6, quad_aux=None,
+                     inputs=None, input_effect=None):
     total = make_total_negCE(mu_r, grid, t_grid, trial_mask, init_params, sigma,
                              moment, gather=gather, gather_N=gather_N,
-                             stencil_r=stencil_r, quad_aux=quad_aux)
+                             stencil_r=stencil_r, quad_aux=quad_aux,
+                             inputs=inputs, input_effect=input_effect)
     g = jax.grad(total)(mean_params_b)
     symm = lambda A: 0.5*(A + jnp.swapaxes(A,-1,-2))
     return {'J': symm(g['ExxT']), 'h': g['Ex'], 'L': g['ExxnT']}

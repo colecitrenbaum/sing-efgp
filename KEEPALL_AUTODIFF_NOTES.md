@@ -162,3 +162,21 @@ $\nu_{\rm mean}$, $\sigma^2$-robust), and each is a batched CG + `nufft1`
 spread — GPU-friendly, memory $O(M+N)$ per sample. Watch: with the
 direct-sum keep-all moments the E-step is still $O(NM)$; V adds $S$ solves,
 not $O(NM)$, so it stays a small fraction.
+
+## Now the default (`qx_moments_method='gmix_full_batched_V'`)
+As of this consolidation, keep-all + Matheron pathwise-V is the **default**
+q(x) update in `fit_efgp_sing_jax`. Changes that made this safe:
+- **Inputs handled.** `make_total_negCE` now adds the linear-input terms
+  (Bu = input_effect @ inputs) exactly as `compute_neg_CE_single`, so the
+  batched path is input-correct (test_efgp_inputs passes on the default).
+- **`top` from the q(f) solve.** The V sampler takes A_r's Toeplitz operator
+  from the actual q(f) call (`return_top` for gmix/analytic) rather than
+  recomputing a gmix-specific one — consistent with A_r and independent of
+  `estep_method`. (mc doesn't return top → V raises a clear error there;
+  use estep_method='gmix' or 'analytic'.)
+- Verified: test_efgp_inputs, test_efgp_em_multitrial, test_efgp_gmix_qx_moments,
+  test_efgp_jax_recovery, test_efgp_sparsegp_drift_agreement all pass with
+  the V default (15 tests).
+Other methods remain selectable: 'gmix_batched' (drop/shim), 'gmix_full_batched'
+(keep-all, no V), 'gmix_full_batched_gather' (keep-all via gather; needs a
+finer gather at small M), 'linearised_shim'.
