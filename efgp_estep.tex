@@ -20,6 +20,9 @@
 \newcommand{\given}{\,|\,}
 
 \newcommand{\code}[1]{\texttt{\small #1}}
+% Long unbreakable \code{...} identifiers otherwise push prose into the margin.
+\emergencystretch=3em
+\hbadness=10000
 
 % Section banner for ELBO-term grounding.  Use immediately under \section{...}.
 \newcommand{\elbobanner}[2]{%
@@ -36,17 +39,20 @@ solved by Fourier features}
 
 \begin{abstract}
 \noindent
-This note derives the E-step of SING with a GP drift prior, accelerated by
-EFGP, organised around \emph{which ELBO term each step addresses}. The
-spine is GP regression on latent velocities. Three layers of structure
-turn it into a matrix-free linear system: replacing fixed sufficient
-statistics by $q(x)$-expectations and applying Stein's lemma; choosing
-Fourier features so the system matrix is BTTB Toeplitz with a cheap
-Jacobian; and computing the remaining $q(x)$-expectations in closed form
-via the Gaussian characteristic function. The $q(f)\!\to\!q(x)$ handoff
-is closed by one principle --- a first-order Taylor linearisation at
-$m_i$ --- applied to two pieces of the transition integrand and yielding
-PSD-by-construction natural-grad updates.
+This note specifies the E-step of SING with a GP drift prior,
+accelerated by EFGP. \S\ref{sec:interface} states the whole contract:
+SING's natural-gradient backbone asks a drift model for exactly three
+per-transition moments and \code{jax.grad}s through them, so EFGP is
+fully described by three values plus six VJP slots, together with the
+three departures (D1--D3) from the generic SING algorithm. The rest is
+the \emph{why}: the $q(f)$ update is GP regression on latent velocities
+(\S\ref{sec:qf-update}), made matrix-free by Stein's lemma plus a
+Fourier basis whose Gram is BTTB Toeplitz (\S\ref{sec:efgp}); the
+remaining $q(x)$-expectations are Gaussian-enveloped NUFFTs, computed by
+one of three interchangeable backends (\S\ref{sec:compute}); and the
+$q(f)\!\to\!q(x)$ handoff is closed by a Gauss--Newton truncation of
+Price's theorem, which is what makes the load-bearing $\partial/\partial
+S_i$ slot PSD by construction (\S\ref{sec:qx}).
 \end{abstract}
 
 \tableofcontents
@@ -134,10 +140,12 @@ non-trivially; the rest of this document analyses that term.
 \subsection*{Section map}
 
 \begin{center}
-\begin{tabular}{lll}
+\begin{tabular}{@{}l l p{0.50\textwidth}@{}}
 \hline
 \S & Addresses & Produces \\
 \hline
+\ref{sec:interface} & \textbf{the SING contract} &
+  \textbf{3 required moments, 6 VJP slots, departures D1--D3} \\
 \ref{sec:notation} & — & Notation glossary \\
 \ref{sec:qf-update} (incl.\ \ref{sec:transition}–\ref{sec:uncertain-x}) & transition at fixed $q(x)$ &
   $A_r, h_r$ (basis-agnostic) \\
@@ -152,19 +160,111 @@ non-trivially; the rest of this document analyses that term.
 \end{tabular}
 \end{center}
 
-\subsection*{Teaser: the two updates in one breath}
+% ============================================================================
+\section{The SING contract: exactly what EFGP must supply}
+\label{sec:interface}
+% ============================================================================
 
-\begin{quote}
-\textbf{q(f) update.} From $q(x)$ marginals build $A_r, h_r$ via NUFFT
-primitives over the $q(x_i)=\mathcal{N}(m_i, S_i)$ Gaussians; solve
-$A_r\mu_r=h_r$ by Jacobi-preconditioned CG.
+SING's backbone (algorithm and derivation: the SING paper) asks a drift
+model for \emph{three} per-transition moments and nothing else. They are
+the methods of \code{sing.sde.SDE}, called at the current
+$q(x_i)=\mathcal{N}(m_i,S_i)$:
 
-\textbf{q(x) update.} From $\mu_r$, get $(\bar f, J_{\bar f})$ at each
-$m_i$ via Type-2 NUFFT; substitute their Taylor-linearised form into
-the transition expectation; differentiate w.r.t.\ $(m_i, S_i)$ via
-\code{jax.grad} (custom-VJP shim plumbs the gradient table from
-§\ref{sec:qx}).
-\end{quote}
+\begin{center}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{llll}
+\hline
+\code{SDE} method & math & shape & name in \code{trm} \\\hline
+\code{f(\ldots, t, m, S)}    & $\Eqx[f(x_i)]$          & $(D)$   & \code{Ef}    \\
+\code{ff(\ldots, t, m, S)}   & $\Eqx[\|f(x_i)\|^2]$    & scalar  & \code{Eff}   \\
+\code{dfdx(\ldots, t, m, S)} & $\Eqx[J_f(x_i)]$        & $(D,D)$ & \code{Edfdx} \\\hline
+\end{tabular}
+\end{center}
+
+\noindent
+The three land in \code{compute\_neg\_CE\_single}
+(\code{sing/utils/sing\_helpers.py:289--304}), which assembles the
+per-transition negative cross-entropy into a scalar \code{trm}
+(eq.~\ref{eq:transition-frozen} and \S\ref{sec:qx}).
+\code{nat\_grad\_transition} (\code{sing/sing.py:46}) then
+\code{vmap(jax.grad(\ldots))}s that scalar w.r.t.\ the \emph{mean}
+parameters $\mu=(\E x_i,\, \E x_i x_i^\top,\, \E x_i x_{i+1}^\top)$;
+by exponential-family duality that \emph{is} the natural gradient on
+$(J,h,L)$, which SING $\rho$-damps and applies.
+
+\paragraph{Two conventions to keep straight.}
+(i) The diffusion enters \code{trm} as one scalar prefactor
+$-1/(2\Delta_i\sigma^2)$ (line 304): the code is the \textbf{isotropic}
+case $\Sigma=\sigma^2 I$ (\code{sigma\_drift\_sq} is a scalar), so the
+$\Sigma^{-1}$ / $\sigma_r^{-2}$ written throughout this note is a single
+$\sigma^{-2}$ in practice, and \code{ff} carries no $\Sigma^{-1}$ inside.
+(ii) Lines 301--302 add the linear-input contribution $Bu_i$; the second
+of these also multiplies \code{Ef}, so \code{Ef}'s cotangent picks up a
+$+2\Delta_i^2 (Bu_i)$ term. Neither changes any statement below.
+
+\paragraph{The contract is three values plus six VJP slots.}
+Since SING only ever differentiates \emph{through} the three returns, a
+drift backend is fully specified per transition by those three values
+and their VJPs w.r.t.\ $(m_i,S_i)$. With
+$\bar f_r(x)=\phi(x)^*\mu_r$ the $q(f)$ posterior-mean drift and $g$ the
+upstream cotangent, EFGP supplies:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.35}
+\footnotesize
+\begin{tabular}{@{}p{1.4cm}|p{3.5cm}|p{3.3cm}|p{4.1cm}|p{2.5cm}@{}}
+\hline
+slot & value (how) & $\partial/\partial m_i$ & $\partial/\partial S_i$ & status \\\hline
+\code{Ef}
+ & $\Eqx[\bar f]$ (gmix-gather)
+ & $\Eqx[J_{\bar f}]^\top g$
+ & $0$
+ & $m$ exact; $S$ GN-dropped \\
+\code{Eff}
+ & $\|\Eqx[\bar f]\|^2$ (from \code{Ef})
+ & $2g\,\Eqx[J_{\bar f}]^\top\Eqx[\bar f]$
+ & $g\,\Eqx[J_{\bar f}]^\top\Eqx[J_{\bar f}]\;\succeq 0$
+ & GN $+$ cov-drop \\
+\code{Edfdx}
+ & $\Eqx[J_{\bar f}]$ (gmix-gather)
+ & $0$ (raw array)
+ & $0$ (raw array)
+ & GN-dropped \\\hline
+\end{tabular}
+\end{center}
+
+\noindent
+Code: \code{FrozenEFGPDrift} with \code{ef\_with\_jac\_grad} and
+\code{eff\_with\_grads} (\code{sing/efgp\_jax\_drift.py:39--134}).
+Note \code{Eff}'s forward stores only $\|\Eqx[\bar f]\|^2$; the
+$\tr[\,\cdot\,S_i]$ piece of the true value lives only in the
+$\partial/\partial S_i$ slot, which is all SING consumes.
+
+\paragraph{Departures from the generic SING algorithm.}
+\begin{itemize}\setlength\itemsep{3pt}
+\item[\textbf{D1}] \textbf{$q(f)$ is a Fourier-feature Gaussian updated in
+closed form.} Generic SING takes a fixed parametric drift; EFGP's drift
+is a GP whose weight posterior $q(w_r)=\mathcal{N}(\mu_r, A_r^{-1})$
+solves $A_r\mu_r=h_r$ --- an extra coordinate-ascent block interleaved
+with SING's $q(x)$ update (\S\ref{sec:qf-update}--\ref{sec:compute}), plus
+a collapsed kernel M-step (\texttt{efgp\_mstep.tex}).
+\item[\textbf{D2}] \textbf{The $S$-slots are Gauss--Newton truncated}
+(\S\ref{sec:qx}). Generic SING would let \code{jax.grad} carry the exact
+Price/Bonnet derivatives through an on-graph quadrature (e.g.\
+\code{GaussHermiteQuadrature}). EFGP computes the moments off-graph
+(autodiff through NUFFTs inside the per-transition \code{vmap} is
+${\sim}50\times$; App.~\ref{app:impl}) and injects the GN-truncated table
+above --- which is what buys a PSD-by-construction $\partial/\partial S_i$
+on the load-bearing slot.
+\item[\textbf{D3}] \textbf{\code{ff} carries only $\bar f$, not the $q(f)$
+variance.} The exact $q(f)$-average is
+$\Eq[q(f)][\|f(x)\|^2]=\|\bar f(x)\|^2 + V(x)$; production drops $V$ and
+its gradient (\code{restore\_qf\_variance='none'}, ``Approximation A'',
+\S\ref{sec:qx} item (iv)). Opt-in restoration: App.~\ref{app:vhutch}.
+\end{itemize}
+Everything else in the ELBO --- emissions, $H[q(x)]$, initial --- is
+Gaussian closed-form and handled unchanged by SING's backbone. A reader
+who wants only the interface can stop here.
 
 % ============================================================================
 \section{Notation cheat-sheet}
@@ -172,7 +272,7 @@ the transition expectation; differentiate w.r.t.\ $(m_i, S_i)$ via
 % ============================================================================
 
 \noindent
-\begin{tabular}{l p{0.78\textwidth}}
+\begin{tabular}{@{}p{0.30\textwidth} p{0.66\textwidth}@{}}
 $m_i, S_i$ & marginal mean and covariance of $q(x_i)$. \\
 $S_{i,i+1}$ & cross-covariance $\Cov(x_i, x_{i+1})$. \\
 $d_i := m_{i+1}-m_i$ & mean increment. \\
@@ -432,11 +532,6 @@ $O(M^2)$.
 expectations $\Eqx[\phi(x_i)\phi(x_i)^*]$, $\Eqx[\phi(x_i)]$,
 $\Eqx[J_\phi(x_i)]$ that fill \eqref{eq:Ah-system}–\eqref{eq:hr-stein-abstract}.}
 
-% ----------------------------------------------------------------------------
-\subsection{Closed-form via the Gaussian characteristic function (default)}
-\label{sec:gmix}
-% ----------------------------------------------------------------------------
-
 Because every $q(x_i)=\mathcal{N}(m_i,S_i)$ is Gaussian and every $\phi_k$
 is a complex exponential, each marginal expectation appearing in
 \eqref{eq:Ah}--\eqref{eq:hr-stein-abstract} is the Gaussian characteristic
@@ -447,7 +542,60 @@ function evaluated at frequency differences:
 e^{2\pi i\,m_i^\top\xi}\;e^{-2\pi^2\,\xi^\top S_i\,\xi},
 \label{eq:Eqx-chi}
 \end{equation}
-i.e.\ a phase at $m_i$ times a Gaussian envelope set by $S_i$. Substituting
+a phase at $m_i$ times a Gaussian envelope set by $S_i$. So \emph{every}
+quantity needed in \eqref{eq:Ah-system}--\eqref{eq:hr-stein-abstract} is
+one \textbf{Gaussian-enveloped non-uniform Fourier sum}
+\begin{equation}
+F(\xi)\;=\;\sum_i w_i\, e^{2\pi i\, m_i^\top \xi}\; e^{-2\pi^2\,\xi^\top S_i\,\xi},
+\label{eq:enveloped-nufft}
+\end{equation}
+evaluated on the frequency-\emph{difference} grid (for the BTTB generator
+of $A_r$) or on the spectral grid (for $h_r$), with $w_i$ the relevant
+Stein weight ($\Delta_i/\sigma^2$, $d_{i,r}/\sigma^2$, or
+$[C_i]_{j,r}/\sigma^2$; assembled by \code{\_flatten\_stein}). Three
+interchangeable backends compute \eqref{eq:enveloped-nufft}, differing
+only in how the \emph{per-source} envelope $S_i$ is handled.
+\code{estep\_method='auto'} (the default) resolves by device:
+
+\begin{center}
+\renewcommand{\arraystretch}{1.3}
+\footnotesize
+\begin{tabular}{@{}p{2.2cm}|p{4.9cm}|p{3.1cm}|p{4.4cm}@{}}
+\hline
+\code{estep\_method} & envelope handling & cost & error \\\hline
+\code{'gmix'} \emph{(default on GPU)}
+ & each $\mathcal{N}(m_i,S_i)$ tabulated on a fine
+   spatial grid over a $(2r{+}1)^D$ stencil, then FFT
+ & $O(N\,r^D + N_f^D\log N_f)$
+ & stencil tail truncation ($n_\sigma$) \\
+\code{'analytic'} \emph{(default on CPU; $D{=}2$ only)}
+ & $S_i = \bar S + \Delta S_i$; Taylor
+   $e^{-2\pi^2\xi^\top\Delta S_i\xi}$ to order $p$
+ & $O(P(p)\,(N + M\log M))$
+ & $\Delta S$ truncation; \emph{exact} at $\Delta S{=}0$ \\
+\code{'mc'} \emph{(reference)}
+ & $S$ marginal samples per source, plain NUFFT
+ & $O(NS + M\log M)$
+ & Monte Carlo variance \\\hline
+\end{tabular}
+\end{center}
+
+\noindent
+Resolution logic (\code{efgp\_em.py:698--712}): \code{'gpu'}$\to$\code{'gmix'},
+otherwise \code{'analytic'}, falling back to \code{'gmix'} when $D\ne 2$.
+The devices disagree because the bottleneck does: on CPU the gmix
+per-source spread dominates the wall, so \code{'analytic'} is ${\sim}6\times$
+faster on the $q(f)$ update; on GPU scatter and cuFFT are nearly free
+(the wall is JIT compile plus the sequential-in-$T$ block-tridiagonal
+smoother \code{lax.scan}), so \code{'analytic'} only adds cuFINUFFT
+launch overhead. Any explicit value overrides \code{'auto'}.
+
+% ----------------------------------------------------------------------------
+\subsection{Backend 1: gmix closed-form spreader (GPU default)}
+\label{sec:gmix}
+% ----------------------------------------------------------------------------
+
+Substituting
 into $A_r$ \eqref{eq:Ah} preserves BTTB structure: the generating kernel
 on the difference grid $\Delta\xi_k$ is the Type-1 NUFFT of weighted
 Gaussians \emph{centred at $m_i$ with per-source widths $S_i$}.
@@ -462,10 +610,58 @@ the bucketed / Gauss--Hermite alternatives considered. The closed-form
 spreader eliminates Monte Carlo variance at the cost of a per-source
 spread; in single-scale regimes the asymptotic cost matches a standard
 NUFFT, and heterogeneous $S_i$ costs an extra
-$\propto(\sigma_{\max}/\sigma_{\min})^{D}$ factor.
+$\propto(\sigma_{\max}/\sigma_{\min})^{D}$ factor. The stencil is
+truncated at $n_\sigma$ standard deviations (default $1.5$), which leaves
+a tail bias present \emph{even at} $\Delta S=0$ (${\sim}10\%$ vs.\ MC on
+the reference problem) --- the accuracy motivation for Backend 2.
+Code: \code{compute\_mu\_r\_gmix\_jax}
+(\code{efgp\_jax\_drift.py:269}), spreader in
+\code{sing/efgp\_gmix\_spreader.py}.
 
 % ----------------------------------------------------------------------------
-\subsection{Monte Carlo cloud (reference)}
+\subsection{Backend 2: analytic Taylor-envelope NUFFT (CPU default)}
+\label{sec:analytic}
+% ----------------------------------------------------------------------------
+
+Split the per-source covariance about the trajectory mean,
+$S_i = \bar S + \Delta S_i$, and Taylor-expand \emph{only} the deviation
+factor:
+\begin{equation}
+e^{-2\pi^2\,\xi^\top S_i\,\xi}
+= e^{-2\pi^2\,\xi^\top \bar S\,\xi}\, e^{u_i(\xi)},
+\quad u_i(\xi):=-2\pi^2\,\xi^\top \Delta S_i\,\xi,
+\quad e^{u_i}\approx\sum_{k\le p}\frac{u_i^k}{k!}.
+\label{eq:env-taylor}
+\end{equation}
+Each term of $u_i^k$ factorises into a $\xi$-monomial times a
+$\Delta S_i$-monomial, so \eqref{eq:enveloped-nufft} becomes a fixed
+number of \emph{ordinary} type-1 NUFFTs on the same nodes $\{m_i\}$ with
+re-weighted source vectors:
+\begin{equation}
+F(\xi)\;\approx\;e^{-2\pi^2\xi^\top\bar S\xi}
+\sum_{\rm pairs} c_{\rm pair}(\xi)\;
+\mathrm{NUFFT1}\bigl(\{m_i\},\,\{w_i\,\nu_{{\rm pair},i}\}\bigr)(\xi),
+\label{eq:analytic-final}
+\end{equation}
+with the $(c_{\rm pair},\nu_{\rm pair})$ enumerated by
+\code{\_env\_taylor\_pairs} (\code{efgp\_jax\_drift.py:525}):
+$P(p)=\binom{p+2}{2}$ pairs in 2-D, i.e.\ $1, 4, 10$ at
+\code{analytic\_order} $p=0,1,2$. All pairs share the nodes $\{m_i\}$ and
+are evaluated as ONE batched transform (a single FINUFFT plan), so
+order$\to$order cost is nearly flat; the same expansion is applied on the
+difference grid (BTTB generator) and on the spectral grid (RHS).
+Code: \code{compute\_mu\_r\_analytic\_jax}
+(\code{efgp\_jax\_drift.py:569}).
+
+No fine grid and no stencil: \emph{exact} for homogeneous $S$ (any order),
+with the truncation error controlled by the $S$-spread rather than by a
+grid. Order 1 holds to ${<}4\%$ up to ${\sim}20\times$ spread in the
+$S_i$ eigenvalues, order 2 to ${\sim}60\times$; converged fits sit near
+$1.4\times$. 2-D only in v0. Full derivation and benchmarks:
+\texttt{efgp\_analytic\_qf.tex}.
+
+% ----------------------------------------------------------------------------
+\subsection{Backend 3: Monte Carlo cloud (reference)}
 \label{sec:mc}
 % ----------------------------------------------------------------------------
 
@@ -528,18 +724,17 @@ of this term, ready for SING's $\rho$-damped natural-grad update on $q(x)$.}
 \subsection*{Setup}
 
 SING does $\rho$-damped natural gradient on $q(x)$ (constrained
-Gaussian-Markov). By exponential-family duality between $q(x)$'s
-natural parameters $\eta = (J, h, L)$ and mean parameters
-$\mu = (\E[x_i], \E[x_i x_i^\top], \E[x_i x_{i+1}^\top])$,
+Gaussian-Markov), using
 \begin{equation}
-\widetilde\nabla_\eta \mathcal{L} \;=\; \partial \mathcal{L}/\partial \mu.
+\widetilde\nabla_\eta \mathcal{L} \;=\; \partial \mathcal{L}/\partial \mu,
+\qquad \eta=(J,h,L),\quad
+\mu=(\E[x_i], \E[x_ix_i^\top], \E[x_ix_{i+1}^\top]),
 \label{eq:natgrad-duality}
 \end{equation}
-SING $\rho$-damps and applies. Mean params re-parameterise cleanly to
-$(m_i, S_i, S_{i,i+1})$. Only the transition term couples $q(x)$ to
-$q(f)$, so the EFGP-specific work is the per-transition transition
-contribution; the other ELBO terms (emissions, $H[q(x)]$, initial)
-are Gaussian-closed-form in $q(x)$ and handled by SING's backbone.
+i.e.\ exponential-family duality (\S\ref{sec:interface}). Mean params
+re-parameterise cleanly to $(m_i, S_i, S_{i,i+1})$. This section derives
+\emph{why} the six VJP slots of \S\ref{sec:interface} take the values they
+do --- departure \textbf{D2}.
 
 \subsection*{The transition term, and how the code assembles it}
 
@@ -547,16 +742,19 @@ At fixed $q(f)$, with $\bar f_r(x) = \phi(x)^* \mu_r$ deterministic but
 nonlinear in $x$ and $V_r(x) = \sigma_r^{-2}\phi(x)^* A_r^{-1}\phi(x)$
 the $q(f)$ posterior variance contribution, the per-transition piece is
 \begin{equation}
+\begin{aligned}
 \Eqxx\!\bigl[\Eq[q(f)][\log p(x_{i+1}\given x_i, f)]\bigr]
-\;=\;
+\;=\;&
 -\,\frac{\E[\delta_i^\top\Sigma^{-1}\delta_i]}{2\Delta_i}
-+ \Eqxx[\delta_i^\top\Sigma^{-1}\bar f(x_i)]
-- \frac{\Delta_i}{2}\,\Eqx\!\bigl[\bar f^\top\Sigma^{-1}\bar f + V\bigr]
++ \Eqxx[\delta_i^\top\Sigma^{-1}\bar f(x_i)]\\
+&- \frac{\Delta_i}{2}\,\Eqx\!\bigl[\bar f^\top\Sigma^{-1}\bar f + V\bigr]
 + \text{const}.
+\end{aligned}
 \label{eq:transition-frozen}
 \end{equation}
-\code{compute\_neg\_CE\_single} (\code{sing/utils/sing\_helpers.py:289-304})
-assembles this into a scalar \code{trm} from four pieces:
+This is assembled into the scalar \code{trm} of
+\code{compute\_neg\_CE\_single} (\code{sing\_helpers.py:289--304}) from
+four pieces:
 
 \begin{center}
 \renewcommand{\arraystretch}{1.3}
@@ -613,13 +811,15 @@ Hessian) is sign-indefinite because $\bar f_r$ has no sign constraint.
 \textbf{The Gauss-Newton approximation drops the residual Hessian} ---
 the standard move for sum-of-squares objectives. Plugged into Price:
 \begin{equation}
+\begin{aligned}
 \partial_{S_i} \E[\bar f^\top \Sigma^{-1}\bar f]
-\;\stackrel{\rm Price}{=}\; \E\bigl[J_{\bar f}^\top \Sigma^{-1} J_{\bar f}\bigr]
+&\;\stackrel{\rm Price}{=}\; \E\bigl[J_{\bar f}^\top \Sigma^{-1} J_{\bar f}\bigr]
    + \tfrac{1}{2}\E\!\bigl[\textstyle\sum_r \sigma_r^{-2}\bar f_r H_{\bar f_r}\bigr]
 \;\stackrel{\rm GN}{\approx}\;
-\E\bigl[J_{\bar f}^\top \Sigma^{-1} J_{\bar f}\bigr]
-\;\stackrel{\rm Cov\text{-}drop}{\approx}\;
+\E\bigl[J_{\bar f}^\top \Sigma^{-1} J_{\bar f}\bigr]\\
+&\;\stackrel{\rm Cov\text{-}drop}{\approx}\;
 \E[J_{\bar f}]^\top \Sigma^{-1}\,\E[J_{\bar f}] \;\succeq\; 0.
+\end{aligned}
 \label{eq:Eff-lin}
 \end{equation}
 The second approximation (the covariance drop) replaces $\E[J^\top J]$
@@ -650,7 +850,8 @@ $2\E[J]^\top \Sigma^{-1}\E[\bar f]$.
 
 \begin{center}
 \renewcommand{\arraystretch}{1.4}
-\begin{tabular}{l|ccc}
+\footnotesize
+\begin{tabular}{@{}p{2.5cm}|p{5.6cm}|p{3.3cm}|p{3.9cm}@{}}
 \hline
 quantity & value & $\partial/\partial m_i$ & $\partial/\partial S_i$ \\\hline
 $\Eqx[\bar f]$
@@ -707,7 +908,7 @@ slots are computed exactly in closed form via the Gaussian char-fun
 \]
 analogously $\Eqx[\partial_j\bar f_r]$ with frequency modulation by
 $(2\pi i\,\xi_{k,j})$. The gmix-gather primitive in
-\code{drift\_moments\_gmix\_jax} (\code{efgp\_jax\_drift.py:557-624};
+\code{drift\_moments\_gmix\_jax} (\code{efgp\_jax\_drift.py:793--870};
 Type-2 analog of the §\ref{sec:gmix} spreader: one batched IFFT $+$
 per-source Gaussian stencil gather) delivers
 $(\code{Ef}, \code{Eff}, \code{Edfdx})$ at all $T$ base points in one
@@ -779,10 +980,10 @@ into a mean-increment piece and a Jacobian (Stein-correction) piece:
 \;=\;
 \underbrace{d_i^\top\Sigma^{-1}\Eqx[\bar f]}_{\text{Part A: mean-increment}}
 + \underbrace{\tr\!\bigl[\Sigma^{-1}\Eqx[J_{\bar f}]\,C_i^\top\bigr]}_{\text{Part B: Jacobian}},
-\quad d_i := m_{i+1}-m_i,\quad C_i := S_{i,i+1}-S_i.
 \label{eq:Stein-cross}
 \end{equation}
-The marginals $\Eqx[\bar f]$, $\Eqx[J_{\bar f}]$ are computed by
+with $d_i := m_{i+1}-m_i$ and $C_i := S_{i,i+1}-S_i$ as before. The
+marginals $\Eqx[\bar f]$, $\Eqx[J_{\bar f}]$ are computed by
 gmix-gather in closed form (framework above) and stored as \code{Ef},
 \code{Edfdx} on \code{FrozenEFGPDrift}.
 
@@ -797,42 +998,25 @@ Part B ($-2\Delta_i\,\tr(\Eqx[J_{\bar f}] C_i^\top)$). The values
 themselves are exact.
 
 \textbf{Gradients.} \code{jax.grad} of \code{trm} assembles three
-distinct contributions per $(\cdot)$-slot. All production values and
-gradients are expressed in terms of the exact $\E_{q(x_i)}$
-expectations $\Eqx[\bar f]$ and $\Eqx[J_{\bar f}]$ from gmix-gather;
-the framework table's pointwise $\bar f(m_i), J_{\bar f}(m_i)$ slots
-are filled with these smoothed values.
-
-\begin{itemize}\setlength\itemsep{2pt}
-\item \textbf{Direct.} Pure autodiff through the outer products and
-  traces in lines 298-299 (treating Ef and Edfdx as constants).
-  Exact.
-\item \textbf{Ef-chain.} Via \code{ef\_with\_jac\_grad}'s
-  \code{custom\_vjp}, which injects
-  $\partial \code{Ef}/\partial m = \Eqx[J_{\bar f}]^\top g$ and
-  $\partial \code{Ef}/\partial S = 0$. The $\partial_m$ injection
-  \emph{coincides exactly} with the true $\partial_m \Eqx[\bar f] =
-  \Eqx[J_{\bar f}]$ from differentiating the char-fun term-by-term ---
-  no GN truncation here (Price reduces to a single gradient term;
-  no Hessian to drop). The $\partial_S$ injection \emph{is}
-  GN-truncated: by Price, $\partial_S \E[\bar f] = \tfrac{1}{2}\E[H_{\bar f}]$;
-  GN drops the Hessian, giving 0 (exact would be the non-zero
-  envelope-derivative $-2\pi^2 \sum_k \mu_{r,k}D_k\,\xi_k\xi_k^\top
-  e^{2\pi i m^\top\xi_k}\,e^{-2\pi^2 \xi_k^\top S\xi_k}$).
-\item \textbf{Edfdx-chain.} \code{Edfdx} is a raw constant array on
-  \code{FrozenEFGPDrift}; all $\partial\code{Edfdx}/\partial(m, S)
-  = 0$. This is the framework's "$\Eqx[J]$ held constant" rule ---
-  the GN truncation drops $\E[H_{\bar f}]$ ($\partial_m$) and the
-  envelope-derivative ($\partial_S$), both non-zero exactly.
-\end{itemize}
-
-Resolving per slot of the production gradient, each contribution
-labelled exact / GN-truncated:
+contributions per slot: \emph{direct} (autodiff through the outer
+products and traces of lines 298--299, holding \code{Ef}/\code{Edfdx}
+constant --- exact); \emph{Ef-chain} (\code{ef\_with\_jac\_grad}'s
+injections $\partial_m\code{Ef}=\Eqx[J_{\bar f}]^\top g$, exact by Price,
+and $\partial_S\code{Ef}=0$, the GN drop of
+$\tfrac12\E[H_{\bar f}]$ --- exactly this would be the non-zero
+envelope-derivative
+$-2\pi^2\sum_k \mu_{r,k}D_k\,\xi_k\xi_k^\top e^{2\pi i m^\top\xi_k}
+e^{-2\pi^2\xi_k^\top S\xi_k}$); and \emph{Edfdx-chain} (a raw constant
+array, so all its slots are $0$ --- the ``$\Eqx[J]$ held constant''
+rule). All values and gradients use the \emph{Gaussian-averaged}
+$\Eqx[\bar f]$, $\Eqx[J_{\bar f}]$ from gmix-gather, not point-evals at
+$m_i$. Resolving per slot, each contribution labelled exact /
+GN-truncated:
 
 \begin{center}
 \renewcommand{\arraystretch}{1.25}
 \footnotesize
-\begin{tabular}{l|lll}
+\begin{tabular}{@{}p{1.8cm}|p{5.2cm}|p{4.3cm}|p{4.0cm}@{}}
 \hline
 slot & direct & Ef-chain & Edfdx-chain \\\hline
 $\partial m_t$       & $2\Delta_i\,\Eqx[\bar f]$ \emph{(exact)} & $-2\Delta_i\,\Eqx[J_{\bar f}]^\top d_i$ \emph{(exact)} & $0$ \emph{(GN: $\E[H_{\bar f}]$ dropped)} \\
@@ -857,20 +1041,12 @@ Linear in $\bar f$; no PSD constraint applies (the PSD slot is item
 (iii)'s $\partial S_t$).
 
 \paragraph{EFGP vs.\ SING.}
-The mechanism that implements these GN drops --- precomputing
-$(\text{Ef}, \text{Edfdx})$ off-graph via gmix-gather and exposing
-them with a \code{custom\_vjp} that injects only the $m$-gradient on
-Ef --- is EFGP-specific (the choice in \code{FrozenEFGPDrift}). SING's
-\code{nat\_grad\_transition} accepts whatever the SDE backend's
-$(\code{f}, \code{ff}, \code{dfdx})$ methods return. A different
-backend (e.g., one that integrates $\bar f$ against $q(x_i)$ on-graph
-via Gauss--Hermite quadrature) would let \code{jax.grad} propagate the
-exact $\partial_S \Eqx[\bar f]$ (the full Price contribution without
-the GN drop). EFGP picks the off-graph route to avoid autodiff through
-NUFFTs (${\sim}50\times$ cost under \code{vmap(grad(\ldots))};
-App.~\ref{app:impl}); the GN framework's gradient table is what makes
-this trade exactly consistent (PSD-by-construction on the load-bearing
-slot, item (iii)).
+This is departure \textbf{D2} (\S\ref{sec:interface}) in detail: SING's
+\code{nat\_grad\_transition} accepts whatever the backend's
+$(\code{f},\code{ff},\code{dfdx})$ return, so an on-graph
+Gauss--Hermite backend would give \code{jax.grad} the exact
+$\partial_S\Eqx[\bar f]$; EFGP goes off-graph to avoid autodiff through
+NUFFTs (App.~\ref{app:impl}) and pays for it with the GN drops above.
 
 \subsection*{Item (iii): the marginal quadratic --- the GN slot}
 \label{sec:approximations}
@@ -886,17 +1062,19 @@ alternative the GN framework rejected (sign-indefinite $\partial_S$).
 
 \textbf{Value (code, line 297).} \code{trm += (del\_t)**2 * Eff},
 where \code{Eff} $= \|\Eqx[\bar f]\|^2$ is stored as
-\code{(Ef * Ef).sum(axis=-1)} in \code{drift\_moments\_gmix\_jax}
-line 623. The forward holds only the $\Eqx[\bar f]^\top \Sigma^{-1}\Eqx[\bar f]$
+\code{(Ef * Ef).sum(axis=-1)} (\code{drift\_moments\_gmix\_jax}
+line 869). The forward holds only the $\Eqx[\bar f]^\top\Eqx[\bar f]$
 piece of \eqref{eq:Eff-lin}; the $\tr$-piece is absorbed into the
 gradient by the \code{custom\_vjp} below (saves a per-source
-contraction). The exact $\Eqx[\bar f^\top \bar f]$ via
-\code{gmix\_E\_full\_Eff} (\code{efgp\_jax\_drift.py:88-102}) is
-separate, used for ELBO reporting only.
+contraction). A closed form for the exact $\Eqx[\bar f^\top \bar f]$
+exists --- \code{gmix\_E\_full\_Eff}
+(\code{sing/efgp\_gmix\_qx\_moments.py:88}) --- but is \emph{not} called
+by the production fit; only \code{precompute\_aux} from that module is,
+and only to supply \code{GmixQxAux} to the V-Hutch path.
 
 \textbf{Gradients.} \code{Eff} comes from
 \code{eff\_with\_grads(m, S, eff\_const, ef\_const, jac\_const)}
-(\code{efgp\_jax\_drift.py:56-75}); the \code{custom\_vjp} backward
+(\code{efgp\_jax\_drift.py:57--75}); the \code{custom\_vjp} backward
 returns
 \begin{equation*}
 \partial\code{Eff}/\partial m_t = 2g\,(\text{ef\_const}\cdot\text{jac\_const}),
@@ -967,25 +1145,24 @@ Price's theorem \eqref{eq:price} to $g = V$:
 \partial_{S_i}\Eqx[V] = \tfrac{1}{2}\E[\nabla^2 V],
 \end{equation}
 and apply the same Hessian-drop the framework uses elsewhere
-($\E[\nabla^2 V] \to 0$). This gives
+($\E[\nabla^2 V] \to 0$). and drop \emph{only} the $\partial_S$ Hessian, keeping the value and
+$m$-gradient exact:
 \begin{equation}
-\Eqx[V] = V(m_i),\quad
-\partial_{m_i}\Eqx[V] = \nabla V(m_i),\quad
-\partial_{S_i}\Eqx[V] = 0.
+\Eqx[V]\ \text{(exact)},\qquad
+\partial_{m_i}\Eqx[V] = \Eqx[\nabla V]\ \text{(exact)},\qquad
+\partial_{S_i}\Eqx[V] = \tfrac12\Eqx[\nabla^2 V]\to 0.
 \label{eq:V-grads-taylor}
 \end{equation}
-All three slots are \textbf{first-order surrogates}: each replaces an
-exact Price-expectation expression by its constant-$x$ leading term
-(drop the residual Hessian and any envelope-derivative contributions),
-exactly as for the $\bar f$ slots in (ii). $V$ doesn't have a
-sum-of-squares structure --- the dropped piece is just $\E[\nabla^2 V]$
-rather than the GN residual --- but the structural move (drop the
-Hessian under Price) is the same. $V(m_i)$ and $\nabla V(m_i)$ are
-precomputed off-graph (App.~\ref{app:vhutch}: Hutchinson estimator of
-$\omega_r$ + batched NUFFT-2 against the difference-grid coefficient
-block --- the analog of gmix-gather for the $V$ piece);
-\code{FrozenEFGPDriftWithVHutch}'s \code{custom\_vjp} injects the
-table above.
+This is exactly the item-(ii) $\bar f$ treatment: $\Eqx[V]$ and
+$\partial_{m_i}\Eqx[V]$ are the \emph{same} Gaussian-averaged NUFFT (the
+closed form \eqref{eq:V-hutch-closed}), computed off-graph and
+differentiated through the $S$-envelope by autodiff --- so the injected
+$\partial_m$ is the exact envelope-damped $\Eqx[\nabla V]$, \emph{not} the
+point value $\nabla V(m_i)$ --- and only $\partial_S$ is Hessian-dropped.
+$\omega_r$ ($=$ the $D_\theta A_r^{-1}D_\theta$ diagonal sums) is
+Hutchinson-estimated; \code{FrozenEFGPDriftWithVHutch}'s
+\code{custom\_vjp} injects the value and $m$-gradient and zeroes the
+$S$-slot.
 
 \subsection*{End-to-end: from \code{trm} gradients to a natural-grad step}
 
@@ -1025,19 +1202,27 @@ spectral grid $\{\xi_k\}$ with weights $D_\theta$:
 
 \begin{enumerate}
 \item \textbf{Increments.} $d_i = m_{i+1}-m_i$,\quad $C_i = S_{i,i+1}-S_i$.
-\item \textbf{Sources.} For \code{estep\_method='gmix'} (default), the
-  ``sources'' are the $q(x_i)=\mathcal{N}(m_i,S_i)$ Gaussians themselves.
-  For \code{'mc'}, draw $x_i^{(s)}\sim q(x_i)$.
+\item \textbf{Sources.} \code{\_flatten\_stein} packs
+  $\{(m_i,S_i,d_i,C_i,\Delta_i)\}_{k,i}$ into $N=K(T{-}1)$ flat
+  supersources (padded slots get $S_i{=}I$ and weight $0$). For
+  \code{'gmix'}/\code{'analytic'} the sources are the
+  $q(x_i)=\mathcal{N}(m_i,S_i)$ Gaussians themselves; for \code{'mc'},
+  draw $x_i^{(s)}\sim q(x_i)$.
 \item \textbf{Precision.} Build the BTTB generator $T_r$ from weighted
-  sources (closed-form spreader for gmix, Type-1 NUFFT for MC) with
-  weights $\Delta_i/\sigma_r^2$; $A_r$ acts as
+  sources by the resolved backend (§\ref{sec:compute}: closed-form
+  spreader / Taylor-envelope NUFFTs / plain Type-1 NUFFT) with weights
+  $\Delta_i/\sigma^2$; $A_r$ acts as
   $v \mapsto v + D_\theta T_r D_\theta v$.
-\item \textbf{RHS.} Same primitive with weights $d_{i,r}/\sigma_r^2$ and
-  $[C_i]_{j,r}/\sigma_r^2$ produces $h_{1,r}$ and $h_{2,r}$.
+\item \textbf{RHS.} Same primitive with weights $d_{i,r}/\sigma^2$ and
+  $[C_i]_{j,r}/\sigma^2$ produces $h_{1,r}$ and $h_{2,r}$.
 \item \textbf{Solve.} Jacobi-preconditioned CG: $A_r\mu_r = h_r$.
-\item \textbf{Drift moments.} Compute $\Eqx[\bar f], \Eqx[J_{\bar f}],
-  \|\Eqx[\bar f]\|^2$ at all base points via gmix-gather
-  (\code{drift\_moments\_gmix\_jax}; §\ref{sec:moments}).
+\item \textbf{Drift moments.} All three backends first return point-eval
+  moments (\code{drift\_moments\_jax}); with the default
+  \code{qx\_moments\_method='gmix\_batched'} these are then
+  \emph{overwritten} by the Gaussian-averaged
+  $\Eqx[\bar f], \Eqx[J_{\bar f}], \|\Eqx[\bar f]\|^2$ from gmix-gather
+  (\code{drift\_moments\_gmix\_jax}; §\ref{sec:moments}). Setting
+  \code{'linearised\_shim'} keeps the point-evals (App.~\ref{app:impl}).
 \item \textbf{$q(x)$ update.} Feed these into
   \code{compute\_neg\_CE\_single} via \code{FrozenEFGPDrift};
   \code{jax.grad} inside \code{nat\_grad\_transition} returns
@@ -1059,12 +1244,17 @@ Fourier features, $k$ the CG iteration count. The $q(f)$ update costs
 \;+\;
 \underbrace{O(k\, D_x\, M\log M)}_{\text{CG over output dims}}.
 \end{equation}
-Drift moments at $T$ points cost $O(T) + O(D_x M\log M)$. The optional
-$V$-restoration of App.~\ref{app:vhutch} adds $O(P\,D_x\,k\,M\log M)$
-per outer iter for $P$ Hutchinson probes plus $O((1+D_x)(M\log M + N))$
-for the $1{+}D_x$ batched NUFFTs that produce $(V_i, \nabla V_i)$; the
-per-inner-iter overhead is zero (the custom-VJP shim looks up
-precomputed values). The implementation rule is to never materialise
+For \code{'analytic'} the $O(N)$ term becomes $O(P(p)N)$ with
+$P(p)=\binom{p+2}{2}$, but as one batched transform. Drift moments at
+$T$ points cost $O(T) + O(D_x M\log M)$. The optional $V$-restoration of
+App.~\ref{app:vhutch} adds, \emph{per outer iter},
+$O(P\,D_x\,k\,M\log M)$ for the $P$ Hutchinson probes that build
+$\hat\omega_r$, and \emph{per inner iter} $O((1{+}D_x)(M\log M + N))$ for
+the $1{+}D_x$ batched NUFFTs that produce $(V_i,\nabla V_i)$ at the
+current $\{m_i\}$ (\code{efgp\_em.py} calls
+\code{precompute\_V\_and\_grad\_E\_V\_per\_t} inside \code{one\_iter});
+only the CG solves are hoisted to the outer iter. The custom-VJP shim
+itself is a table lookup. The implementation rule is to never materialise
 $K$, $\Phi$, $\Phi^*W\Phi$, or $A_r^{-1}$: every required action is a
 Fourier matvec, a BTTB matvec, or a CG solve.
 
@@ -1077,8 +1267,8 @@ Fourier matvec, a BTTB matvec, or a CG solve.
 \label{app:dictionary}
 % ============================================================================
 
-\noindent
-\begin{tabular}{ll}
+\noindent\footnotesize
+\begin{tabular}{@{}p{0.44\textwidth} p{0.52\textwidth}@{}}
 \hline
 Math & Code \\
 \hline
@@ -1096,30 +1286,40 @@ Operator $A_r v = v + D_\theta T_r D_\theta v$
 & \code{make\_A\_apply} \\
 Solve $A_r \mu_r = h_r$ (Jacobi-preconditioned CG)
 & \code{cg\_solve} \\
-$h_r = h_{1,r} + h_{2,r}$ build
+$h_r = h_{1,r} + h_{2,r}$ build, \code{'mc'} backend
 & \code{compute\_mu\_r\_jax} \\
-$\bar f(x)$, $J_{\bar f}(x)$ pointwise (legacy)
+same, \code{'gmix'} backend (§\ref{sec:gmix})
+& \code{compute\_mu\_r\_gmix\_jax} $+$ \code{sing/efgp\_gmix\_spreader.py} \\
+same, \code{'analytic'} backend (§\ref{sec:analytic})
+& \code{compute\_mu\_r\_analytic\_jax}, \code{\_env\_taylor\_pairs} \\
+$q(f)$ update $+$ drift moments in one call (per backend)
+& \code{qf\_and\_moments\_\{jax, gmix\_jax, analytic\_jax\}} \\
+$\bar f(m_i)$, $J_{\bar f}(m_i)$ point-eval (\code{'linearised\_shim'})
 & \code{drift\_moments\_jax} \\
-$\Eqx[\bar f]$, $\Eqx[J_{\bar f}]$, $\Eqx[\bar f^\top\bar f]$ (gmix closed form)
-& \code{gmix\_E\_moments\_at} (\code{sing/efgp\_gmix\_qx\_moments.py}) \\
+$\Eqx[\bar f]$, $\Eqx[J_{\bar f}]$ Gaussian-averaged (\textbf{default})
+& \code{drift\_moments\_gmix\_jax} $+$ \code{sing/efgp\_gmix\_gather.py} \\
+$\Eqx[\bar f^\top\bar f]$ exact closed form (\emph{defined, unused in the fit})
+& \code{gmix\_E\_full\_Eff} (\code{sing/efgp\_gmix\_qx\_moments.py}) \\
 Spectral autocorrelation $\rho(\delta)$ precompute (one FFT/outer iter)
-& \code{precompute\_aux} \\
+& \code{precompute\_aux} (only feeds the V-Hutch path) \\
 Multi-trial flatten of $\{(m_i,S_i,d_i,C_i,\Delta_i)\}_{k,i}$
 & \code{\_flatten\_stein} \\
-$\diag(\Phi A_r^{-1}\Phi^*)$ (general Hutchinson primitive)
+$\diag(\Phi A_r^{-1}\Phi^*)$ (general Hutchinson primitive; tests only)
 & \code{hutchinson\_diag} \\
 $\omega_r(\delta)$ Hutchinson estimator (eq.~\ref{eq:omega-hutch})
 & \code{precompute\_omega\_per\_r} (\code{sing/efgp\_qx\_v\_hutch.py}) \\
 $(V_i, \nabla V_i)$ batched NUFFT-2 precompute (eq.~\ref{eq:V-hutch-closed})
 & \code{precompute\_V\_and\_grad\_E\_V\_per\_t} \\
 V-Hutch custom-VJP shim into per-transition $q(x)$ update
-& \code{FrozenEFGPDriftWithVHutch} \\
-Live gmix moments shim into $q(x)$ update (default)
-& \code{LiveGmixEFGPDrift} \\
-Linearised custom-VJP shim into $q(x)$ update
+& \code{FrozenEFGPDriftWithVHutch} (\code{efgp\_qx\_v\_hutch.py:485}) \\
+GN custom-VJP shim into $q(x)$ update (\textbf{default}, §\ref{sec:interface})
 & \code{FrozenEFGPDrift}, \code{ef\_with\_jac\_grad}, \code{eff\_with\_grads} \\
-$q(x)$ consumer
-& \code{nat\_grad\_transition} (\code{sing/sing.py}) \\
+$q(x)$ consumer: \code{vmap(grad(trm))} $\to$ $(J,h,L)$
+& \code{nat\_grad\_transition} (\code{sing/sing.py:46}) \\
+\code{trm} assembly from (\code{Ef}, \code{Eff}, \code{Edfdx})
+& \code{compute\_neg\_CE\_single} (\code{sing\_helpers.py:289}) \\
+EM driver, backend resolution, M-step
+& \code{fit\_efgp\_sing\_jax} (\code{efgp\_em.py:404}) \\
 \hline
 \end{tabular}
 
@@ -1147,11 +1347,28 @@ argument is suspect --- boundary or cluster-supported coverage,
 anisotropic coverage, sharp turns near $\partial\Omega$, cold-start outer
 iters before $q(x)$ has localised --- this appendix gives a Hutchinson +
 NUFFT restoration whose $(m_i, S_i)$ gradient structure is exactly the
-linear case of §\ref{sec:approximations}.
+linear case of §\ref{sec:approximations}. Wiring guard
+(\code{efgp\_em.py:151--153}): the restoration is active only for
+\code{qx\_moments\_method} $\in$ (\code{'linearised\_shim'},
+\code{'gmix\_batched'}) \emph{and} \code{estep\_method} $\in$
+(\code{'gmix'}, \code{'analytic'}); with \code{'mc'} it is silently
+inactive.
 
 \subsection{Closed-form $\Eqx[V]$ via BTTB-diagonal sums of $D A^{-1} D$}
 
-Define the diagonal sums
+$V_r$ is a \emph{quadratic form in the Fourier features}, so --- exactly
+like the mean-square $\bar f_r^2=\phi^*\mu_r\mu_r^*\phi$ of item (iii) ---
+it is a sum of difference-frequency modes,
+\begin{equation}
+V_r(x)=\sigma_r^{-2}\phi(x)^*A_r^{-1}\phi(x)
+=\sigma_r^{-2}\sum_{k,\ell}D_k\,(A_r^{-1})_{k\ell}\,D_\ell\;
+ e^{2\pi i(\xi_\ell-\xi_k)^\top x}.
+\end{equation}
+The dense $A_r^{-1}$ (unlike the rank-one $\mu_r\mu_r^*$) only sets the mode
+coefficients; the $x$-dependence is still $e^{2\pi i\delta^\top x}$,
+$\delta:=\xi_\ell-\xi_k$, so each mode averages under $q(x_i)$ by the same
+characteristic function \eqref{eq:Eqx-chi}. Collecting modes by lag, define
+the diagonal sums
 \begin{equation}
 \omega_r(\delta) \;:=\; \sum_{(k,\ell):\,\xi_\ell - \xi_k = \delta}
    D_k\,(A_r^{-1})_{k\ell}\,D_\ell,
@@ -1173,6 +1390,13 @@ block --- the primitive \code{gmix\_E\_full\_Eff} already uses for
 $\Eqx[\bar f^\top\bar f]$, with $\omega_r$ replacing the autocorrelation
 $\rho_r$ of $\mu_r$.
 
+So the recipe is modular: (i) obtain the drift posterior variance --- i.e.\
+the coefficients $\omega_r(\delta)$ --- by \emph{any} estimator (the
+Hutchinson estimator below, or a pathwise/Matheron posterior sampler,
+Wilson et al.\ 2020); (ii) apply the gmix envelope-NUFFT
+\eqref{eq:V-hutch-closed}. Only step (i) touches $A_r^{-1}$; step (ii),
+the $q(x_i)$-average, is identical to every other moment.
+
 \subsection{Hutchinson estimator of $\omega_r$}
 
 $\omega_r$ is estimated unbiasedly by a padded-FFT pair on $P$ Rademacher
@@ -1191,30 +1415,29 @@ sufficient. \emph{Keep the imaginary part:} a \code{.real} cast on the
 IFFT discards $-\Im\omega(\delta)\sin(2\pi\delta^\top m)$, the dominant
 error vs dense ground truth when sources are not centrosymmetric.
 
-\subsection{Per-transition $S_i$-gradient via Taylor}
+\subsection{Per-transition gradient: exact in $m$, $S$-slot dropped}
 
-The §\ref{sec:approximations} linear-case identity \eqref{eq:V-grads-taylor}
-applies directly:
+Following \eqref{eq:V-grads-taylor}, the shim keeps the value and
+$m$-gradient exact and drops only the $S$-slot:
 \begin{equation}
-\E_{q(x_i)}[V(x_i)] = V(m_i),
+\E_{q(x_i)}[V(x_i)]\ \text{(exact)},
 \qquad
-\partial_{m_i}\E[V] = \nabla V(m_i),
+\partial_{m_i}\E[V] = \E[\nabla V]\ \text{(exact)},
 \qquad
 \partial_{S_i}\E[V] = 0.
 \end{equation}
-The \code{custom\_vjp} shim exposes $V_i$ and $\partial V_i/\partial m_i$
-to \code{nat\_grad\_transition}'s autodiff and sets the $\partial V_i /
-\partial S_i$ slot to zero; this is the V-analog of the linearised-$\bar
-f$ shim in §\ref{sec:qx}, applied at the same Taylor truncation order.
+\code{precompute\_V\_and\_grad\_E\_V\_per\_t} evaluates the closed form
+\eqref{eq:V-hutch-closed} at $\{m_i\}$ and takes \code{jax.grad} w.r.t.\
+$\{m_i\}$, so $\partial_m$ is the exact envelope-damped $\E[\nabla V]$
+(not $\nabla V(m_i)$); \code{FrozenEFGPDriftWithVHutch} zeroes the
+$\partial V_i/\partial S_i$ slot. This is the V-analog of the item-(ii)
+$\bar f$ shim, at the same truncation (drop $\partial_S$ only).
 
-The dropped second-order Taylor term has bias
-$\Eqx[V(x_i)] - V(m_i) = \tfrac12\tr[\nabla^2 V(m_i)\,S_i] + O(\|S_i\|^2)$,
-bounded by $\|S_i\|\cdot \sigma_f^2/\ell^2$ for SE kernels --- small for
-$q(x)$ localised at scale $\sim\ell$, and contributes only to $V_i$'s
-constant offset in $\E[\bar f^\top \bar f]$, not to its $(m, S)$ gradient.
-The exposed \emph{value} $V_i$ is the exact closed-form
-\eqref{eq:V-hutch-closed}; the Taylor argument applies only to the
-\emph{gradients}. To restore the second-order $S$-pull exactly, replace
+The value $V_i$ and the $m$-gradient are exact (the closed form
+\eqref{eq:V-hutch-closed} and its autodiff); the \emph{only} dropped term
+is the $S$-slot $\partial_{S_i}\E[V]=\tfrac12\Eqx[\nabla^2 V]$, of size
+$O(\|S_i\|\cdot\sigma_f^2/\ell^2)$ for SE kernels --- small for $q(x)$
+localised at scale $\sim\ell$. To restore this $S$-pull exactly, replace
 $V$ by its second-order Taylor with PSD-projected Hessian
 $H_V^{+}\succeq 0$ (Price's identity, $\partial_S = \tfrac12 H_V^{+}$);
 cost: $D(D{+}1)/2$ extra batched NUFFTs against frequency-modulated
@@ -1226,22 +1449,26 @@ coefficient grids. Not enabled by default.
 Two production sub-modes for the per-source envelope in
 \eqref{eq:V-hutch-closed}:
 
-\paragraph{\code{'hutch'} (default).}
+\paragraph{\code{'hutch'} (default \emph{when} restoration is on;
+\code{'none'} is the production default).}
 $S_i$ is replaced by the trajectory-mean $\bar S$ in the envelope
 $e^{-2\pi^2 \delta^\top S \delta}$, so the envelope folds into the
-coefficient grid once per outer iter and the per-source NUFFT-2 is a
-standard (non-gmix) transform.
+coefficient grid and the per-source NUFFT-2 is a standard (non-gmix)
+transform. $\hat\omega_r$ is built once per \emph{outer} iter;
+$(V_i, \nabla V_i)$ are rebuilt each \emph{inner} iter at the current
+$\{m_i\}$ (and $\bar S$ from the current $S$'s).
 
 \paragraph{\code{'hutch\_hetS'}.}
 Per-source $S_i$ envelope, implemented via the Type-2 gmix-gather
-primitive (\code{sing/efgp\_gmix\_gather.py}). Pipeline: (i) inverse-FFT
+primitive (\code{efgp\_gmix\_gather.py}). Pipeline: (i) inverse-FFT
 $\hat\omega(\delta)$ once to a uniform spatial grid
 $\widetilde\omega(x)$; (ii) for each source $i$, gather $\widetilde\omega$
 via a per-source Gaussian stencil weighted by $\mathcal{N}(x; m_i, S_i)$
 and Riemann-summed over a $(2r{+}1)^D$ neighbourhood, with
-$r = \lceil n_\sigma\,\sigma_{\max}/h_{\rm grid}\rceil$. Both $V_i$ and
-$\nabla V_i$ flow through the same primitive (gradient via
-\code{jax.grad} reverse-mode through the gather).
+$r = \lceil n_\sigma\,\sigma_{\max}/h_{\rm grid}\rceil$ (static, picked at
+startup from $V_0$). Both $V_i$ and $\nabla V_i$ flow through the same
+primitive (gradient via \code{jax.grad} reverse-mode through the gather),
+rebuilt every inner iter.
 
 % ============================================================================
 \section{Implementation and benchmarks}
@@ -1300,7 +1527,10 @@ subprocess-isolated timings, warm JIT:
   \code{'none'} ${\sim}48.3$\,s (${\sim}11\%$);
   \code{'hutch\_hetS'} ${\sim}64.8$\,s (${\sim}1.34{\times}$).
   Recovery is bit-identical across all three modes
-  (\code{demos/bench\_hutch\_vs\_none.py}).
+  (\code{demos/bench\_hutch\_vs\_none.py}). \emph{Caveat:} the
+  \code{efgp\_em.py} docstring quotes ${\sim}22\%$ for
+  \code{'hutch\_hetS'} at the same $K,T$ --- the two figures come from
+  different runs; re-measure before quoting either in the manuscript.
 \end{itemize}
 
 \subsection{$\nabla V$ magnitude diagnostic}
@@ -1336,24 +1566,27 @@ Hutch CG ($A_r^{-1} z_p$, eq.~\ref{eq:omega-hutch})
 FFT cross-correlation (gives $\hat\omega_r$)
    & $P\cdot D_{\rm out}$
    & $O(M\log M)$ \\
-Forward batched NUFFT-2 (gives $\{V_i\}$)
+Forward batched NUFFT-2 (gives $\{V_i\}$) \emph{---per inner iter}
    & 1
    & $O(K(M\log M + T))$ \\
-Adjoint NUFFT-1 ($\nabla V_i$ via \code{jax.grad})
+Adjoint NUFFT-1 ($\nabla V_i$ via \code{jax.grad}) \emph{---per inner iter}
    & $D$
    & $O(K(M\log M + T))$ \\
 \hline
-\multicolumn{2}{l}{Per-inner-iter NUFFTs / CG solves added}
+\multicolumn{2}{l}{Per-inner-iter CG solves added}
    & 0 \\
 \hline
 \end{tabular}}
 
 \medskip
-NUFFTs are the only ops that scale with $N=K(T{-}1)$. Per-outer-iter
-counts: $1{+}D$ batched NUFFTs, $P\cdot D_{\rm out}$ CG solves; both
-independent of $n_{\rm estep}$. At $K{=}10/T{=}500$ ($D{=}2$,
-$M\!\sim\!10^3$, $P{=}4$, $k_{\rm cg}\!\sim\!30$): CG block
-${\sim}0.1$\,s, NUFFT block ${\sim}1$\,ms; total ${\sim}5$--$10\%$
-theoretical overhead, within JIT noise empirically.
+NUFFTs are the only ops that scale with $N=K(T{-}1)$. Only the
+$\hat\omega_r$ block (CG $+$ FFT cross-correlation) is hoisted to the
+outer iter; the $1{+}D$ batched NUFFTs that produce $(V_i,\nabla V_i)$
+sit \emph{inside} \code{one\_iter}, since they must be re-evaluated at
+the current $\{m_i\}$, so they scale with $n_{\rm estep}$. At
+$K{=}10/T{=}500$ ($D{=}2$, $M\!\sim\!10^3$, $P{=}4$,
+$k_{\rm cg}\!\sim\!30$): CG block ${\sim}0.1$\,s per outer iter, NUFFT
+block ${\sim}1$\,ms per inner iter --- consistent with the
+${\sim}11\%$ measured wall for \code{'hutch'}.
 
 \end{document}

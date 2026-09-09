@@ -11,6 +11,9 @@
 \newcommand{\Cov}{\operatorname{Cov}}
 \newcommand{\given}{\mid}
 \newcommand{\code}[1]{\texttt{#1}}
+% Long unbreakable \code{...} identifiers otherwise push prose into the margin.
+\emergencystretch=3em
+\hbadness=10000
 \newcommand{\GP}{\mathcal{GP}}
 \newcommand{\Dt}{D_{\rm out}}
 \newcommand{\dropped}[1]{\textcolor{red!70!black}{#1}}
@@ -31,17 +34,30 @@ likelihood of the pseudo-velocity regression --- it drops nothing $\theta$-depen
 except a constant, and (3) locate precisely the terms EFGP \emph{does} leave
 out: they live in the E-step that \emph{builds} $q(x)$, not in this objective.
 
+\noindent
+\textbf{Placement.} This whole note lives inside departure \textbf{D1} of
+\texttt{efgp\_estep.tex} \S2 (``$q(f)$ is a Fourier-feature Gaussian
+updated in closed form''): the M-step is the extra block that generic SING
+has no analogue for. It runs once per outer EM iteration, but only after
+\code{kernel\_warmup\_iters} (default 8) so that $q(f)$ is not still
+trivial. \S\ref{sec:leftout}(B1) and (B2) below are the same objects as
+the E-step doc's departures \textbf{D3} and \textbf{D2} respectively.
+
 \section{The ELBO and the M-step objective}
 Recall the structured posterior $q(x_{0:T})q(f)$, independent GP drifts
 $f_r\sim\GP(0,k_\theta)$, diagonal diffusion $\Sigma=\diag(\sigma_1^2,\dots)$,
 Euler transition $x_{i+1}=x_i+\Delta_i f(x_i)+\varepsilon_i$,
-$\varepsilon_i\sim\mathcal N(0,\Delta_i\Sigma)$, and $\delta_i:=x_{i+1}-x_i$. The
-ELBO is
+$\varepsilon_i\sim\mathcal N(0,\Delta_i\Sigma)$, and $\delta_i:=x_{i+1}-x_i$.
+(As in the E-step doc, the \emph{code} is the isotropic case
+$\Sigma=\sigma^2I$: \code{sigma\_drift\_sq} is a scalar, so every
+$\sigma_r^{-2}$ below is one $\sigma^{-2}$.) The ELBO is
 \begin{equation}
-\mathcal L=\Eq{q(x)}{\log p(y\given x)}
-+\sum_i \Eq{q(x,f)}{\log p(x_{i+1}\given x_i,f)}
-+\Eq{q(f)}{\log p(f)-\log q(f)}
+\begin{aligned}
+\mathcal L=\;&\Eq{q(x)}{\log p(y\given x)}
++\sum_i \Eq{q(x,f)}{\log p(x_{i+1}\given x_i,f)}\\
+&+\Eq{q(f)}{\log p(f)-\log q(f)}
 +H[q(x)]+\Eq{q(x_0)}{\log p(x_0)}.
+\end{aligned}
 \label{eq:elbo-recap}
 \end{equation}
 Only the transition term and the $q(f)$-KL depend on $\theta$; the emission,
@@ -56,13 +72,13 @@ entropy and initial terms are $\theta$-free. So the M-step objective is
 \paragraph{Notation} (the rest lives in \texttt{efgp\_estep.tex}; $D$ = latent dimension).
 \begin{center}\small
 \renewcommand{\arraystretch}{1.25}
-\begin{tabular}{@{}ll@{}}
+\begin{tabular}{@{}l p{0.70\textwidth}@{}}
 \toprule
 $D,\ \Dt$ & latent/input dimension; number of drift output coordinates ($\Dt{=}D$ here). \\
 $m_i,\,S_i$ & mean, covariance of $q(x_i)=\mathcal N(m_i,S_i)$; \ $S_{i,i+1}=\Cov(x_i,x_{i+1})$. \\
 $d_i:=m_{i+1}-m_i$ & mean increment; \quad $C_i:=S_{i,i+1}-S_i$ (Stein cross-cov correction). \\
 $\xi_k,\ M$ & spectral-grid frequencies ($k{=}1{:}M$) and grid size. \\
-$F_x,\ D_\theta$ & Fourier features $F_x[k]{=}e^{2\pi i x^\top\xi_k}$; \ $D_\theta{=}\diag(\sqrt{S(\xi_k;\theta)})$ (real, diagonal). \\
+$F_x,\ D_\theta$ & Fourier features $F_x[k]{=}e^{2\pi i x^\top\xi_k}$; \ $D_\theta{=}\diag(\sqrt{S(\xi_k;\theta)\,h^D})$ (real, diagonal; \code{grid.ws}). \\
 $\phi_\theta(x){=}D_\theta F_x$ & drift basis; \ $f_r(x)=\phi_\theta(x)^*w_r$, whitened weights $w_r\sim\mathcal{CN}(0,I)$. \\
 $\bar f_r(x){=}\phi(x)^*\mu_r$ & posterior-mean drift; \ $J_{\bar f}$ its Jacobian, $H_{\bar f_r}$ the Hessian of coord.\ $r$. \\
 $V_r(x){=}\sigma_r^{-2}\phi(x)^*A_r^{-1}\phi(x)$ & $q(f_r)$ posterior-variance at $x$. \\
@@ -86,9 +102,12 @@ f_r(x)=\phi_\theta(x)^*w_r,\qquad \phi_\theta(x)=D_\theta F_x,\quad F_x[k]=e^{2\
 where $D_\theta=\diag(\sqrt{S(\xi_k;\theta)})$ carries the RBF spectral density
 \begin{equation}
 S(\xi;\theta)=\sigma_f^2\,(2\pi\ell^2)^{D/2}\,e^{-2\pi^2\ell^2\|\xi\|^2}
-\qquad(\texttt{efgp\_jax\_drift.py:\_ws\_real\_se}).
+\qquad(\texttt{efgp\_jax\_drift.py:907}).
 \label{eq:specdens}
 \end{equation}
+\code{\_ws\_real\_se} evaluates $\sqrt{S(\xi_k)h^D}$ in log-space, so the
+square-root's gradient stays finite at the high-frequency modes where
+$S(\xi_k)$ underflows to zero.
 Taking the $q(x)$-expectation of the likelihood (the expectation touches only the
 features, never $w_r$) gives a Gaussian in $w_r$:
 \begin{equation}
@@ -121,8 +140,30 @@ over the $\Dt$ coordinates,
 \label{eq:Mstep}
 \end{equation}
 which is exactly what \code{m\_step\_kernel\_jax} minimises
-(\texttt{efgp\_jax\_drift.py:773--796}), using $\langle\mu,A\mu\rangle=\langle\mu,h\rangle$
-to collapse the quadratic. This is the E-step doc's eq.~(Mstep-collapsed).
+(\texttt{efgp\_jax\_drift.py:925--1029}), using
+$\langle\mu,A\mu\rangle=\langle\mu,h\rangle$ to collapse the quadratic.
+This is the E-step doc's eq.~(Mstep-collapsed).
+
+\paragraph{How it is actually optimised (v0: dense Cholesky).}
+$\theta=(\log\ell,\log\sigma_f^2)$ is moved by \code{n\_mstep\_iters}
+Adam steps on \eqref{eq:Mstep}. Each step materialises the \emph{dense}
+$A_\theta = I + \diag(\text{ws})\,T\,\diag(\text{ws})$ ($O(M^2)$, by
+direct indexing into the cached BTTB convolution vector) and takes ONE
+Cholesky $A_\theta=LL^*$, which supplies both
+$\log|A_\theta|=2\sum_k\log L_{kk}$ and $\mu_\theta=A_\theta^{-1}h_\theta$
+by two triangular solves; \code{jax.grad} then differentiates the whole
+thing, handling the implicit $\mu_\theta$ by the envelope theorem. Cost
+$O(M^3/3 + \Dt M^2)$ per Adam step, practical for $M\lesssim 2000$--$4000$.
+\emph{The Hutchinson trace path is gone}: \code{n\_hutchinson},
+\code{include\_trace}, \code{cg\_tol\_trace}, \code{max\_cg\_iter\_trace}
+and \code{key} are still accepted for signature compatibility but
+\textbf{ignored}, so \code{n\_hutchinson\_mstep} in a driver script is
+inert. (Repo history holds the old estimator; $P\!\ge\!64$ probes were
+needed to match exact slogdet on this problem.) Two more v0 details worth
+knowing: the Adam parameters are cast to \code{float32} inside
+\code{m\_step\_kernel\_jax} even under \code{jax\_enable\_x64}, and
+\code{efgp\_em.py:1074} clamps the accepted step to
+$\ell\in(0.05,50)$, $\sigma_f^2\in(0.01,100)$ as a collapse guard.
 
 \paragraph{How $\theta$ enters.} On the fixed Fourier grid the features $F_x$, and
 therefore the assembled statistics
@@ -136,7 +177,21 @@ z_r:=\frac{1}{\sigma_r^2}\sum_i\Eqxx[F_{x_i}\delta_{i,r}]
 \end{equation}
 do \emph{not} depend on $\theta$. All $\theta$-dependence is through the prior
 weights $D_\theta$: $A_\theta=I+D_\theta\,T\,D_\theta$ and $h_{\theta,r}=D_\theta z_r$
-(\texttt{efgp\_jax\_drift.py:777,786}). So \eqref{eq:Mstep} is precisely a GP
+(\texttt{efgp\_jax\_drift.py:994,1003}).
+
+\emph{Two implementation caveats on ``frozen''.} (a) $z_r$ is not
+accumulated during the RHS build; the driver recovers it from the
+converged E-step solution as
+$z_r = (A_{\theta_0}\mu_r)/\text{ws}(\theta_0)$
+(\texttt{efgp\_em.py:1051--1060}) --- the same object by
+$h_{\theta,r}=D_\theta z_r$, but obtained by re-applying $A$ at the
+\emph{incoming} hypers $\theta_0$. (b) The spectral grid
+$\{\xi_k\}$ and spacing $h$ are themselves tailored to $\ell$
+(\code{eps\_grid}) and rebuilt \emph{after} each accepted M-step. So
+$(T,z_r)$ are $\theta$-free \emph{within} one M-step --- which is all
+\eqref{eq:Mstep} needs --- but not across outer iterations.
+
+So \eqref{eq:Mstep} is precisely a GP
 \emph{marginal likelihood} in which the ``data'' $(T,z_r)$ --- the frozen $q(x)$
 sufficient statistics --- are held fixed and only the kernel varies. That is the
 formal content of ``the M-step is a GP hyperparameter update on the reconstructed
@@ -162,6 +217,7 @@ $\log|A_\theta|=\sum_k\log\lambda_k$ encodes ($\lambda_k$ the eigenvalues of $A_
 variance is present in the M-step objective}; it is not a dropped term here.
 
 \section{Exactly what is left out}
+\label{sec:leftout}
 Two categories. Be precise about which is which.
 
 \subsection*{(A) Dropped from the objective \eqref{eq:Mstep} --- one term, and it is harmless}
@@ -198,7 +254,9 @@ update currently uses two approximations. They change $(T,z_r)$, hence $\mathcal
 L_{\rm M}$ \emph{indirectly}, but they are not terms of \eqref{eq:Mstep}.
 
 \medskip
-\noindent\textbf{(B1) The drift-posterior-variance feedback $\Eqx[V_r]$ --- piece (iv), ``dropped (production)''.}
+\noindent\textbf{(B1) The drift-posterior-variance feedback $\Eqx[V_r]$ --- piece (iv), ``dropped (production)''}
+(= E-step doc departure \textbf{D3}: \code{ff} returns
+$\|\Eqx[\bar f]\|^2$, not $\|\bar f\|^2{+}V$).
 The exact transition contribution to the $q(x)$-objective is (E-step doc
 eq.~(transition-frozen))
 \begin{equation}
@@ -225,7 +283,9 @@ D_kD_\ell$; empirically here $\|\nabla\Eqx[V]\|\approx5\times10^{-5}\|\text{lega
 so restoring it is inert --- \emph{this} problem is drift-well-determined.)
 
 \medskip
-\noindent\textbf{(B2) The Gauss--Newton / covariance-drop linearisation of the drift moments.}
+\noindent\textbf{(B2) The Gauss--Newton / covariance-drop linearisation of the drift moments}
+(= E-step doc departure \textbf{D2}; concretely, the
+$\partial/\partial S_i$ column of that doc's six-slot interface table).
 For piece (iii), $g=\bar f^\top\Sigma^{-1}\bar f$, Price's $\partial_{S_i}$ needs
 $\tfrac12\Eqx[\nabla^2 g]$; the Hessian splits (E-step doc eq.~(gn-hessian))
 \begin{equation}
@@ -234,11 +294,14 @@ $\tfrac12\Eqx[\nabla^2 g]$; the Hessian splits (E-step doc eq.~(gn-hessian))
 \end{equation}
 and production makes two truncations, each second-order in the nonlinearity of $\bar f$:
 \begin{equation}
+\begin{aligned}
 \partial_{S_i}\Eqx[\bar f^\top\Sigma^{-1}\bar f]
-\;\overset{\text{GN}}{\approx}\;\Eqx[J_{\bar f}^\top\Sigma^{-1}J_{\bar f}]
-\;\overset{\text{cov-drop}}{\approx}\;\Eqx[J_{\bar f}]^\top\Sigma^{-1}\Eqx[J_{\bar f}]
-\qquad
-\Big(\dropped{\text{drops }\textstyle\sum_r\sigma_r^{-2}\bar f_r H_{\bar f_r},\ \Cov(J)}\Big).
+\;&\overset{\text{GN}}{\approx}\;\Eqx[J_{\bar f}^\top\Sigma^{-1}J_{\bar f}]
+\;\overset{\text{cov-drop}}{\approx}\;\Eqx[J_{\bar f}]^\top\Sigma^{-1}\Eqx[J_{\bar f}],\\[2pt]
+&\text{dropping }\;
+\dropped{\textstyle\sum_r\sigma_r^{-2}\bar f_r H_{\bar f_r}}
+\;\text{ and }\;\dropped{\Cov(J)}.
+\end{aligned}
 \end{equation}
 Equivalently $\bar f$ is replaced by its first-order Taylor
 $\widetilde f(x)=\bar f(m_i)+J_{\bar f}(m_i)(x-m_i)$ inside the $q(x_i)$-average. Bias is
@@ -258,11 +321,11 @@ term & explicit form & cost / difficulty \\
 \midrule
 (A) self-energy &
 $\tfrac12\sum_i\Delta_i^{-1}\tr\!\big(\Sigma^{-1}\Eqxx[\delta_i\delta_i^\top]\big)$,\ \
-$\Eqxx[\delta_i\delta_i^\top]{=}S_{i+1}{+}S_i{-}S_{i,i+1}{-}S_{i,i+1}^\top{+}d_id_i^\top$ &
+$\Eqxx[\delta_i\delta_i^\top]$ $= S_{i+1}{+}S_i{-}S_{i,i+1}{-}S_{i,i+1}^\top{+}d_id_i^\top$ &
 \textbf{trivial} ($O(TD^2)$ traces of $q(x)$ moments) --- but $\theta$-constant, so no reason to add. \\
 (B1) $q(f)$-var \emph{value} &
 $\sum_i\Delta_i\Eqx[V_i]=\Dt\big(M-\tr A_\theta^{-1}\big)$ &
-\textbf{free}: $\tr A_\theta^{-1}{=}\|L^{-1}\|_F^2$ reuses the M-step Cholesky $A_\theta{=}LL^*$; already implicit in $\log|A_\theta|$. \\
+\textbf{free}: $\tr A_\theta^{-1}{=}\|L^{-1}\|_F^2$ reuses the Cholesky $A_\theta{=}LL^*$ that \code{m\_step\_kernel\_jax} already forms; and it is already implicit in $\log|A_\theta|$. \\
 (B1) $q(f)$-var \emph{feedback} &
 $\partial_{m_i}\Eqx[V]{=}\Eqx[\nabla V]$, $\partial_{S_i}\Eqx[V]{=}\tfrac12\Eqx[\nabla^2 V]$;
 needs $\omega_r(\delta){=}\!\!\sum_{\xi_\ell-\xi_k=\delta}\!\!(A_r^{-1})_{k\ell}D_{\theta,k}D_{\theta,\ell}$ &

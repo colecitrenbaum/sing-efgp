@@ -1,0 +1,441 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue!50!black}
+
+% --- minimal standalone macros (names match the EFGP paper's) --------------
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\Eqx}{\E_{q(x_i)}}
+\newcommand{\Eqxx}{\E_{q(x_i,x_{i+1})}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\GP}{\mathcal{GP}}
+\newcommand{\given}{\,|\,}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\emergencystretch=3em
+\hbadness=10000
+
+\title{Updating the latent posterior $q(x)$ with the drift posterior $q(f)$
+fixed}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+% ==========================================================================
+\section*{What this note is, in one paragraph}
+% ==========================================================================
+
+\noindent
+We are fitting a latent stochastic differential equation: a hidden
+trajectory $x_0,\dots,x_T$ evolves under an unknown drift $f$, and we see
+only noisy observations $y$. Inference is variational EM. We keep a
+Gaussian approximation $q(x)$ to the hidden path and a Gaussian process
+posterior $q(f)$ to the drift, and we improve them in alternation. This
+note covers exactly one of those alternating updates: \textbf{holding the
+drift posterior $q(f)$ fixed, improve the path posterior $q(x)$.} The
+punchline is that this update is one \emph{exact} rewrite followed by one
+\emph{single} approximation --- and that one approximation, applied once,
+determines every quantity the update needs.
+
+\bigskip
+\noindent\fbox{\parbox{\dimexpr\textwidth-2\fboxsep-2\fboxrule}{%
+\textbf{The whole update in three moves.}
+\begin{description}[leftmargin=2.6em,itemsep=2pt,topsep=3pt]
+\item[\textmd{\textbf{M1 (exact).}}] Rewrite the objective so that all of
+its dependence on the drift $f$ funnels through just \emph{three numbers}
+per time step --- averages of the drift and its slope over $q(x_i)$.
+\item[\textmd{\textbf{M2 (bookkeeping).}}] We compute those three numbers
+fast, in a way that hides them from automatic differentiation. So we must
+tell the optimiser, by hand, how each of them changes with $q(x)$.
+\item[\textmd{\textbf{M3 (the one approximation).}}] To get those
+derivatives we make a single assumption --- \emph{the drift is a straight
+line across the width of $q(x_i)$} --- and turn the crank. Every
+derivative the update needs falls out of that one assumption.
+\end{description}}}
+
+% ==========================================================================
+\section{Setup, and what a \texorpdfstring{$q(x)$}{q(x)} step must compute}
+% ==========================================================================
+
+\paragraph{The model.}
+Time is discretised (Euler--Maruyama), so between samples the latent state
+takes a noisy step driven by the drift:
+\begin{equation}
+x_{i+1} = x_i + \Delta_i\, f(x_i) + \epsilon_i,
+\qquad \epsilon_i \sim \mathcal N(0,\Delta_i\Sigma).
+\label{eq:euler}
+\end{equation}
+The variational posterior over the path is a Gaussian Markov chain: each
+state has a marginal $q(x_i)=\mathcal N(m_i,S_i)$, and neighbours share a
+cross-covariance $S_{i,i+1}=\Cov(x_i,x_{i+1})$. The drift posterior
+$q(f)$ is already in hand from the other EM update; all we use from it is
+the posterior-\emph{mean} drift, written $\bar f(x)$. (In the EFGP basis
+$\bar f_r(x)=\phi(x)^*\mu_r$, but nothing below needs that form.)
+
+\paragraph{Why we only ever compute one gradient.}
+We improve $q(x)$ by natural-gradient ascent on the ELBO. For a Gaussian
+posterior there is a useful shortcut: writing $q(x)$ in its
+\emph{mean parameters}
+\begin{equation}
+\mu = \bigl(\E[x_i],\ \E[x_ix_i^\top],\ \E[x_ix_{i+1}^\top]\bigr),
+\end{equation}
+the natural gradient is just the \emph{ordinary} gradient in $\mu$,
+\begin{equation}
+\widetilde\nabla\,\mathcal L \;=\; \partial\mathcal L/\partial\mu .
+\label{eq:duality}
+\end{equation}
+No Fisher matrix, no special calculus: we plainly differentiate the ELBO
+with respect to $\mu$, damp the result, and step. That machinery --- the
+damping, the conversion back to $(m_i,S_i,S_{i,i+1})$ --- is the SING
+backbone and is not our concern here. \textbf{Our only job is to hand the
+backbone $\partial\mathcal L/\partial\mu$.}
+
+\paragraph{Only one piece of the ELBO involves the drift.}
+The ELBO splits into four groups,
+\begin{equation}
+\mathcal L \;=\;
+\underbrace{\E_{q(x)}[\log p(y\given x)]}_{\text{observations}}
+\;+\; \sum_i \underbrace{\E_{q(x,f)}[\log p(x_{i+1}\given x_i,f)]}_{\text{transitions}}
+\;-\; \underbrace{\mathrm{KL}[q(f)\,\|\,p(f)]}_{\text{no }q(x)}
+\;+\; \underbrace{H[q(x)] + \E[\log p(x_0)]}_{\text{entropy, initial}} .
+\end{equation}
+The observation, entropy, and initial terms are ordinary Gaussian
+expressions in $q(x)$; the backbone differentiates them directly. The KL
+does not involve $q(x)$ at all. \textbf{Only the transition term couples
+$q(x)$ to the drift}, so it is the only term we have to work on.
+Everything from here concerns a single transition $i$; call its
+contribution to the objective $\code{trm}_i$.
+
+% ==========================================================================
+\section{M1: reduce the transition term to three drift moments (exact)}
+% ==========================================================================
+
+Start from the log-transition of \eqref{eq:euler} and take its average
+under the drift posterior $q(f)$. Two clean things happen. First, the
+average of $f$ is the posterior mean $\bar f$. Second, the average of
+$f^\top\Sigma^{-1}f$ is $\bar f^\top\Sigma^{-1}\bar f$ plus a variance
+term $V$ (the drift's own uncertainty); we carry $V$ along and dispose of
+it in M3. Writing $\delta_i := x_{i+1}-x_i$,
+\begin{equation}
+\E_{q(f)}\bigl[\log p(x_{i+1}\given x_i,f)\bigr]
+= -\frac{\delta_i^\top\Sigma^{-1}\delta_i}{2\Delta_i}
++ \delta_i^\top\Sigma^{-1}\bar f(x_i)
+- \frac{\Delta_i}{2}\Bigl[\bar f(x_i)^\top\Sigma^{-1}\bar f(x_i) + V(x_i)\Bigr]
++ \text{const}.
+\label{eq:qf-averaged}
+\end{equation}
+Now average over the path, $\Eqxx[\cdot]$. Two exact simplifications
+leave the whole thing depending on $q(x)$ through only a handful of
+quantities.
+
+\paragraph{The first term is already elementary.}
+$\Eqxx[\delta_i^\top\Sigma^{-1}\delta_i]$ is a Gaussian average of a
+quadratic, so it expands into traces of $\E[x_ix_i^\top]$,
+$\E[x_{i+1}x_{i+1}^\top]$, $\E[x_ix_{i+1}^\top]$ and the means. It is
+\emph{linear in $\mu$}: no drift, no approximation, and its
+$\mu$-gradient is immediate.
+
+\paragraph{The middle term is collapsed by Stein's lemma.}
+The cross term $\Eqxx[\delta_i^\top\Sigma^{-1}\bar f(x_i)]$ couples $x_i$
+and $x_{i+1}$. Stein's lemma trades that coupling for two \emph{marginal}
+averages against known $q(x)$ statistics:
+\begin{equation}
+\Eqxx\bigl[\delta_i^\top\Sigma^{-1}\bar f(x_i)\bigr]
+= d_i^\top\Sigma^{-1}\,\Eqx[\bar f]
+\;+\; \tr\!\bigl[\Sigma^{-1}\,\Eqx[J_{\bar f}]\,C_i^\top\bigr],
+\qquad
+\begin{aligned}
+d_i &:= m_{i+1}-m_i,\\
+C_i &:= S_{i,i+1}-S_i,
+\end{aligned}
+\label{eq:stein}
+\end{equation}
+where $J_{\bar f}$ is the Jacobian (the slope) of the mean drift.
+
+\paragraph{What remains: three drift moments.}
+After \eqref{eq:qf-averaged}--\eqref{eq:stein}, the transition term is a
+plain algebraic formula in $(m_i,S_i,S_{i,i+1})$ and just three averages
+of the drift over the marginal $q(x_i)$:
+\begin{equation}
+\boxed{\;
+\begin{aligned}
+\mathrm{Ef}_i &:= \Eqx[\bar f] && (\text{mean drift}), &
+\mathrm{Edfdx}_i &:= \Eqx[J_{\bar f}] && (\text{mean slope}), \\
+\mathrm{Eff}_i &:= \Eqx\bigl[\bar f^\top\Sigma^{-1}\bar f\bigr] && (\text{mean square}).
+\end{aligned}
+\;}
+\label{eq:moments}
+\end{equation}
+Concretely, dropping the constant and the overall $-1/(2\Delta_i\sigma^2)$
+prefactor, one transition contributes
+\begin{equation}
+\code{trm}_i \;\propto\;
+\Eqxx\bigl[\delta_i^\top\Sigma^{-1}\delta_i\bigr]
+\;+\;\Delta_i^2\,\mathrm{Eff}_i
+\;-\;2\Delta_i\Bigl(d_i^\top\Sigma^{-1}\,\mathrm{Ef}_i
+   + \tr\bigl[\Sigma^{-1}\,\mathrm{Edfdx}_i\,C_i^\top\bigr]\Bigr).
+\label{eq:assembled}
+\end{equation}
+
+\medskip\noindent
+\textbf{This is M1, and it is exact.} It is also the entire interface
+between the drift model and the path update: give the backbone the three
+numbers in \eqref{eq:moments}, and it assembles \eqref{eq:assembled}
+knowing nothing about where they came from. This mirrors the other EM
+update, where uncertainty in the path enters the drift fit only by
+replacing fixed sufficient statistics with their $q(x)$-averages; here it
+is the same idea, read the other way.
+
+% ==========================================================================
+\section{M2: the moments' derivatives must be supplied by hand}
+% ==========================================================================
+
+We need $\partial\,\code{trm}_i/\partial\mu$. The explicit algebra of
+\eqref{eq:assembled} --- the $\delta$-quadratic and the $d_i,C_i$ pieces
+--- differentiates by ordinary autodiff, exactly. The difficulty is that
+the three moments \eqref{eq:moments} are \emph{themselves} functions of
+$(m_i,S_i)$, because they are averages over $q(x_i)$. So the chain rule
+also demands their derivatives:
+\begin{equation}
+\frac{\partial\,\mathrm{Ef}_i}{\partial(m_i,S_i)},\qquad
+\frac{\partial\,\mathrm{Edfdx}_i}{\partial(m_i,S_i)},\qquad
+\frac{\partial\,\mathrm{Eff}_i}{\partial(m_i,S_i)}
+\qquad\text{(six derivatives).}
+\label{eq:six-slots}
+\end{equation}
+
+\paragraph{Why autodiff cannot just do it.}
+Each moment has a closed form (a Gaussian average of a complex
+exponential), and for speed we evaluate all $T$ of them together in
+\emph{one} batched transform. But a derivative is needed
+\emph{per transition}. Asking autodiff to differentiate that batched
+transform in place would pay one full transform \emph{per transition}
+instead of one for all of them --- orders of magnitude slower. So we
+compute the moments off the autodiff graph, pass them in as constants,
+and attach the six derivatives by hand (a \code{custom\_vjp} in JAX).
+Autodiff then differentiates \eqref{eq:assembled} normally and picks up
+our injected derivatives through the chain rule.
+
+\paragraph{What the exact derivatives are.}
+For a Gaussian $q(x_i)=\mathcal N(m_i,S_i)$, the derivatives of an average
+are given by Price's theorem (its mean case is Bonnet's lemma):
+\begin{equation}
+\partial_{m_i}\Eqx[g] = \Eqx[\nabla g],
+\qquad
+\partial_{S_i}\Eqx[g] = \tfrac12\,\Eqx[\nabla^2 g].
+\label{eq:price}
+\end{equation}
+That is: differentiating in the mean pulls down a \emph{gradient} of the
+integrand; differentiating in the covariance pulls down a \emph{Hessian}.
+Applied to the three moments, the six exact answers are
+\begin{center}
+\renewcommand{\arraystretch}{1.5}\small
+\begin{tabular}{@{}p{3.0cm} p{4.2cm} p{7.4cm}@{}}
+\toprule
+moment & exact $\partial/\partial m_i$ & exact $\partial/\partial S_i$ \\
+\midrule
+$\Eqx[\bar f]$
+  & $\Eqx[J_{\bar f}]$
+  & $\tfrac12\,\Eqx[H_{\bar f}]$ \\
+$\Eqx[J_{\bar f}]$
+  & $\Eqx[H_{\bar f}]$
+  & $\tfrac12\,\Eqx[\nabla^2 J_{\bar f}]$ \\
+$\Eqx[\bar f^\top\Sigma^{-1}\bar f]$
+  & $2\,\Eqx[J_{\bar f}^\top\Sigma^{-1}\bar f]$
+  & $\Eqx[J_{\bar f}^\top\Sigma^{-1}J_{\bar f}]
+    + \sum_r\sigma_r^{-2}\,\Eqx[\bar f_r H_{\bar f_r}]$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+where $H_{\bar f}$ is the Hessian (the curvature) of the mean drift. Five
+of the six answers need this curvature; only the top-left --- the slope
+$\Eqx[J_{\bar f}]$, which we already have --- does not. Computing the
+curvature everywhere is the expense we would like to avoid. M3 avoids it.
+
+% ==========================================================================
+\section{M3: one approximation, and the whole table falls out}
+% ==========================================================================
+
+Here is the single assumption behind the entire $q(x)$ update:
+
+\begin{quote}\itshape
+Across the width of $q(x_i)$, replace the drift by a straight line.
+\end{quote}
+
+\noindent
+We fix the line by \emph{statistical linearisation}: the affine map that
+matches $\bar f$'s first two moments under $q(x_i)$,
+\begin{equation}
+\ell(x) \;=\; a + B\,(x-m_i),
+\qquad
+a := \Eqx[\bar f],
+\qquad
+B := \Eqx[J_{\bar f}],
+\label{eq:linearise}
+\end{equation}
+its offset the mean drift and its slope the \emph{expected} Jacobian. This
+is not the Taylor tangent at $m_i$: by Stein's lemma --- the identity
+already used in \eqref{eq:stein} --- $\Eqx[J_{\bar f}]$ equals the
+least-squares slope $\Cov(\bar f,x)\,S_i^{-1}$, so $\ell$ is the best
+affine fit to $\bar f$ over the whole blob (statistical linearisation; S\"arkk\"a, 2013; Opper \& Archambeau, 2009). Both coefficients $a,B$ are
+the exact gmix moments of M1; the slope is $\Eqx[J_{\bar f}]$
+throughout, \emph{never} a point value $J_{\bar f}(m_i)$. We use $\ell$ in
+place of $\bar f$ inside every $q(x_i)$-average; the six derivatives then
+come out with no further choices.
+
+\paragraph{How to picture it.}
+The assumption is not that the drift is simple --- we linearise afresh at
+\emph{every} $m_i$, so the tangents track the true curved field along the
+path. It is a statement about $q(x)$: each marginal $q(x_i)$ is narrow
+enough that the drift is effectively straight across that one blob. Take a
+one-dimensional bistable drift, $f(x)=x-x^3$. Over a Gaussian $q(x_i)=\mathcal N(m_i,S_i)$ of width $\sqrt{S_i}$ we
+pretend $f$ is a straight line (of slope $\Eqx[f']$; the point tangent
+$f'(m_i)=1-3m_i^2$ differs from it only at the order below). The mismatch
+is set by the curvature, $f''=-6x$: the error in any averaged drift
+quantity is of order $\tfrac12 f''\,S_i$, i.e.\ (curvature) $\times$
+(width).
+It is zero if $f$ is genuinely affine (a linear SDE, a line attractor),
+and small whenever $q(x_i)$ is narrow \emph{relative to the scale on which
+the drift bends} --- the length-scale $\ell$ --- so the honest condition
+is $\|S_i\|\ll\ell^2$, not $\|S_i\|$ small in absolute terms. We expand at
+the mean precisely because there the first-order error cancels, leaving
+only this second-order term.
+
+\paragraph{When it breaks.}
+The error is largest where a \emph{wide} blob sits on a \emph{sharply
+bending} part of the field --- both factors at once. In practice that
+means: the cold-start iterations, before the smoother has localised
+$q(x)$; stretches of the trajectory with few or noisy observations, where
+$q(x_i)$ stays broad; and sharp turns of the flow (a fast reversal, a
+separatrix) where $\|H_{\bar f}\|$ is large. A tight blob on a gentle part
+of the field, or any blob on a near-linear part, is fine.
+
+\paragraph{Why the breaking case does not hurt much.}
+A wide $q(x_i)$ is, by definition, a latent state the data do not pin
+down. A slightly mis-directed gradient on a weakly-determined coordinate
+has little leverage on the reconstruction, and SING's $\rho$-damping
+attenuates any single overconfident step on top of that --- so the
+approximation is worst exactly where the answer is least sensitive to it.
+It is also self-correcting: in well-observed regions the update tightens
+$q(x_i)$, which makes the next linearisation better, so error shrinks over
+EM iterations rather than accumulating. And the damage is bounded even
+in the transient: the moment \emph{values} fed to the backbone are the
+true Gaussian averages of \eqref{eq:moments} (only their \emph{derivatives}
+assume a straight line), so the step's base point stays exact and only its
+\emph{direction} is affected; and each transition's error is local to its
+own term in the sum, not compounded along the path. (These are the same
+regimes flagged below for optionally restoring the $V$ term.)
+
+\paragraph{And the worst case is not one we could trust anyway.}
+Sharpen the failure condition: the error is order-one only once the
+positional standard deviation approaches the length-scale,
+$\sqrt{\|S_i\|}\gtrsim\ell$. But $\ell$ \emph{is} the scale on which the
+drift varies, and the only information we have about the drift at that
+scale comes from watching $x$ move between states we have localised to
+precision $\sqrt{\|S_i\|}$. If $\sqrt{\|S_i\|}\gg\ell$, each look at the
+drift is a smear wider than the feature it would resolve, so the data
+cannot have identified structure at scale $\ell$ in the first place: a
+confident $\hat\ell$ far below the positional spread is simply
+unsupported. Where the linearisation is worst, the length-scale it
+conditions on is itself untrustworthy --- the two degrade together, and
+neither is a regime one would report a fit from. Conversely, any
+well-identified converged fit has $\sqrt{\|S_i\|}\ll\ell$, the path pinned
+to well within the drift's variation scale, which is exactly where
+linearisation is excellent; validity and convergence coincide. (This is
+the typical, whole-trajectory statement --- a few wide-$S_i$ transitions
+in an otherwise sharp fit are just the weakly-identified states above. And
+since only $\tr(H_{\bar f}S_i)$ enters, uncertainty along directions in
+which the drift is flat costs nothing, so the true condition is even more
+forgiving than $\|S_i\|<\ell^2$.)
+
+\paragraph{The six gradients.}
+$\ell$ is affine, so its moments under $q(x_i)=\mathcal N(m,S)$ are exact
+(the linear part averages out; the Jacobian is the constant $B$; the
+quadratic adds one trace),
+\[
+\Eqx[\ell]=a,\qquad
+\Eqx[J_\ell]=B,\qquad
+\Eqx[\ell^\top\Sigma^{-1}\ell]=a^\top\Sigma^{-1}a+\tr(B^\top\Sigma^{-1}B\,S),
+\]
+with the $m$-dependence carried only by $\Eqx[\ell]=a+B(m-m_i)$.
+Differentiating in $(m,S)$ at $m=m_i$ gives the six injected gradients:
+\begin{align*}
+\partial_m\Eqx[\bar f] &= B=\Eqx[J_{\bar f}], &
+\partial_S\Eqx[\bar f] &= 0,\\
+\partial_m\Eqx[J_{\bar f}] &= 0, &
+\partial_S\Eqx[J_{\bar f}] &= 0,\\
+\partial_m\Eqx[\bar f^\top\Sigma^{-1}\bar f] &= 2B^\top\Sigma^{-1}a, &
+\partial_S\Eqx[\bar f^\top\Sigma^{-1}\bar f] &= B^\top\Sigma^{-1}B \;\succeq 0,
+\end{align*}
+$a=\Eqx[\bar f]$, $B=\Eqx[J_{\bar f}]$ \eqref{eq:linearise}, both exact
+gmix moments. The top-left is the exact Price gradient
+$\partial_m\Eqx[\bar f]=\Eqx[J_{\bar f}]$; the bottom-right
+$B^\top\Sigma^{-1}B\succeq0$ is the Gauss--Newton curvature of the sum of
+squares $\bar f^\top\Sigma^{-1}\bar f$ (Khan \& Lin, 2017), keeping the
+precision update \eqref{eq:duality} PSD.
+
+\paragraph{The drift variance $V$: one more term of the same kind, dropped by default.}
+$V_r(x)=\sigma_r^{-2}\phi(x)^*A_r^{-1}\phi(x)$ is a quadratic form in the
+Fourier features --- like the mean-square $\bar f_r^2=\phi^*\mu_r\mu_r^*\phi$
+--- so it too is a sum of difference-frequency modes
+$\sum_\delta\omega_r(\delta)e^{2\pi i\delta^\top x}$, and its
+$q(x_i)$-average is the \emph{same} characteristic-function envelope-NUFFT
+as every other term (value and $m$-gradient exact, $S$-slot dropped). The
+dense $A_r^{-1}$ only sets the coefficients $\omega_r(\delta)$: (i) compute
+the drift posterior variance by any method --- Hutchinson on $A_r^{-1}$, or
+the pathwise/Matheron estimator we use for UQ --- then (ii) apply the same
+gmix envelope. Production omits $V$ altogether: $\nabla V\approx0$ wherever
+the data surround $x$ evenly at scale $\ell$
+($\|\nabla\Eqx[V]\|\approx5\times10^{-5}\|\partial_m\mathrm{Eff}\|$ on our
+benchmark, recovery unchanged to 3--4 digits). Restore it (opt-in) when
+that flatness fails --- clustered data, sharp boundary turns, or cold
+start.
+
+% ==========================================================================
+\section{One inner iteration, end to end}
+% ==========================================================================
+
+\begin{enumerate}[leftmargin=2.2em,itemsep=2pt]
+\item From the current $q(x)$, read off $m_i,S_i,S_{i,i+1}$ and form
+  $d_i=m_{i+1}-m_i$, $C_i=S_{i,i+1}-S_i$.
+\item Update the drift posterior $q(f)$ (the other EM step), giving the
+  mean drift $\bar f$.
+\item \textbf{[M1]} Evaluate the three moments \eqref{eq:moments} at all
+  transitions in one batched transform.
+\item \textbf{[M2, M3]} Hand them to the backbone as constants, with the
+  linearised derivative table of \S4 attached.
+\item Autodiff the assembled scalar \eqref{eq:assembled} in $\mu$; by
+  \eqref{eq:duality} this is the natural gradient. Damp and step.
+\item Repeat for $n_{\mathrm{estep}}$ inner iterations, then take the
+  kernel (hyperparameter) M-step.
+\end{enumerate}
+
+% ==========================================================================
+\section*{Crosswalk to the long note}
+% ==========================================================================
+
+\noindent
+\begin{tabular}{@{}l l@{}}
+\toprule
+here & \texttt{efgp\_estep.tex} \\
+\midrule
+\S1 setup, what the step computes & \S2 (interface), \S6 setup \\
+\S2 M1, three drift moments (exact) & \S6 ``the transition term'', items (i)--(ii) \\
+\S3 M2, hand-supplied derivatives & \S6 ``why we can't just autodiff'', App.~C \\
+\S4 M3, the one approximation & \S6 Gauss--Newton framework, items (iii)--(iv) \\
+\S4 the $V$ drop & \S6 item (iv); App.~B (restoration) \\
+how the moments are computed & \S4 (three backends), \texttt{efgp\_estep\_charfun.tex} \\
+\bottomrule
+\end{tabular}
+
+\end{document}

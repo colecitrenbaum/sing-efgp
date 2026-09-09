@@ -1,0 +1,149 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue!50!black}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Eqx}{\E_{q(x_i)}}
+\newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\tr}{\operatorname{tr}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\emergencystretch=3em \hbadness=10000
+\title{The $q(x)$ update given $q(f)$: two evaluation paths}
+\date{}
+\begin{document}
+\maketitle
+\vspace{-2.5em}
+
+\noindent
+Picking up where \texttt{efgp\_estep\_succinct.tex} leaves off: the $q(f)$
+step is done, so we hold the posterior-mean drift
+$\bar f_r(x)=\phi(x)^*\mu_r$ fixed on the spectral grid $\{\xi_k\}_{k=1}^M$
+(weights $D_k$, centre $x_c$), and take one SING natural-gradient step on
+$q(x)$. Diffusion is isotropic, $\Sigma=\sigma^2 I$.
+
+% ==========================================================================
+\section{What we compute (common to both paths)}
+% ==========================================================================
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item By exponential-family duality the natural gradient is
+  $\partial\mathcal L/\partial\mu$, $\mu=(\E[x_i],\E[x_ix_i^\top],\E[x_ix_{i+1}^\top])$.
+\item The transition term depends on the drift only through three
+  per-source moments under $q(x_i)=\mathcal N(m_i,S_i)$:
+  \[
+  \mathrm{Ef}_i=\Eqx[\bar f],\quad
+  \mathrm{Edfdx}_i=\Eqx[J_{\bar f}],\quad
+  \mathrm{Eff}_i=\Eqx[\bar f^\top\Sigma^{-1}\bar f].
+  \]
+\item \textbf{Method.} The three moments are \emph{per source}
+  ($\mathrm{Ef}_i,\mathrm{Edfdx}_i,\mathrm{Eff}_i$ for every $i$). From each
+  we assemble the per-transition scalar $\code{trm}_i$
+  (\code{compute\_neg\_CE\_single}) using the $q(x)$ statistics
+  $(d_i,C_i,m_i,S_i,S_{i,i+1})$, then sum: $\mathcal L(\mu)=\sum_i\code{trm}_i$.
+  The sum is ours --- formed only to hand \code{jax.grad} a scalar; since
+  $\code{trm}_i$ depends only on $\mu_i$, \code{jax.grad}$(\mathcal L)$ once
+  returns every per-transition $(J,h,L)$. No hand-derived gradients and
+  nothing dropped --- reverse mode returns the exact gradient.
+\item Each moment is a Gaussian average of Fourier features, i.e.\ a
+  characteristic function. With the enveloped feature
+  \[
+  \psi_k(m,S)\;=\;D_k\,e^{2\pi i\,\xi_k^\top(m-x_c)}\;e^{-2\pi^2\,\xi_k^\top S\,\xi_k},
+  \]
+  \[
+  \Eqx[\bar f_r]=\sum_k \mu_{r,k}\,\psi_k,\qquad
+  \Eqx[\partial_j\bar f_r]=\sum_k \mu_{r,k}\,(2\pi i\,\xi_{k,j})\,\psi_k,
+  \]
+  \[
+  \Eqx[\bar f^\top\bar f]=\sum_\delta \rho(\delta)\,
+    e^{2\pi i\,\delta^\top(m-x_c)}\,e^{-2\pi^2\,\delta^\top S\,\delta},
+  \quad \rho(\delta)=\sum_r\!\!\sum_{\xi_k-\xi_{k'}=\delta}\!\! (D_k\mu_{r,k})(D_{k'}\mu_{r,k'}).
+  \]
+\end{enumerate}
+The two paths differ \emph{only} in how these sums --- and, under
+\code{jax.grad}, their adjoints --- are evaluated. $N=K(T{-}1)$ is the
+source count.
+
+% ==========================================================================
+\section{Path A --- direct sums \ ($O(NM)$)}
+% ==========================================================================
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item Increments $d_i=m_{i+1}-m_i$, $C_i=S_{i,i+1}-S_i$.
+\item Autocorrelation $\rho(\delta)$: one padded FFT of $\{D_k\mu_{r,k}\}$
+  per output $r$, summed over $r$ (once per outer iter).
+\item Moments, \emph{one per source} $i$, by direct summation:
+  $\mathrm{Ef}_i,\mathrm{Edfdx}_i$ as the $O(M)$ spectral sums above,
+  $\mathrm{Eff}_i$ as the $O(M)$ sum over the difference grid against
+  $\rho$ --- each a value at $m_i$, no sum over sources. Vectorised over
+  all $N$ sources $\Rightarrow O(NM)$.
+\item Assemble $\mathcal L=\sum_i\code{trm}_i$; \code{jax.grad}$(\mathcal L)$
+  w.r.t.\ $\mu$. Reverse mode differentiates the dense sums directly
+  (another $O(NM)$ pass); no NUFFT.
+\end{enumerate}
+\textbf{Cost} $O(NM)$ time and memory (the reverse tape holds the
+$(N,M)$ mode arrays). \textbf{Exact.} Simplest; best at small $M$.
+Implementation: \code{exp\_full\_moments.py} + \code{exp\_batched\_estep.py}.
+
+% ==========================================================================
+\section{Path B --- gather / NUFFT \ ($O(M\log M + N)$)}
+% ==========================================================================
+\begin{enumerate}[leftmargin=1.6em,itemsep=2pt]
+\item Increments $d_i,C_i$ as above.
+\item Coefficient grids: $c^{(0)}_k=D_k\mu_{r,k}$ (mean),
+  $c^{(1)}_{k,j}=(2\pi i\,\xi_{k,j})D_k\mu_{r,k}$ (Jacobian); and the
+  difference-grid $\rho(\delta)$ (one padded-FFT autocorrelation) for the
+  quadratic.
+\item Evaluate the moments by the \emph{gmix gather} --- a
+  Gaussian-enveloped Type-2 NUFFT that reads the coefficient field at each
+  $m_i$ with its own $\mathcal N(\,\cdot\,;m_i,S_i)$ stencil, returning
+  \emph{one value per source} (not a sum): one batched call for
+  $\mathrm{Ef}$, one per latent dim for $\mathrm{Edfdx}$, one on the
+  $\rho$-grid for $\mathrm{Eff}$. Cost $O(M\log M + N)$ per call. (Contrast
+  the $q(f)$-side \emph{spreader}, a Type-1 NUFFT that \emph{accumulates}
+  $\sum_i w_i\,\mathcal N(\cdot;m_i,S_i)$ into the BTTB generator --- that
+  is the primitive that sums over sources; the gather does not.)
+\item Assemble the per-source $\code{trm}_i$ and $\mathcal L=\sum_i\code{trm}_i$;
+  \code{jax.grad}$(\mathcal L)$. The VJP of each gather is its Type-1 adjoint
+  --- the \emph{spreader} (\code{efgp\_gmix\_spreader}), the same
+  $\sum_i$-onto-the-grid primitive used on the $q(f)$ side --- chained
+  automatically, also $O(M\log M + N)$, memory flat in $M$.
+  So the whole per-source pipeline (moments $\to \code{trm}_i \to$ gradients)
+  is $O(M\log M + N)$: the gather (Type-2) and spreader (Type-1) are an
+  adjoint pair, forward and backward.
+\end{enumerate}
+\textbf{Cost} $O(M\log M + N)$ time, memory independent of $M$.
+\textbf{Approximate}: the per-source Gaussian stencil truncates at
+$n_\sigma$ (tunable \code{gather\_N}, \code{stencil\_r}); error decreases
+on finer grids. Best at large $M$/$N$. Primitive:
+\code{efgp\_gmix\_gather.py} / \code{drift\_moments\_gmix\_jax}.
+
+% ==========================================================================
+\section{Choosing a path}
+% ==========================================================================
+\begin{center}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & Path A (direct) & Path B (gather) \\
+\midrule
+time    & $O(NM)$          & $O(M\log M + N)$ \\
+memory  & $O(NM)$          & flat in $M$ \\
+moments & exact            & stencil-approx ($n_\sigma$) \\
+grad    & autodiff (dense) & autodiff (NUFFT adjoints) \\
+best when & $M$ small       & $M$ or $N$ large \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent
+Both return the same natural gradient (to the gather's stencil tolerance).
+The $O(NM)$ cost is exclusive to Path A (brute-force sums, no gmix); Path B's
+gather/spreader pair keeps \emph{per-source} moments and gradients at
+$O(M\log M + N)$.
+Empirically the crossover is $M\!\approx\!200$--$350$: below it A is faster
+and exact; above it B is several-fold faster with flat memory. In neither
+path is any gradient hand-derived or dropped --- both are \code{jax.grad}
+of the exact summed transition term; they differ only in the primitive
+used to evaluate (and hence adjoint) the moment sums.
+\end{document}
